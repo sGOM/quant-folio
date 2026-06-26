@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, AlertCircle, Loader2, Globe, Building2 } from "lucide-react";
+import { CheckCircle2, AlertCircle, Loader2, Globe, Building2, UserCircle } from "lucide-react";
 import { api, type Broker } from "@/lib/api";
 import { Nav } from "@/components/Nav";
 import { RequireAuth } from "@/components/RequireAuth";
@@ -124,7 +124,9 @@ function SettingsContent() {
       <main className="mx-auto max-w-xl px-4 py-8 sm:px-6">
         <h1 className="text-2xl font-semibold tracking-tight">설정</h1>
 
-        <Card className="mt-6">
+        <ProfileCard />
+
+        <Card className="mt-4">
           <CardHeader>
             <div className="flex items-center justify-between">
               <CardTitle className="text-base">증권사 연동</CardTitle>
@@ -240,6 +242,78 @@ function SettingsContent() {
         <TossQuoteCard registered={!!me.data?.has_toss_quote} />
       </main>
     </>
+  );
+}
+
+/**
+ * 프로필(닉네임) 설정 카드. 닉네임은 공유 전략 목록에 작성자명으로 표시되며,
+ * 비워두면 '익명'으로 노출된다.
+ */
+function ProfileCard() {
+  const qc = useQueryClient();
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const [name, setName] = useState("");
+
+  // 사용자 정보 로드 시 현재 닉네임으로 초기화.
+  useEffect(() => {
+    setName(me.data?.display_name ?? "");
+  }, [me.data?.display_name]);
+
+  const save = useMutation({
+    mutationFn: () => api.updateProfile(name.trim()),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["me"] }),
+  });
+
+  return (
+    <Card className="mt-6">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-1.5 text-base">
+          <UserCircle className="h-4 w-4" /> 프로필
+        </CardTitle>
+        <CardDescription>
+          닉네임은 공유 전략 목록에 작성자명으로 표시됩니다. 비워두면 ‘익명’으로
+          표시됩니다.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            save.mutate();
+          }}
+          className="space-y-4"
+        >
+          <div className="space-y-1.5">
+            <Label>닉네임</Label>
+            <TextInput
+              type="text"
+              maxLength={50}
+              value={name}
+              placeholder="예: 퀀트초보"
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
+
+          {save.isError && (
+            <p className="flex items-center gap-1.5 text-sm text-destructive">
+              <AlertCircle className="h-4 w-4 shrink-0" />
+              {(save.error as Error).message}
+            </p>
+          )}
+          {save.isSuccess && (
+            <p className="flex items-center gap-1.5 text-sm text-profit">
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+              닉네임이 저장되었습니다.
+            </p>
+          )}
+
+          <Button type="submit" disabled={save.isPending}>
+            {save.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+            {save.isPending ? "저장 중…" : "저장"}
+          </Button>
+        </form>
+      </CardContent>
+    </Card>
   );
 }
 

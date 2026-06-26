@@ -67,12 +67,26 @@ function StrategyDetailContent({ sid }: { sid: number }) {
   });
 
   const edit = useMutation({
-    mutationFn: ({ name, config }: { name: string; config: StrategyConfig }) =>
-      api.updateStrategy(sid, name, config),
+    mutationFn: ({
+      name,
+      config,
+      description,
+    }: {
+      name: string;
+      config: StrategyConfig;
+      description: string;
+    }) => api.updateStrategy(sid, name, config, description),
     onSuccess: () => {
       setEditing(false);
       qc.invalidateQueries({ queryKey: ["strategy", sid] });
     },
+  });
+
+  // 대표 백테스트 지정/해제(공유 시 성과 표시용).
+  const setFeatured = useMutation({
+    mutationFn: (backtestId: number | null) =>
+      api.setFeaturedBacktest(sid, backtestId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["strategy", sid] }),
   });
 
   const remove = useMutation({
@@ -144,15 +158,23 @@ function StrategyDetailContent({ sid }: { sid: number }) {
               : ` · 초기자본 ${strategy.data.config.cash.toLocaleString()}원`}
           </p>
         )}
+        {strategy.data?.description && (
+          <p className="mt-2 whitespace-pre-wrap rounded-md border border-border bg-card/50 p-3 text-sm text-foreground/90">
+            {strategy.data.description}
+          </p>
+        )}
 
         {editing && strategy.data && (
           <StrategyForm
             initialName={strategy.data.name}
+            initialDescription={strategy.data.description ?? ""}
             initialConfig={strategy.data.config}
             submitLabel="변경 저장"
             pending={edit.isPending}
             error={edit.isError ? (edit.error as Error).message : null}
-            onSubmit={(name, config) => edit.mutate({ name, config })}
+            onSubmit={(name, config, description) =>
+              edit.mutate({ name, config, description })
+            }
             onCancel={() => setEditing(false)}
           />
         )}
@@ -220,26 +242,56 @@ function StrategyDetailContent({ sid }: { sid: number }) {
         )}
 
         <section className="mt-8">
-          <h2 className="mb-2 text-sm text-muted-foreground">백테스트 이력</h2>
+          <h2 className="mb-2 text-sm text-muted-foreground">
+            백테스트 이력
+            <span className="ml-2 text-xs">
+              · ★ 대표로 지정하면 공유 시 성과가 함께 표시됩니다
+            </span>
+          </h2>
           <div className="space-y-2">
             {backtests.data?.length === 0 && (
               <p className="text-sm text-muted-foreground">아직 실행한 백테스트가 없습니다.</p>
             )}
-            {backtests.data?.map((b) => (
-              <div
-                key={b.id}
-                className="flex justify-between rounded-md border border-border bg-card px-4 py-2 text-sm"
-              >
-                <span className="text-muted-foreground">
-                  {b.period_start.slice(0, 10)} ~ {b.period_end.slice(0, 10)}
-                </span>
-                <span>
-                  수익률 {pct(b.total_return)} · MDD {pct(b.mdd)} · 샤프{" "}
-                  {b.sharpe?.toFixed(2) ?? "-"}
-                </span>
-              </div>
-            ))}
+            {backtests.data?.map((b) => {
+              const featured = strategy.data?.featured_backtest_id === b.id;
+              return (
+                <div
+                  key={b.id}
+                  className={`flex flex-wrap items-center justify-between gap-2 rounded-md border px-4 py-2 text-sm ${
+                    featured
+                      ? "border-primary/50 bg-primary/5"
+                      : "border-border bg-card"
+                  }`}
+                >
+                  <span className="text-muted-foreground">
+                    {b.period_start.slice(0, 10)} ~ {b.period_end.slice(0, 10)}
+                  </span>
+                  <div className="flex items-center gap-3">
+                    <span>
+                      수익률 {pct(b.total_return)} · MDD {pct(b.mdd)} · 샤프{" "}
+                      {b.sharpe?.toFixed(2) ?? "-"}
+                    </span>
+                    <button
+                      onClick={() => setFeatured.mutate(featured ? null : b.id)}
+                      disabled={setFeatured.isPending}
+                      className={`shrink-0 rounded-md border px-2 py-1 text-xs transition-colors disabled:opacity-50 ${
+                        featured
+                          ? "border-primary bg-primary/10 text-primary"
+                          : "border-input text-muted-foreground hover:bg-accent"
+                      }`}
+                    >
+                      {featured ? "★ 대표" : "대표 지정"}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
           </div>
+          {setFeatured.isError && (
+            <p className="mt-2 text-sm text-destructive">
+              {(setFeatured.error as Error).message}
+            </p>
+          )}
         </section>
       </main>
     </>

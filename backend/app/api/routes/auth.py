@@ -10,7 +10,7 @@ from app.core.database import get_db
 from app.core.security import hash_password, verify_password
 from app.core.session import create_session, destroy_session
 from app.models import User
-from app.schemas.auth import UserOut, UserRegister
+from app.schemas.auth import UserOut, UserProfileUpdate, UserRegister
 from app.services.broker import user_has_toss_quote
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -40,6 +40,7 @@ def _user_out(user: User) -> UserOut:
     return UserOut(
         id=user.id,
         email=user.email,
+        display_name=user.display_name,
         broker=user.broker,
         kis_account_no=user.kis_account_no,
         has_kis_credentials=bool(user.kis_app_key),
@@ -92,4 +93,18 @@ async def logout(request: Request, response: Response):
 
 @router.get("/me", response_model=UserOut)
 async def me(current: User = Depends(get_current_user)):
+    return _user_out(current)
+
+
+@router.patch("/me", response_model=UserOut)
+async def update_me(
+    payload: UserProfileUpdate,
+    current: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """프로필(닉네임)을 갱신한다. 공백만/빈 문자열은 미설정(null)으로 정규화한다."""
+    name = (payload.display_name or "").strip()
+    current.display_name = name or None
+    await db.commit()
+    await db.refresh(current)
     return _user_out(current)

@@ -356,11 +356,13 @@ StrategyConfig = Annotated[
 
 class StrategyCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=2000)
     config: StrategyConfig
 
 
 class StrategyUpdate(BaseModel):
     name: str | None = None
+    description: str | None = None
     config: StrategyConfig | None = None
 
 
@@ -369,10 +371,55 @@ class StrategyOut(BaseModel):
 
     id: int
     name: str
+    description: str | None = None
     config: dict
     status: str
+    featured_backtest_id: int | None = None
+    is_shared: bool = False
+    is_favorite: bool = False
+    sort_order: int = 0
     created_at: datetime
     updated_at: datetime
+
+
+class BacktestSummary(BaseModel):
+    """공유 시 노출되는 경량 백테스트 성과 요약(대용량 equity_curve 등은 제외)."""
+    id: int
+    total_return: float | None = None
+    mdd: float | None = None
+    sharpe: float | None = None
+    period_start: datetime
+    period_end: datetime
+
+
+class SharedStrategyOut(BaseModel):
+    """공유 전략 목록 항목. 작성자 닉네임·좋아요 수·설명·대표 백테스트 성과를 포함한다."""
+    id: int
+    name: str
+    description: str | None
+    config: dict
+    author_name: str
+    like_count: int
+    liked_by_me: bool
+    is_mine: bool
+    backtest: BacktestSummary | None
+    created_at: datetime
+
+
+class ReorderRequest(BaseModel):
+    """내 전략 표시 순서 일괄 갱신. 배열 순서대로 sort_order 를 0..n 부여."""
+    ordered_ids: list[int] = Field(min_length=1)
+
+
+class LikeOut(BaseModel):
+    """좋아요 토글 결과."""
+    like_count: int
+    liked_by_me: bool
+
+
+class FeaturedBacktestIn(BaseModel):
+    """대표 백테스트 지정/해제. None 이면 해제."""
+    backtest_id: int | None = None
 
 
 class BacktestRequest(BaseModel):
