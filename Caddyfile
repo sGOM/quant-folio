@@ -1,0 +1,28 @@
+# QuantFolio 단일 출처 리버스 프록시.
+# 프론트(Next.js)와 백엔드(FastAPI)를 한 포트(:80)로 합쳐, 브라우저가
+# 항상 같은 출처로 접속하게 한다. 이렇게 하면:
+#  - 폰이 어떤 주소(Tailscale 머신명/IP)로 들어와도 프론트가 상대경로로
+#    API·WS 를 호출하므로 주소가 바뀌어도 프론트 재빌드가 필요 없다.
+#  - 프론트/백엔드가 같은 출처가 되어 CORS·교차출처 쿠키 문제가 사라진다
+#    (모바일 Safari 의 엄격한 SameSite/Secure 정책에서도 인증이 안정적).
+#
+# Tailscale 위에서 평문 HTTP 로 운용한다(테일넷은 사설망이라 종단간 암호화됨).
+# 공인 HTTPS 가 필요하면 `tailscale serve` 로 이 :80 앞에 TLS 를 씌운다.
+
+{
+	admin off
+	auto_https off
+}
+
+:80 {
+	# 백엔드(FastAPI)로 보내는 경로. 나머지는 모두 프론트로 간다.
+	@backend path /api/* /ws /ws/* /health /docs /openapi.json /redoc
+	handle @backend {
+		# reverse_proxy 는 WebSocket Upgrade 를 자동 처리한다(/ws 실시간 피드).
+		reverse_proxy web:8000
+	}
+
+	handle {
+		reverse_proxy frontend:3000
+	}
+}

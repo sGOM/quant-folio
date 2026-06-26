@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+.env.local
+*.local
+# 시크릿 파일(마스터 키·API 키). secrets/.gitignore 로도 이중 보호.
+/secrets/*.txt
+# DB 백업 덤프
+backup*.sql
+*.dump
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-error.log*
+
+# Build / coverage
+dist/
+build/
+coverage/
+htmlcov/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Claude Code — 개인 로컬 설정/권한(머신별). 공유 설정·에이전트는 추적.
+.claude/settings.local.json
+
+# Playwright MCP 디버그 산출물(스냅샷·콘솔 로그)
+.playwright-mcp/
+
+# Data
+*.sqlite3
+*.db
+data/

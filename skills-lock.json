@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "tossinvest-skill": {
+      "source": "BEOKS/tossinvest-skill",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "bc0def4e10feec8da9e791a50706b75f417db476c052be0a15e7da91f184596e"
+    }
+  }
+}

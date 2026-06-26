@@ -1,0 +1,62 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * QuantFolio 디자인 토큰 — 다크 우선 금융 대시보드 팔레트.
+ * shadcn/ui 표준 CSS 변수 + 손익(profit/loss) 전용 색상을 정의한다.
+ */
+@layer base {
+  :root {
+    color-scheme: dark;
+
+    --background: 0 0% 4%;
+    --foreground: 0 0% 96%;
+
+    --card: 0 0% 7%;
+    --card-foreground: 0 0% 96%;
+
+    --popover: 0 0% 6%;
+    --popover-foreground: 0 0% 96%;
+
+    --primary: 217 91% 60%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 0 0% 14%;
+    --secondary-foreground: 0 0% 90%;
+
+    --muted: 0 0% 12%;
+    --muted-foreground: 0 0% 55%;
+
+    --accent: 0 0% 16%;
+    --accent-foreground: 0 0% 96%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 0 0% 16%;
+    --input: 0 0% 18%;
+    --ring: 217 91% 60%;
+
+    /* 금융 전용: 상승/하락. 색상에만 의존하지 않도록 부호·아이콘과 병행한다. */
+    --profit: 152 64% 46%;
+    --loss: 0 72% 56%;
+    --neutral-trend: 0 0% 60%;
+
+    --radius: 0.625rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+  /* 표·수치 정렬용: 자릿수 폭을 고정한다. */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}

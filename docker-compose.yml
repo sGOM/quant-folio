@@ -1,0 +1,157 @@
+name: quantfolio
+
+# 백엔드 3개 서비스(web/engine/worker)가 공유하는 시크릿 파일 주입.
+#  - 비밀은 평문 env/.env 가 아니라 /run/secrets/* (tmpfs) 로 마운트되어
+#    docker inspect·이미지 레이어·프로세스 환경에 남지 않는다.
+#  - config 의 `<FIELD>_FILE` 로더가 이 파일을 읽어 평문 env 보다 우선 사용한다.
+x-backend-secret-env: &backend-secret-env
+  SECRET_KEY_FILE: /run/secrets/secret_key
+  CREDENTIAL_ENC_KEY_FILE: /run/secrets/credential_enc_key
+  KIS_APP_KEY_FILE: /run/secrets/kis_app_key
+  KIS_APP_SECRET_FILE: /run/secrets/kis_app_secret
+  TOSS_APP_KEY_FILE: /run/secrets/toss_app_key
+  TOSS_APP_SECRET_FILE: /run/secrets/toss_app_secret
+
+x-backend-secrets: &backend-secrets
+  - secret_key
+  - credential_enc_key
+  - kis_app_key
+  - kis_app_secret
+  - toss_app_key
+  - toss_app_secret
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-quant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant}
+      POSTGRES_DB: ${POSTGRES_DB:-quant}
+    # 127.0.0.1 바인딩: DB 포트는 호스트 로컬에서만 접근 가능(테일넷 노출 차단).
+    # 다른 컨테이너는 도커 내부 네트워크(db:5432)로 접근하므로 영향 없다.
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quant}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-quant}:${POSTGRES_PASSWORD:-quant}@db:5432/${POSTGRES_DB:-quant}
+      REDIS_URL: redis://redis:6379/0
+      <<: *backend-secret-env
+    secrets: *backend-secrets
+    # 외부 접속은 proxy 를 통한다. 호스트 8000 은 로컬 디버깅용으로만 노출.
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 24시간 운용: --reload 제거(파일 변경에 의한 의도치 않은 재시작 방지).
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - ./backend:/app
+
+  engine:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-quant}:${POSTGRES_PASSWORD:-quant}@db:5432/${POSTGRES_DB:-quant}
+      REDIS_URL: redis://redis:6379/0
+      <<: *backend-secret-env
+    secrets: *backend-secrets
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python -m engine.main
+    volumes:
+      - ./backend:/app
+
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-quant}:${POSTGRES_PASSWORD:-quant}@db:5432/${POSTGRES_DB:-quant}
+      REDIS_URL: redis://redis:6379/0
+      <<: *backend-secret-env
+    secrets: *backend-secrets
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A worker.celery_app.celery_app worker --loglevel=info
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 빈 값 = 상대경로(같은 출처)로 API/WS 호출 → proxy 를 통해 접속하면
+      # 폰이 어떤 주소로 들어와도 동작하고 재빌드가 필요 없다.
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - web
+    command: npm run dev
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+  # 단일 출처 리버스 프록시(폰/외부 접속의 유일한 진입점).
+  # 외부에는 이 포트만 노출하고 web/frontend 는 위처럼 127.0.0.1 로 가린다.
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - web
+      - frontend
+
+# 시크릿 파일 소스. secrets/ 디렉터리는 .gitignore 로 커밋 제외된다.
+# 사용하지 않는 브로커(예: 토스 미사용)는 빈 파일로 두면 된다.
+secrets:
+  secret_key:
+    file: ./secrets/secret_key.txt
+  credential_enc_key:
+    file: ./secrets/credential_enc_key.txt
+  kis_app_key:
+    file: ./secrets/kis_app_key.txt
+  kis_app_secret:
+    file: ./secrets/kis_app_secret.txt
+  toss_app_key:
+    file: ./secrets/toss_app_key.txt
+  toss_app_secret:
+    file: ./secrets/toss_app_secret.txt
+
+volumes:
+  pgdata:
