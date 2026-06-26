@@ -10,6 +10,7 @@ import {
   Settings,
   BookOpen,
   LogOut,
+  Share2,
 } from "lucide-react";
 import { useLogout } from "@/lib/useAuth";
 import { GlossaryDrawer } from "@/components/GlossaryDrawer";
@@ -20,9 +21,25 @@ import { cn } from "@/lib/utils";
 const LINKS = [
   { href: "/dashboard", label: "대시보드", icon: LayoutDashboard },
   { href: "/strategies", label: "전략", icon: LineChart },
+  { href: "/strategies/shared", label: "공유 전략", icon: Share2 },
   { href: "/monitor", label: "실시간", icon: Activity },
   { href: "/settings", label: "설정", icon: Settings },
 ];
+
+/**
+ * 현재 경로가 메뉴 링크에 해당하는지 판정한다.
+ * "/strategies" 가 "/strategies/shared" 의 prefix 이므로, 더 구체적인(긴) 링크가
+ * 매칭되는 경우 덜 구체적인 링크는 비활성으로 둔다.
+ */
+function isActive(pathname: string, href: string): boolean {
+  if (pathname !== href && !pathname.startsWith(href + "/")) return false;
+  // 이 링크보다 더 길게(구체적으로) 매칭되는 다른 링크가 있으면 양보한다.
+  return !LINKS.some(
+    (other) =>
+      other.href.length > href.length &&
+      (pathname === other.href || pathname.startsWith(other.href + "/")),
+  );
+}
 
 /**
  * 보호 페이지 상단 내비게이션 바.
@@ -48,7 +65,7 @@ export function Nav() {
           </Link>
           <div className="hidden gap-1 md:flex">
             {LINKS.map((l) => {
-              const active = pathname.startsWith(l.href);
+              const active = isActive(pathname, l.href);
               const Icon = l.icon;
               return (
                 <Link

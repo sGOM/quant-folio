@@ -23,16 +23,18 @@ const INPUT =
  * 전략 생성·편집 공용 폼. 유형 선택에 따라 파라미터 입력 필드를 동적으로 렌더하고,
  * 공통 필드(종목·초기자본·손절/익절/트레일링)를 함께 입력받는다.
  *
- * @param initialName   초기 이름(편집 시)
- * @param initialConfig 초기 설정(편집 시). 없으면 SMA 기본값으로 시작
- * @param submitLabel   제출 버튼 라벨
- * @param pending       제출 진행 중 여부(버튼 비활성)
- * @param error         서버/제출 에러 메시지
- * @param onSubmit      검증 통과 시 (name, config) 전달
- * @param onCancel      취소 버튼(있으면 렌더)
+ * @param initialName        초기 이름(편집 시)
+ * @param initialDescription 초기 설명(편집 시)
+ * @param initialConfig      초기 설정(편집 시). 없으면 SMA 기본값으로 시작
+ * @param submitLabel        제출 버튼 라벨
+ * @param pending            제출 진행 중 여부(버튼 비활성)
+ * @param error              서버/제출 에러 메시지
+ * @param onSubmit           검증 통과 시 (name, config, description) 전달
+ * @param onCancel           취소 버튼(있으면 렌더)
  */
 export function StrategyForm({
   initialName = "",
+  initialDescription = "",
   initialConfig,
   submitLabel,
   pending,
@@ -41,14 +43,16 @@ export function StrategyForm({
   onCancel,
 }: {
   initialName?: string;
+  initialDescription?: string;
   initialConfig?: StrategyConfig;
   submitLabel: string;
   pending?: boolean;
   error?: string | null;
-  onSubmit: (name: string, config: StrategyConfig) => void;
+  onSubmit: (name: string, config: StrategyConfig, description: string) => void;
   onCancel?: () => void;
 }) {
   const [name, setName] = useState(initialName);
+  const [description, setDescription] = useState(initialDescription);
   const [config, setConfig] = useState<StrategyConfig>(
     // 편집 시 거래비용 필드(fees/tax)가 없는 레거시 설정은 기본값으로 채운다(없는 키만 보강).
     initialConfig
@@ -259,7 +263,7 @@ export function StrategyForm({
     e.preventDefault();
     const err = validate();
     setFormError(err);
-    if (!err) onSubmit(name.trim(), config);
+    if (!err) onSubmit(name.trim(), config, description.trim());
   }
 
   return (
@@ -274,6 +278,17 @@ export function StrategyForm({
           onChange={(e) => setName(e.target.value)}
           placeholder="삼성전자 골든크로스"
           className={INPUT}
+        />
+      </Field>
+
+      <Field label="전략 설명 (선택)">
+        <textarea
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          placeholder="전략의 아이디어·근거·사용법을 적어 두면 공유 시 함께 표시됩니다."
+          rows={2}
+          maxLength={2000}
+          className={`${INPUT} h-auto min-h-[60px] resize-y py-2`}
         />
       </Field>
 

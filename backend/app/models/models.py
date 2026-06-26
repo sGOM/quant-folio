@@ -9,12 +9,14 @@ from enum import StrEnum
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
     Integer,
     Numeric,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -51,6 +53,8 @@ class User(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 공유 전략 목록에 표시할 닉네임(없으면 화면에서 '익명'으로 표기)
+    display_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
     # 사용할 증권사. 'kis'(한국투자) | 'toss'(토스증권). 자격증명 컬럼은 공통 재사용.
     broker: Mapped[str] = mapped_column(
         String(16), default="kis", server_default="kis", nullable=False
@@ -80,13 +84,43 @@ class Strategy(Base, TimestampMixin):
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 전략 설명(자유 텍스트). 공유 시 함께 노출.
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
     config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[StrategyStatus] = mapped_column(
         String(20), default=StrategyStatus.DRAFT, nullable=False
     )
+    # 대표 백테스트(공유 시 성과 표시용). 원본 삭제 시 SET NULL.
+    featured_backtest_id: Mapped[int | None] = mapped_column(
+        ForeignKey("backtests.id", ondelete="SET NULL"), nullable=True
+    )
+    # 공유: 켜면 다른 모든 사용자가 공유 목록에서 열람·복사·좋아요 가능
+    is_shared: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    shared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 소유자 내 표시: 즐겨찾기(상단 고정)·정렬 순서(작을수록 위)
+    is_favorite: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    sort_order: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    # 복사 출처(원본 삭제 시 NULL). 자기참조 FK.
+    copied_from_id: Mapped[int | None] = mapped_column(
+        ForeignKey("strategies.id", ondelete="SET NULL"), nullable=True
+    )
 
     user: Mapped["User"] = relationship(back_populates="strategies")
     backtests: Mapped[list["Backtest"]] = relationship(
+        back_populates="strategy",
+        # featured_backtest_id 로 strategies↔backtests 사이 FK 가 둘이 되어 모호하므로
+        # 이 관계는 backtests.strategy_id 를 명시한다.
+        foreign_keys="Backtest.strategy_id",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    likes: Mapped[list["StrategyLike"]] = relationship(
         back_populates="strategy",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -111,7 +145,32 @@ class Backtest(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-    strategy: Mapped["Strategy"] = relationship(back_populates="backtests")
+    strategy: Mapped["Strategy"] = relationship(
+        back_populates="backtests", foreign_keys="Backtest.strategy_id"
+    )
+
+
+# ─────────────────────────── strategy_likes ───────────────────────────
+class StrategyLike(Base):
+    """공유 전략 좋아요. (strategy_id, user_id) 유니크로 인당 1회를 강제한다."""
+    __tablename__ = "strategy_likes"
+    __table_args__ = (
+        UniqueConstraint("strategy_id", "user_id", name="uq_strategy_likes_user"),
+        Index("ix_strategy_likes_strategy", "strategy_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_id: Mapped[int] = mapped_column(
+        ForeignKey("strategies.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    strategy: Mapped["Strategy"] = relationship(back_populates="likes")
 
 
 # ─────────────────────────── orders ───────────────────────────

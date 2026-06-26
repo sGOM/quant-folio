@@ -62,7 +62,8 @@ async def register_credentials(
     await db.commit()
     await db.refresh(current)
     return UserOut(
-        id=current.id, email=current.email, broker=current.broker,
+        id=current.id, email=current.email, display_name=current.display_name,
+        broker=current.broker,
         kis_account_no=current.kis_account_no, has_kis_credentials=True,
         has_toss_quote=user_has_toss_quote(current),
     )
@@ -83,7 +84,8 @@ async def register_toss_quote(
     await db.commit()
     await db.refresh(current)
     return UserOut(
-        id=current.id, email=current.email, broker=current.broker,
+        id=current.id, email=current.email, display_name=current.display_name,
+        broker=current.broker,
         kis_account_no=current.kis_account_no,
         has_kis_credentials=bool(current.kis_app_key),
         has_toss_quote=user_has_toss_quote(current),

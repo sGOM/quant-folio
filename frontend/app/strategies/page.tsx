@@ -3,7 +3,17 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, X, Trash2, ChevronRight, Loader2 } from "lucide-react";
+import {
+  Plus,
+  X,
+  Trash2,
+  ChevronRight,
+  ChevronUp,
+  ChevronDown,
+  Loader2,
+  Star,
+  Share2,
+} from "lucide-react";
 import { api, Strategy, StrategyConfig } from "@/lib/api";
 import { Nav } from "@/components/Nav";
 import { RequireAuth } from "@/components/RequireAuth";
@@ -13,6 +23,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge, type BadgeProps } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { cn } from "@/lib/utils";
 
 /** 전략 상태 코드 → 한글 배지 라벨. */
 const STATUS_LABEL: Record<string, string> = {
@@ -46,6 +57,23 @@ function StrategiesContent() {
     queryKey: ["strategies"],
     queryFn: api.listStrategies,
   });
+
+  // 순서 변경: 인접 항목과 swap 한 ID 배열을 서버에 보낸다.
+  const reorder = useMutation({
+    mutationFn: (orderedIds: number[]) => api.reorderStrategies(orderedIds),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["strategies"] }),
+  });
+
+  const list = strategies.data ?? [];
+
+  /** index 의 항목을 dir(-1=위, +1=아래) 방향으로 한 칸 이동시킨다. */
+  const move = (index: number, dir: -1 | 1) => {
+    const next = [...list];
+    const target = index + dir;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    reorder.mutate(next.map((s) => s.id));
+  };
 
   return (
     <>
@@ -96,8 +124,16 @@ function StrategiesContent() {
               </p>
             </Card>
           )}
-          {strategies.data?.map((s) => (
-            <StrategyCard key={s.id} strategy={s} />
+          {list.map((s, i) => (
+            <StrategyCard
+              key={s.id}
+              strategy={s}
+              index={i}
+              isFirst={i === 0}
+              isLast={i === list.length - 1}
+              onMove={move}
+              reordering={reorder.isPending}
+            />
           ))}
         </div>
       </main>
@@ -105,27 +141,55 @@ function StrategiesContent() {
   );
 }
 
-
 /**
- * 전략 목록 카드. 클릭하면 상세로 이동하며, 우측 삭제 버튼으로 바로 제거할 수 있다.
- * 삭제 버튼은 카드 링크 위에 겹쳐 있으므로 클릭 시 링크 이동을 막는다.
- * @param strategy 표시·삭제 대상 전략
+ * 전략 목록 카드. 클릭하면 상세로 이동하며, 우측 컨트롤로 즐겨찾기·공유·순서변경·삭제를
+ * 직접 처리한다. 컨트롤은 카드 링크 위에 겹쳐 있으므로 클릭 시 링크 이동을 막는다.
  */
-function StrategyCard({ strategy: s }: { strategy: Strategy }) {
+function StrategyCard({
+  strategy: s,
+  index,
+  isFirst,
+  isLast,
+  onMove,
+  reordering,
+}: {
+  strategy: Strategy;
+  index: number;
+  isFirst: boolean;
+  isLast: boolean;
+  onMove: (index: number, dir: -1 | 1) => void;
+  reordering: boolean;
+}) {
   const qc = useQueryClient();
+  const invalidate = () => qc.invalidateQueries({ queryKey: ["strategies"] });
+
   const remove = useMutation({
     mutationFn: () => api.deleteStrategy(s.id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["strategies"] }),
+    onSuccess: invalidate,
+  });
+  const favorite = useMutation({
+    mutationFn: () =>
+      s.is_favorite ? api.unfavoriteStrategy(s.id) : api.favoriteStrategy(s.id),
+    onSuccess: invalidate,
+  });
+  const share = useMutation({
+    mutationFn: () =>
+      s.is_shared ? api.unshareStrategy(s.id) : api.shareStrategy(s.id),
+    onSuccess: invalidate,
   });
 
-  /** 링크 이동을 막고 확인 후 삭제한다. */
-  const handleDelete = (e: React.MouseEvent) => {
+  /** 카드 링크 이동을 막고 핸들러를 실행하는 래퍼. */
+  const stop = (fn: () => void) => (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    fn();
+  };
+
+  const handleDelete = stop(() => {
     if (window.confirm(`'${s.name}'을(를) 삭제할까요? 되돌릴 수 없습니다.`)) {
       remove.mutate();
     }
-  };
+  });
 
   return (
     <Link href={`/strategies/${s.id}`} className="group block">
@@ -135,10 +199,62 @@ function StrategyCard({ strategy: s }: { strategy: Strategy }) {
             {s.name}
             <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
           </span>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
+            {/* 순서 변경 */}
+            <div className="flex flex-col">
+              <button
+                onClick={stop(() => onMove(index, -1))}
+                disabled={isFirst || reordering}
+                aria-label={`${s.name} 위로`}
+                className="rounded p-0.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-30"
+              >
+                <ChevronUp className="h-3.5 w-3.5" />
+              </button>
+              <button
+                onClick={stop(() => onMove(index, 1))}
+                disabled={isLast || reordering}
+                aria-label={`${s.name} 아래로`}
+                className="rounded p-0.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-30"
+              >
+                <ChevronDown className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            {/* 즐겨찾기 */}
+            <button
+              onClick={stop(() => favorite.mutate())}
+              disabled={favorite.isPending}
+              aria-label={s.is_favorite ? `${s.name} 즐겨찾기 해제` : `${s.name} 즐겨찾기`}
+              aria-pressed={s.is_favorite}
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent disabled:opacity-50"
+            >
+              <Star
+                className={cn(
+                  "h-4 w-4",
+                  s.is_favorite && "fill-amber-400 text-amber-400",
+                )}
+              />
+            </button>
+            {/* 공유 토글 */}
+            <button
+              onClick={stop(() => share.mutate())}
+              disabled={share.isPending}
+              aria-label={s.is_shared ? `${s.name} 공유 해제` : `${s.name} 공유`}
+              aria-pressed={s.is_shared}
+              className={cn(
+                "rounded-md p-1 transition-colors hover:bg-accent disabled:opacity-50",
+                s.is_shared ? "text-primary" : "text-muted-foreground",
+              )}
+            >
+              {share.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Share2 className="h-4 w-4" />
+              )}
+            </button>
             <Badge variant={STATUS_VARIANT[s.status] ?? "muted"}>
               {STATUS_LABEL[s.status] ?? s.status}
             </Badge>
+            {s.is_shared && <Badge variant="secondary">공유 중</Badge>}
             <button
               onClick={handleDelete}
               disabled={remove.isPending}
@@ -172,8 +288,15 @@ function StrategyCard({ strategy: s }: { strategy: Strategy }) {
  */
 function CreateStrategy({ onCreated }: { onCreated: () => void }) {
   const create = useMutation({
-    mutationFn: ({ name, config }: { name: string; config: StrategyConfig }) =>
-      api.createStrategy(name, config),
+    mutationFn: ({
+      name,
+      config,
+      description,
+    }: {
+      name: string;
+      config: StrategyConfig;
+      description: string;
+    }) => api.createStrategy(name, config, description),
     onSuccess: onCreated,
   });
 
@@ -182,7 +305,9 @@ function CreateStrategy({ onCreated }: { onCreated: () => void }) {
       submitLabel="전략 생성"
       pending={create.isPending}
       error={create.isError ? (create.error as Error).message : null}
-      onSubmit={(name, config) => create.mutate({ name, config })}
+      onSubmit={(name, config, description) =>
+        create.mutate({ name, config, description })
+      }
     />
   );
 }

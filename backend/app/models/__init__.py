@@ -10,6 +10,7 @@ from app.models.models import (
     PriceTick,
     RiskLimit,
     Strategy,
+    StrategyLike,
     StrategyStatus,
     User,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "User",
     "Strategy",
     "StrategyStatus",
+    "StrategyLike",
     "Backtest",
     "Order",
     "OrderSide",

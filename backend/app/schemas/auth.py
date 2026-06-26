@@ -24,11 +24,18 @@ class UserOut(BaseModel):
 
     id: int
     email: EmailStr
+    # 공유 전략 목록에 표시할 닉네임(미설정 시 null → 화면에서 '익명').
+    display_name: str | None = None
     broker: Literal["kis", "toss"] = "kis"
     kis_account_no: str | None = None
     has_kis_credentials: bool = False
     # 통합 시세(토스) 연동 여부 — 국내·해외 시세를 토스로 통합 조회할 수 있는지.
     has_toss_quote: bool = False
+
+
+class UserProfileUpdate(BaseModel):
+    """사용자 프로필 갱신(현재 닉네임만). 빈 문자열은 null(미설정)로 정규화."""
+    display_name: str | None = Field(default=None, max_length=50)
 
 
 class KisCredentialsIn(BaseModel):

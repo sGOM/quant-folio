@@ -67,6 +67,8 @@ export const BROKER_INFO: Record<Broker, { name: string; market: string }> = {
 export interface UserOut {
   id: number;
   email: string;
+  /** 공유 전략 목록에 표시할 닉네임. 미설정이면 null. */
+  display_name: string | null;
   broker: Broker;
   kis_account_no: string | null;
   has_kis_credentials: boolean;
@@ -331,10 +333,65 @@ export type StrategyConfig =
 export interface Strategy {
   id: number;
   name: string;
+  /** 전략 설명(자유 텍스트). 미설정이면 null. */
+  description: string | null;
   config: StrategyConfig;
   status: "draft" | "backtested" | "live";
+  /** 대표 백테스트 ID(공유 시 성과 표시용). 미지정이면 null. */
+  featured_backtest_id: number | null;
+  /** 공유 여부(켜면 다른 사용자가 공유 목록에서 열람·복사·좋아요 가능). */
+  is_shared: boolean;
+  /** 즐겨찾기(목록 상단 고정). */
+  is_favorite: boolean;
+  /** 사용자 지정 표시 순서(작을수록 위). */
+  sort_order: number;
   created_at: string;
   updated_at: string;
+}
+
+/** 공유 시 노출되는 경량 백테스트 성과 요약. */
+export interface BacktestSummary {
+  id: number;
+  total_return: number | null;
+  mdd: number | null;
+  sharpe: number | null;
+  period_start: string;
+  period_end: string;
+}
+
+/** 공유 전략 목록 항목(작성자·좋아요·설명·대표 백테스트 포함). */
+export interface SharedStrategy {
+  id: number;
+  name: string;
+  /** 전략 설명. 미설정이면 null. */
+  description: string | null;
+  config: StrategyConfig;
+  /** 작성자 닉네임(미설정이면 "익명"). */
+  author_name: string;
+  like_count: number;
+  /** 현재 사용자가 좋아요를 눌렀는지. */
+  liked_by_me: boolean;
+  /** 현재 사용자 본인의 전략인지(좋아요 비활성 처리용). */
+  is_mine: boolean;
+  /** 대표 백테스트 성과(미지정이면 null). */
+  backtest: BacktestSummary | null;
+  created_at: string;
+}
+
+/** 공유 목록 필터·정렬 옵션. */
+export interface SharedQuery {
+  /** 전략 제목 부분일치. */
+  q?: string;
+  /** 종목코드(단일종목·리밸런싱 universe). */
+  symbol?: string;
+  /** 정렬 기준(기본 likes). */
+  sort?: "likes" | "name" | "recent";
+}
+
+/** 좋아요 토글 결과. */
+export interface LikeResult {
+  like_count: number;
+  liked_by_me: boolean;
 }
 
 export interface BacktestResult {
@@ -427,6 +484,16 @@ export const api = {
   /** 현재 로그인 세션의 사용자 정보. 미인증(쿠키 없음/만료)이면 401 로 실패한다. */
   me: () => request<UserOut>("/api/auth/me"),
 
+  /**
+   * 프로필(닉네임)을 갱신한다. 빈 값이면 미설정(null)으로 처리된다.
+   * @param display_name 공유 목록에 표시할 닉네임
+   */
+  updateProfile: (display_name: string) =>
+    request<UserOut>("/api/auth/me", {
+      method: "PATCH",
+      body: JSON.stringify({ display_name }),
+    }),
+
   // --- 증권사 연동(KIS/토스) ---
   /** 등록된 자격증명으로 토큰 발급을 시도해 연동 상태를 확인한다. */
   kisHealth: () =>
@@ -494,34 +561,102 @@ export const api = {
 
   /**
    * 신규 전략을 생성한다.
-   * @param name   전략 이름
-   * @param config 전략 설정(종목·이평 기간·초기자본 등)
+   * @param name        전략 이름
+   * @param config      전략 설정(종목·이평 기간·초기자본 등)
+   * @param description 전략 설명(선택)
    */
-  createStrategy: (name: string, config: StrategyConfig) =>
+  createStrategy: (name: string, config: StrategyConfig, description?: string) =>
     request<Strategy>("/api/strategies", {
       method: "POST",
-      body: JSON.stringify({ name, config }),
+      body: JSON.stringify({ name, config, description }),
     }),
 
   /**
-   * 전략의 이름/설정을 수정한다(전달된 필드만 갱신).
-   * @param id     전략 ID
-   * @param name   새 이름(미변경 시 생략)
-   * @param config 새 설정(미변경 시 생략)
+   * 전략의 이름/설명/설정을 수정한다(전달된 필드만 갱신).
+   * @param id          전략 ID
+   * @param name        새 이름(미변경 시 생략)
+   * @param config      새 설정(미변경 시 생략)
+   * @param description 새 설명(미변경 시 생략, 빈 문자열이면 설명 제거)
    */
   updateStrategy: (
     id: number,
     name?: string,
     config?: StrategyConfig,
+    description?: string,
   ) =>
     request<Strategy>(`/api/strategies/${id}`, {
       method: "PATCH",
-      body: JSON.stringify({ name, config }),
+      body: JSON.stringify({ name, config, description }),
+    }),
+
+  /**
+   * 대표 백테스트를 지정/해제한다(공유 시 성과 표시용).
+   * @param id         전략 ID
+   * @param backtestId 대표로 지정할 백테스트 ID, null 이면 해제
+   */
+  setFeaturedBacktest: (id: number, backtestId: number | null) =>
+    request<Strategy>(`/api/strategies/${id}/featured-backtest`, {
+      method: "PUT",
+      body: JSON.stringify({ backtest_id: backtestId }),
     }),
 
   /** 전략을 삭제한다. @param id 전략 ID */
   deleteStrategy: (id: number) =>
     request<void>(`/api/strategies/${id}`, { method: "DELETE" }),
+
+  // --- 공유/복사/좋아요/정렬·즐겨찾기 ---
+  /** 전략을 공유 상태로 전환한다. @param id 전략 ID */
+  shareStrategy: (id: number) =>
+    request<Strategy>(`/api/strategies/${id}/share`, { method: "POST" }),
+
+  /** 전략 공유를 해제한다. @param id 전략 ID */
+  unshareStrategy: (id: number) =>
+    request<Strategy>(`/api/strategies/${id}/share`, { method: "DELETE" }),
+
+  /** 전략을 즐겨찾기로 표시한다. @param id 전략 ID */
+  favoriteStrategy: (id: number) =>
+    request<Strategy>(`/api/strategies/${id}/favorite`, { method: "POST" }),
+
+  /** 전략 즐겨찾기를 해제한다. @param id 전략 ID */
+  unfavoriteStrategy: (id: number) =>
+    request<Strategy>(`/api/strategies/${id}/favorite`, { method: "DELETE" }),
+
+  /**
+   * 내 전략 표시 순서를 일괄 갱신한다(배열 순서대로 0..n).
+   * @param orderedIds 원하는 표시 순서대로의 전략 ID 배열
+   */
+  reorderStrategies: (orderedIds: number[]) =>
+    request<void>("/api/strategies/reorder", {
+      method: "PATCH",
+      body: JSON.stringify({ ordered_ids: orderedIds }),
+    }),
+
+  /**
+   * 공유된 전체 사용자의 전략 목록을 조회한다(좋아요·작성자·설명·대표 백테스트 포함).
+   * @param params 제목(q)·종목(symbol) 필터와 정렬(sort) 옵션
+   */
+  listSharedStrategies: (params: SharedQuery = {}) => {
+    const sp = new URLSearchParams();
+    if (params.q) sp.set("q", params.q);
+    if (params.symbol) sp.set("symbol", params.symbol);
+    if (params.sort) sp.set("sort", params.sort);
+    const qs = sp.toString();
+    return request<SharedStrategy[]>(
+      `/api/strategies/shared${qs ? `?${qs}` : ""}`,
+    );
+  },
+
+  /** 공유 전략(또는 본인 전략)을 내 전략으로 복사한다. @param id 원본 전략 ID */
+  copyStrategy: (id: number) =>
+    request<Strategy>(`/api/strategies/${id}/copy`, { method: "POST" }),
+
+  /** 공유 전략에 좋아요를 누른다(인당 1회). @param id 전략 ID */
+  likeStrategy: (id: number) =>
+    request<LikeResult>(`/api/strategies/${id}/like`, { method: "POST" }),
+
+  /** 좋아요를 취소한다. @param id 전략 ID */
+  unlikeStrategy: (id: number) =>
+    request<LikeResult>(`/api/strategies/${id}/like`, { method: "DELETE" }),
 
   // --- 백테스트 ---
   /**
