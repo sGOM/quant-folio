@@ -64,6 +64,15 @@ _SEED: list[tuple[str, str, str, str]] = [
     ("042660", "한화오션", "Hanwha Ocean", "KOSPI"),
     ("064350", "현대로템", "Hyundai Rotem", "KOSPI"),
     ("012450", "한화에어로스페이스", "Hanwha Aerospace", "KOSPI"),
+    ("011070", "LG이노텍", "LG Innotek", "KOSPI"),
+    ("097950", "CJ제일제당", "CJ CheilJedang", "KOSPI"),
+    ("034020", "두산에너빌리티", "Doosan Enerbility", "KOSPI"),
+    ("009540", "HD한국조선해양", "HD Korea Shipbuilding & Offshore Engineering", "KOSPI"),
+    ("161390", "한국타이어앤테크놀로지", "Hankook Tire & Technology", "KOSPI"),
+    ("267250", "HD현대", "HD Hyundai", "KOSPI"),
+    ("010140", "삼성중공업", "Samsung Heavy Industries", "KOSPI"),
+    ("352820", "하이브", "HYBE", "KOSPI"),
+    ("323410", "카카오뱅크", "KakaoBank", "KOSPI"),
     # KOSDAQ 대형주
     ("247540", "에코프로비엠", "Ecopro BM", "KOSDAQ"),
     ("086520", "에코프로", "Ecopro", "KOSDAQ"),
@@ -136,6 +145,15 @@ def get_catalog() -> list[dict[str, str]]:
     if _cache is None:
         _cache = _build_catalog()
     return _cache
+
+
+def get_name_map() -> dict[str, str]:
+    """종목코드 → 한글명 매핑 전체를 반환한다(카탈로그 기반, 프로세스 캐시).
+
+    체결/주문 로그처럼 코드만 있는 곳에서 종목명을 붙이는 용도. 동기(최초 1회
+    블로킹)이므로 호출자는 스레드풀에서 실행할 것.
+    """
+    return {item["code"]: item["name"] for item in get_catalog()}
 
 
 def search_symbols(query: str, limit: int = 20) -> list[dict[str, str]]:

@@ -272,14 +272,50 @@ export interface CustomConfig extends BaseConfig {
   exit: ConditionGroup;
 }
 
+/**
+ * 종합점수 카테고리 가중치(합=1.0). method="score" 에서 사용.
+ * quality(ROE·저부채·FCF)는 OpenDART 재무데이터가 필요하며, 키가 없으면 중립 처리된다.
+ */
+export interface FactorWeights {
+  momentum: number;
+  value: number;
+  lowvol: number;
+  quality: number;
+  growth: number;
+}
+
 /** 리밸런싱 종목 선정 규칙. */
 export interface RebalanceSelection {
-  /** "momentum": 룩백 수익률 상위 top_n / "all": universe 전체. */
-  method: "momentum" | "all";
+  /**
+   * "momentum": 룩백 수익률 상위 top_n / "all": universe 전체 /
+   * "score": 멀티팩터 종합점수 상위 top_n(factor_weights 로 가중) /
+   * "custom": 각 종목에 사용자 정의 진입·청산 규칙을 적용해 현재 편입 국면인 종목만 동일비중.
+   */
+  method: "momentum" | "all" | "score" | "custom";
   /** 모멘텀 측정 봉 수. */
   lookback: number;
-  /** 선정 종목 수(momentum). */
+  /** 선정 종목 수(momentum/score). */
   top_n: number;
+  /** method="score": 종합점수 카테고리 가중치(합=1.0). */
+  factor_weights?: FactorWeights;
+  /** method="custom": 편입(매수) 논리식. 각 종목에 독립 적용. */
+  entry?: ConditionGroup;
+  /** method="custom": 청산(매도) 논리식. 각 종목에 독립 적용. */
+  exit?: ConditionGroup;
+}
+
+/** 현금화 오버레이(레짐 필터): 기준지수가 이동평균 아래면 전량 청산·매수 중단. */
+export interface RegimeFilter {
+  /** 오버레이 사용 여부. */
+  enabled: boolean;
+  /** 추세 판정 기준지수. */
+  index: "KOSPI" | "KOSDAQ";
+  /** 추세 판정 이동평균 기간(거래일). */
+  ma_period: number;
+  /** 재진입 히스테리시스 버퍼: 지수가 MA×(1+이 값) 이상 회복해야 재편입(휩쏘 억제). 0 이면 즉시. */
+  reentry_buffer_pct?: number;
+  /** 청산 히스테리시스 버퍼: 지수가 MA×(1−이 값) 미만일 때 청산. 0 이면 MA 하회 즉시. */
+  exit_buffer_pct?: number;
 }
 
 /**
@@ -291,8 +327,8 @@ export interface RebalanceConfig {
   /** 후보 종목코드 목록. */
   universe: string[];
   selection: RebalanceSelection;
-  /** 선정 종목 비중 방식(현재 동일비중). */
-  weighting: "equal";
+  /** 선정 종목 비중 방식. "equal"=동일비중 / "score"=순위 기반 선형 가중(method="score" 전용). */
+  weighting: "equal" | "score";
   cadence: "daily" | "weekly" | "monthly";
   /** weekly: 0=월~4=금. */
   rebalance_weekday?: number | null;
@@ -302,6 +338,8 @@ export interface RebalanceConfig {
   rebalance_time: string;
   /** 목표 대비 비중 편차 임계(0~1). 초과 종목만 매매. */
   drift_band_pct: number;
+  /** 현금화 오버레이(레짐 필터). null/미설정이면 미적용(항상 100% 투자). */
+  regime_filter?: RegimeFilter | null;
   /** 이 전략이 운용할 배정 자본(원). */
   capital: number;
   /** 위탁수수료율. */
@@ -394,14 +432,44 @@ export interface LikeResult {
   liked_by_me: boolean;
 }
 
+/** 리밸런싱 백테스트의 개별 체결 로그(매수/매도 + 그 순간 수익률). */
+export interface BacktestTrade {
+  /** 체결일(ISO). */
+  t: string;
+  /** 종목코드. */
+  symbol: string;
+  side: "buy" | "sell";
+  /** 원화 거래대금(근사). */
+  amount: number;
+  /** 체결가(종가). */
+  price: number | null;
+  /** 그 순간의 포트폴리오 누적수익률(시작=0). */
+  port_return: number | null;
+  /** 매도 시 해당 포지션의 원가 대비 보유수익률(매수는 null). */
+  position_return: number | null;
+  /** 사유: 'rebalance'(정기) 또는 'regime_exit'(레짐 현금화). */
+  reason: string;
+}
+
 export interface BacktestResult {
   total_return: number | null;
   mdd: number | null;
   sharpe: number | null;
+  /** 연평균 복리수익률(리밸런싱 백테스트에서 제공). */
+  cagr?: number | null;
+  /** 종목단위 승률(리밸런싱 전략에는 없음 → null). */
   win_rate: number | null;
   num_trades: number;
+  /** 리밸런싱 실행 횟수(리밸런싱 백테스트). */
+  num_rebalances?: number;
+  /** 평균 회전율 Σ|Δw|(리밸런싱 백테스트). */
+  avg_turnover?: number | null;
   equity_curve: { t: string; v: number }[];
-  markers: { t: string; type: "buy" | "sell"; price: number }[];
+  markers: { t: string; type: string; price?: number }[];
+  /** 종료 시점 보유 비중(종목코드 → 비중). 리밸런싱 백테스트. */
+  holdings?: Record<string, number>;
+  /** 매수/매도 체결 로그. 리밸런싱 백테스트. */
+  trades?: BacktestTrade[];
 }
 
 export interface Backtest {
@@ -422,6 +490,145 @@ export interface SymbolHit {
   name: string;
   name_en: string;
   market: string;
+}
+
+// ─────────────────────────── 지표(섹터/종목 스냅샷) 타입 ───────────────────────────
+
+/** 지표 조회 시장 필터. */
+export type MetricMarket = "ALL" | "KOSPI" | "KOSDAQ";
+
+/** 섹터 지표 정렬 기준. */
+export type SectorSort = "rs" | "mom_6m" | "mom_3m" | "value_trend";
+
+/** 종목 지표 정렬 기준. */
+export type StockSort = "score" | "mom_6m" | "mom_3m" | "per" | "pbr" | "div";
+
+/** 종목 지표 조회 파라미터. */
+export interface StocksQuery {
+  market?: MetricMarket;
+  sort?: StockSort;
+  /** 최소 일평균거래대금(원). */
+  min_value?: number;
+  /** 최소 시가총액(원). */
+  min_mcap?: number;
+  /** 최대 반환 건수. */
+  limit?: number;
+}
+
+/** 섹터별 퀀트 지표 스냅샷(백엔드 /api/metrics/sectors 응답). */
+export interface SectorMetric {
+  name: string;
+  market: string;
+  /** 1개월 모멘텀(소수 비율). */
+  mom_1m: number | null;
+  /** 3개월 모멘텀(소수 비율). */
+  mom_3m: number | null;
+  /** 6개월 모멘텀(소수 비율). */
+  mom_6m: number | null;
+  /** 상대강도(126일). */
+  rs_126: number | null;
+  /** 연환산 변동성(소수 비율). */
+  vol_ann: number | null;
+  /** 위험조정 모멘텀. */
+  risk_adj_mom: number | null;
+  /** 거래대금 추세. */
+  value_trend: number | null;
+  /** 52주 고가 대비 비율(소수 비율). */
+  high_52w_ratio: number | null;
+  /** 252일 최대 낙폭(소수 비율, 음수). */
+  mdd_252: number | null;
+  // 섹터 PER/PBR/배당 중앙값은 KRX 업종 구성종목 API 미동작으로 산출 불가하여 제외됨.
+}
+
+/** 섹터 지표 응답 래퍼. */
+export interface SectorsOut {
+  /** 기준일(YYYY-MM-DD). */
+  as_of: string;
+  items: SectorMetric[];
+}
+
+/** 종목별 퀀트 지표 스냅샷(백엔드 /api/metrics/stocks 응답). */
+export interface StockMetric {
+  code: string;
+  name: string;
+  market: string;
+  /** 현재가(원). */
+  price: number | null;
+  /** 당일 등락률(소수 비율). */
+  change_rate: number | null;
+  /** 시가총액(원). */
+  market_cap: number | null;
+  /** 20일 평균 거래대금(원). */
+  avg_value_20: number | null;
+  per: number | null;
+  pbr: number | null;
+  /** 배당수익률(퍼센트 값, pykrx 원값. 예: 2.1 = 2.1%). */
+  div: number | null;
+  /** 1개월 모멘텀(소수 비율). */
+  mom_1m: number | null;
+  /** 3개월 모멘텀(소수 비율). */
+  mom_3m: number | null;
+  /** 6개월 모멘텀(소수 비율). */
+  mom_6m: number | null;
+  /** 12-1개월 모멘텀(소수 비율). */
+  mom_12_1: number | null;
+  /** 52주 고가 대비 비율(소수 비율). */
+  high_52w_ratio: number | null;
+  /** RSI 14일. */
+  rsi14: number | null;
+  /** 연환산 변동성(소수 비율). */
+  vol_ann: number | null;
+  /** 252일 최대 낙폭(소수 비율, 음수). */
+  mdd_252: number | null;
+  /** 이동평균 정배열 여부. */
+  trend_aligned: boolean;
+  /** 200일 이동평균 위 여부. */
+  above_sma200: boolean;
+  /** 종합 점수. */
+  score: number | null;
+  /** 밸류 세부 점수. */
+  score_value: number | null;
+  /** 모멘텀 세부 점수. */
+  score_momentum: number | null;
+  /** 저변동성 세부 점수. */
+  score_lowvol: number | null;
+}
+
+/** 종목 지표 응답 래퍼. */
+export interface StocksOut {
+  /** 기준일(YYYY-MM-DD). */
+  as_of: string;
+  /** 전체 종목 수(필터 적용 전). */
+  count: number;
+  items: StockMetric[];
+}
+
+/** 소형주 턴어라운드 스크리너 후보 1건(백엔드 /api/screener/turnaround). */
+export interface TurnaroundCandidate {
+  code: string;
+  name: string;
+  market: string;
+  market_cap: number;
+  avg_value_20: number;
+  turnover_surge: number | null;
+  net_income: number | null;
+  debt_ratio: number | null;
+  turnaround: number | null;
+  net_growth: number | null;
+  f_score: number | null;
+  loss_years_3: number | null;
+  per: number | null;
+  pbr: number | null;
+  score: number;
+}
+
+export interface TurnaroundScreenOut {
+  as_of: string;
+  market: string;
+  scanned: number;
+  count: number;
+  opendart_enabled: boolean;
+  items: TurnaroundCandidate[];
 }
 
 export interface Position {
@@ -709,4 +916,56 @@ export const api = {
     request<SymbolHit[]>(
       `/api/symbols/search?q=${encodeURIComponent(q)}&limit=${limit}`,
     ),
+
+  /** 종목코드 → 한글명 전체 매핑(체결/주문 로그에 종목명 표시용). */
+  symbolNames: () => request<Record<string, string>>("/api/symbols/names"),
+
+  // --- 지표(섹터/종목 스냅샷) ---
+  /**
+   * 섹터별 퀀트 지표 스냅샷을 조회한다.
+   * @param market ALL|KOSPI|KOSDAQ
+   * @param sort   정렬 기준(rs|mom_6m|mom_3m|value_trend)
+   */
+  getSectors: (market: MetricMarket = "ALL", sort: SectorSort = "rs") => {
+    const sp = new URLSearchParams({ market, sort });
+    return request<SectorsOut>(`/api/metrics/sectors?${sp.toString()}`);
+  },
+
+  /**
+   * 종목별 퀀트 지표 스냅샷을 조회한다.
+   * @param params 시장·정렬·최소거래대금·최소시총·표시개수
+   */
+  getStocks: (params: StocksQuery = {}) => {
+    const sp = new URLSearchParams();
+    if (params.market) sp.set("market", params.market);
+    if (params.sort) sp.set("sort", params.sort);
+    if (params.min_value != null) sp.set("min_value", String(params.min_value));
+    if (params.min_mcap != null) sp.set("min_mcap", String(params.min_mcap));
+    if (params.limit != null) sp.set("limit", String(params.limit));
+    const qs = sp.toString();
+    return request<StocksOut>(`/api/metrics/stocks${qs ? `?${qs}` : ""}`);
+  },
+
+  /**
+   * 소형주 턴어라운드 스크리너: 전 시장을 스캔해 하드 필터(시총 하위·거래대금 급증·
+   * 저부채·만성적자 제외·흑자전환)를 통과한 후보를 반환한다.
+   */
+  screenTurnaround: (
+    params: {
+      market?: MetricMarket;
+      top_n?: number;
+      smallcap_pct?: number;
+      surge?: number;
+      max_debt?: number;
+    } = {},
+  ) => {
+    const sp = new URLSearchParams();
+    if (params.market) sp.set("market", params.market);
+    if (params.top_n != null) sp.set("top_n", String(params.top_n));
+    if (params.smallcap_pct != null) sp.set("smallcap_pct", String(params.smallcap_pct));
+    if (params.surge != null) sp.set("surge", String(params.surge));
+    if (params.max_debt != null) sp.set("max_debt", String(params.max_debt));
+    const qs = sp.toString();
+    return request<TurnaroundScreenOut>(`/api/screener/turnaround${qs ? `?${qs}` : ""}`);
+  },
 };

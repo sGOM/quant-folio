@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Operand, RebalanceConfig, StrategyConfig, StrategyType } from "@/lib/api";
+import { ConditionGroup, Operand, RebalanceConfig, StrategyConfig, StrategyType } from "@/lib/api";
 import {
   STRATEGY_TYPES,
   STRATEGY_TYPE_LABELS,
@@ -15,9 +15,13 @@ import { RuleBuilder } from "@/components/RuleBuilder";
 import { SymbolSearch } from "@/components/SymbolSearch";
 import { Button } from "@/components/ui/button";
 
-/** 입력/셀렉트 공용 스타일(shadcn input 토큰). 자식 컴포넌트에도 동일 톤을 적용한다. */
+/**
+ * 입력/셀렉트 공용 스타일(shadcn input 토큰). 자식 컴포넌트에도 동일 톤을 적용한다.
+ * bg-transparent 대신 bg-input 을 명시해 네이티브 select 가 OS 기본(흰 배경)
+ * 콤보박스로 렌더되는 것을 방지하고, text-foreground 로 글씨 대비를 보장한다.
+ */
 const INPUT =
-  "flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
+  "flex h-9 w-full rounded-md border border-input bg-input text-foreground px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
 
 /**
  * 전략 생성·편집 공용 폼. 유형 선택에 따라 파라미터 입력 필드를 동적으로 렌더하고,
@@ -147,10 +151,18 @@ export function StrategyForm({
       if (new Set(config.universe).size !== config.universe.length)
         return "중복 종목코드가 있습니다.";
       if (
-        config.selection.method === "momentum" &&
+        (config.selection.method === "momentum" || config.selection.method === "score") &&
         config.selection.top_n > config.universe.length
       )
         return "선정 종목 수(top_n)는 종목 수 이하여야 합니다.";
+      if (config.selection.method === "score") {
+        const fw = config.selection.factor_weights ?? DEFAULT_FACTOR_WEIGHTS;
+        const sum = fw.momentum + fw.value + fw.lowvol + fw.quality + fw.growth;
+        if (Math.abs(sum - 1) > 1e-6)
+          return `팩터 가중치 합은 1.00 이어야 합니다(현재 ${sum.toFixed(2)}).`;
+      }
+      if (config.weighting === "score" && config.selection.method !== "score")
+        return "'점수 순위 가중'은 선정 방식이 멀티팩터일 때만 사용할 수 있습니다.";
       if (!Number.isFinite(config.capital) || config.capital <= 0)
         return "배정 자본은 0보다 커야 합니다.";
       if (!/^\d{1,2}:\d{2}$/.test(config.rebalance_time))
@@ -595,6 +607,44 @@ function CostField({
   );
 }
 
+/** 리밸런싱 custom 선정의 기본 진입/청산 규칙(SMA5>SMA20 / SMA5<SMA20). 종가 기반만 사용. */
+const DEFAULT_REBAL_ENTRY: ConditionGroup = {
+  combinator: "and",
+  children: [{ left: { kind: "sma", period: 5 }, op: ">", right: { kind: "sma", period: 20 } }],
+};
+const DEFAULT_REBAL_EXIT: ConditionGroup = {
+  combinator: "and",
+  children: [{ left: { kind: "sma", period: 5 }, op: "<", right: { kind: "sma", period: 20 } }],
+};
+
+/** method="score" 전환 시 기본 팩터 가중치(metrics 화면과 동일한 0.4/0.3/0.3, quality=growth=0). */
+const DEFAULT_FACTOR_WEIGHTS = { momentum: 0.4, value: 0.3, lowvol: 0.3, quality: 0.0, growth: 0.0 };
+
+/** 팩터 카테고리 메타(표시명·설명). */
+const FACTOR_META: { key: keyof typeof DEFAULT_FACTOR_WEIGHTS; label: string; hint: string }[] = [
+  { key: "momentum", label: "모멘텀", hint: "최근 1·3·6M 수익률·52주 고가 근접" },
+  { key: "value", label: "밸류", hint: "저PER·저PBR·고배당" },
+  { key: "lowvol", label: "저변동", hint: "낮은 변동성·얕은 낙폭" },
+  { key: "quality", label: "퀄리티", hint: "고ROE·저부채·FCF흑자 (OpenDART 재무데이터)" },
+  { key: "growth", label: "성장", hint: "영업이익·순이익 YoY 성장·흑자전환 (OpenDART 재무데이터)" },
+];
+
+/** 팩터 가중치 합계 배지. 합=1.00 이면 정상(초록), 아니면 경고(주황). */
+function FactorWeightSum({ weights }: { weights: { momentum: number; value: number; lowvol: number; quality: number; growth: number } }) {
+  const sum = weights.momentum + weights.value + weights.lowvol + weights.quality + weights.growth;
+  const ok = Math.abs(sum - 1) < 1e-6;
+  return (
+    <span
+      className={`rounded px-1.5 py-0.5 text-[11px] tabular-nums ${
+        ok ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" : "bg-amber-500/15 text-amber-600 dark:text-amber-400"
+      }`}
+      title={ok ? "합계 정상" : "합계가 1.00 이어야 저장됩니다"}
+    >
+      합계 {sum.toFixed(2)}
+    </span>
+  );
+}
+
 /** 리밸런싱 전략 전용 입력 — universe·선정규칙·주기·드리프트밴드·자본. */
 function RebalanceFields({
   config,
@@ -618,6 +668,49 @@ function RebalanceFields({
   }
   function patchSelection(p: Partial<RebalanceConfig["selection"]>) {
     patch({ selection: { ...config.selection, ...p } } as Partial<StrategyConfig>);
+  }
+  /** 선정 방식 변경. custom 전환 시 진입/청산 규칙, score 전환 시 팩터 가중치 기본값을 채운다. */
+  function changeSelectionMethod(method: RebalanceConfig["selection"]["method"]) {
+    if (method === "custom") {
+      // score→custom 전환 시 weighting=score 였다면 equal 로 되돌린다(백엔드 제약).
+      patch({
+        selection: {
+          ...config.selection,
+          method,
+          entry: config.selection.entry ?? DEFAULT_REBAL_ENTRY,
+          exit: config.selection.exit ?? DEFAULT_REBAL_EXIT,
+        },
+        ...(config.weighting === "score" ? { weighting: "equal" } : {}),
+      } as Partial<StrategyConfig>);
+    } else if (method === "score") {
+      patchSelection({
+        method,
+        factor_weights: config.selection.factor_weights ?? { ...DEFAULT_FACTOR_WEIGHTS },
+      });
+    } else {
+      // score→다른 방식 전환 시 weighting=score 였다면 equal 로 되돌린다(백엔드 제약).
+      patch({
+        selection: { ...config.selection, method },
+        ...(config.weighting === "score" ? { weighting: "equal" } : {}),
+      } as Partial<StrategyConfig>);
+    }
+  }
+  /** 팩터 가중치 1개 변경(0~1). 합계는 UI 에 표시하고, 저장 시 백엔드가 합=1 을 검증한다. */
+  function patchFactorWeight(key: keyof typeof DEFAULT_FACTOR_WEIGHTS, v: number) {
+    const cur = config.selection.factor_weights ?? DEFAULT_FACTOR_WEIGHTS;
+    patchSelection({ factor_weights: { ...cur, [key]: Number.isFinite(v) ? v : 0 } });
+  }
+  const regime = config.regime_filter ?? null;
+  function toggleRegime(on: boolean) {
+    patch({
+      regime_filter: on
+        ? { enabled: true, index: "KOSPI", ma_period: 200, reentry_buffer_pct: 0.05, exit_buffer_pct: 0 }
+        : null,
+    } as Partial<StrategyConfig>);
+  }
+  function patchRegime(p: Partial<NonNullable<RebalanceConfig["regime_filter"]>>) {
+    if (!regime) return;
+    patch({ regime_filter: { ...regime, ...p } } as Partial<StrategyConfig>);
   }
 
   return (
@@ -653,13 +746,13 @@ function RebalanceFields({
         <Field label="선정 방식">
           <select
             value={config.selection.method}
-            onChange={(e) =>
-              patchSelection({ method: e.target.value as "momentum" | "all" })
-            }
+            onChange={(e) => changeSelectionMethod(e.target.value as RebalanceConfig["selection"]["method"])}
             className={INPUT}
           >
             <option value="momentum">모멘텀 상위 N</option>
+            <option value="score">멀티팩터 종합점수 상위 N</option>
             <option value="all">전체 동일비중</option>
+            <option value="custom">사용자 규칙(편입/청산)</option>
           </select>
         </Field>
         {config.selection.method === "momentum" && (
@@ -676,6 +769,28 @@ function RebalanceFields({
               value={config.selection.top_n}
               onChange={(v) => patchSelection({ top_n: v })}
             />
+          </>
+        )}
+        {config.selection.method === "score" && (
+          <>
+            <NumField
+              label="선정 종목 수(top_n)"
+              min={1}
+              value={config.selection.top_n}
+              onChange={(v) => patchSelection({ top_n: v })}
+            />
+            <Field label="비중 방식">
+              <select
+                value={config.weighting}
+                onChange={(e) =>
+                  patch({ weighting: e.target.value as RebalanceConfig["weighting"] } as Partial<StrategyConfig>)
+                }
+                className={INPUT}
+              >
+                <option value="equal">동일비중</option>
+                <option value="score">점수 순위 가중</option>
+              </select>
+            </Field>
           </>
         )}
         <NumField
@@ -696,6 +811,63 @@ function RebalanceFields({
           }
         />
       </div>
+
+      {config.selection.method === "score" && (
+        <div className="rounded-md border p-3 space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-medium">팩터 가중치</span>
+            <FactorWeightSum weights={config.selection.factor_weights ?? DEFAULT_FACTOR_WEIGHTS} />
+          </div>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            각 카테고리 z-스코어를 가중 합산해 종합점수를 매기고 상위 {config.selection.top_n}종목을
+            선정합니다. 가중치 합은 <b className="text-muted-foreground">1.00</b>이어야 저장됩니다.
+            퀄리티는 OpenDART 재무데이터가 필요하며, 키가 없으면 중립 처리됩니다.
+          </p>
+          <div className="space-y-2.5">
+            {FACTOR_META.map((f) => {
+              const w = (config.selection.factor_weights ?? DEFAULT_FACTOR_WEIGHTS)[f.key];
+              return (
+                <div key={f.key} className="grid grid-cols-[5rem_1fr_3rem] items-center gap-2">
+                  <span className="text-xs font-medium" title={f.hint}>
+                    {f.label}
+                  </span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={w}
+                    onChange={(e) => patchFactorWeight(f.key, Number(e.target.value))}
+                    className="w-full accent-primary"
+                    aria-label={`${f.label} 가중치`}
+                  />
+                  <span className="text-right text-xs tabular-nums text-muted-foreground">
+                    {w.toFixed(2)}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {config.selection.method === "custom" && (
+        <div className="space-y-2">
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            universe 각 종목에 아래 규칙을 독립 적용해, 진입 신호가 난 뒤 아직 청산되지
+            않은(현재 보유 국면) 종목만 동일비중으로 편입합니다. top_n·룩백은 사용하지 않습니다.
+            리밸런싱은 종가만 사용하므로 <b className="text-muted-foreground">종가 기반 지표
+            (가격 종가·SMA·EMA·RSI·MACD·상수)</b>만 쓸 수 있습니다(OHLC/거래량 불가).
+          </p>
+          <RuleBuilder
+            entry={config.selection.entry ?? DEFAULT_REBAL_ENTRY}
+            exit={config.selection.exit ?? DEFAULT_REBAL_EXIT}
+            onChange={(field, group) =>
+              patchSelection({ [field]: group } as Partial<RebalanceConfig["selection"]>)
+            }
+          />
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3">
         <Field label="리밸런싱 주기">
@@ -755,10 +927,73 @@ function RebalanceFields({
         )}
       </div>
 
+      <div className="rounded-md border p-3 space-y-3">
+        <label className="flex items-center gap-2 text-sm font-medium">
+          <input
+            type="checkbox"
+            checked={!!regime?.enabled}
+            onChange={(e) => toggleRegime(e.target.checked)}
+          />
+          현금화 오버레이(레짐 필터)
+        </label>
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          기준지수가 이동평균 아래(하락 추세)면 보유를 전량 청산·현금화하고 신규 매수를
+          중단합니다. 추세가 이동평균을 재진입 버퍼만큼 회복하면 그 즉시 재편입합니다(하락장 방어).
+        </p>
+        {regime?.enabled && (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="기준지수">
+                <select
+                  value={regime.index}
+                  onChange={(e) =>
+                    patchRegime({ index: e.target.value as "KOSPI" | "KOSDAQ" })
+                  }
+                  className={INPUT}
+                >
+                  <option value="KOSPI">KOSPI</option>
+                  <option value="KOSDAQ">KOSDAQ</option>
+                </select>
+              </Field>
+              <NumField
+                label="이동평균 기간(거래일)"
+                min={5}
+                max={400}
+                value={regime.ma_period}
+                onChange={(v) => patchRegime({ ma_period: v })}
+              />
+              <NumField
+                label="재진입 버퍼 %"
+                min={0}
+                max={20}
+                step={0.5}
+                value={Number(((regime.reentry_buffer_pct ?? 0) * 100).toFixed(4))}
+                onChange={(v) =>
+                  patchRegime({ reentry_buffer_pct: Number.isFinite(v) ? v / 100 : 0 })
+                }
+              />
+              <NumField
+                label="청산 버퍼 %"
+                min={0}
+                max={20}
+                step={0.5}
+                value={Number(((regime.exit_buffer_pct ?? 0) * 100).toFixed(4))}
+                onChange={(v) =>
+                  patchRegime({ exit_buffer_pct: Number.isFinite(v) ? v / 100 : 0 })
+                }
+              />
+            </div>
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              재진입 버퍼: 지수가 이동평균을 이 비율만큼 상회해야 재편입(가짜 반등·휩쏘 억제,
+              권장 5%). 청산 버퍼: 이동평균을 이 비율만큼 하회할 때 청산(0%면 하회 즉시).
+            </p>
+          </>
+        )}
+      </div>
+
       <p className="text-[11px] leading-relaxed text-muted-foreground">
-        ※ 리밸런싱은 백테스트를 지원하지 않습니다. universe 종목은 이 전략이 단독으로
-        운용한다고 가정합니다(다른 전략과 종목이 겹치지 않게 하세요). 지정 시각 이후
-        가장 가까운 영업일·장중에 실행됩니다.
+        ※ universe 종목은 이 전략이 단독으로 운용한다고 가정합니다(다른 전략과 종목이
+        겹치지 않게 하세요). 지정 시각 이후 가장 가까운 영업일·장중에 실행됩니다.
       </p>
     </div>
   );

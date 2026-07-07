@@ -26,7 +26,14 @@ from app.services.data.loader import (
     load_ohlcv,
     upsert_price_ticks,
 )
-from app.services.market import now_kst
+from app.services.market import is_market_open, now_kst
+from app.services.metrics import (
+    _approx_start,
+    _fetch_index_ohlcv,
+    _last_business_day,
+    _ymd,
+    compute_universe_scores,
+)
 from engine import risk
 from engine.executor import execute_signal, make_idempotency_key
 from engine.rebalance import (
@@ -40,7 +47,11 @@ logger = logging.getLogger("engine.rebalance_runner")
 
 _POLL_INTERVAL = 60  # 초 — 발화 시점 점검 주기
 _LAST_PREFIX = "rebalance:last:"
+_REGIME_PREFIX = "rebalance:regime:"  # 직전 레짐 상태(risk-off 여부) 보관
 _LAST_TTL = 60 * 60 * 24 * 90  # 90일(휴장 등 대비 여유)
+
+# pykrx 종합지수 티커(레짐 필터 기준지수). 백테스트 라우트와 동일 규약.
+_REGIME_INDEX_TICKER = {"KOSPI": "1001", "KOSDAQ": "2001"}
 
 
 class RebalanceRunner:
@@ -92,13 +103,47 @@ class RebalanceRunner:
         logger.info("리밸런싱 전략 %d 실행 종료", self.strategy_id)
 
     async def _maybe_rebalance(self) -> None:
+        """정기 cadence 발화와 레짐 전환(청산/재진입)을 분리해 점검한다.
+
+        백테스트 엔진과 동일 규약:
+          - 청산: risk-off 이면 cadence 와 무관하게 즉시 전량 청산.
+          - 재진입: risk-off→risk-on 회복 & 현금 상태이면 cadence 를 기다리지 않고 즉시 매수.
+          - 정기 리밸런싱: is_rebalance_due 일 때만 실행하며, 이때만 마지막 실행일을 소비한다.
+            레짐 재진입은 월간 스케줄(_set_last)을 소비하지 않아 정규 cadence 를 유지한다.
+        """
         now = now_kst()
-        last = await self._get_last()
-        if not is_rebalance_due(self._cfg, last, now):
+        rf = self._cfg.get("regime_filter") or {}
+        regime_enabled = bool(rf.get("enabled"))
+
+        risk_off = False
+        reentry = False
+        # 레짐 전환 판정은 장중에만(주문 실행 가능 시점). 매 tick 확인해 회복 즉시 반응.
+        if regime_enabled and is_market_open(now):
+            risk_off = await self._is_risk_off()
+            prev = await self._get_regime()
+            await self._set_regime(risk_off)
+            # risk-off → risk-on 전환이고 현재 현금(보유 없음) 상태면 재진입 트리거.
+            if not risk_off and prev is True and not await self._has_holdings():
+                reentry = True
+
+        # 청산: cadence 무관, 즉시. 마지막 실행일(월간 스케줄)은 소비하지 않는다.
+        if risk_off:
+            logger.info("리밸런싱 전략 %d 레짐 위험회피 — 즉시 청산 점검", self.strategy_id)
+            await self._rebalance_once(now, risk_off=True, bar_tag="regime")
             return
-        logger.info("리밸런싱 전략 %d 발화 (%s)", self.strategy_id, now.isoformat())
-        await self._rebalance_once(now)
-        await self._set_last(now)
+
+        last = await self._get_last()
+        due = is_rebalance_due(self._cfg, last, now)
+        if not (due or reentry):
+            return
+
+        logger.info(
+            "리밸런싱 전략 %d %s (%s)",
+            self.strategy_id, "정기 발화" if due else "레짐 재진입", now.isoformat(),
+        )
+        await self._rebalance_once(now, risk_off=False, bar_tag="rebal" if due else "regime")
+        if due:  # 재진입은 월간 cadence 스케줄을 소비하지 않는다
+            await self._set_last(now)
 
     # ───────────────────── 마지막 실행일 상태 ─────────────────────
     def _last_key(self) -> str:
@@ -116,40 +161,172 @@ class RebalanceRunner:
     async def _set_last(self, dt: datetime) -> None:
         await self.redis.set(self._last_key(), dt.isoformat(), ex=_LAST_TTL)
 
-    # ───────────────────── 리밸런싱 1회 ─────────────────────
-    async def _rebalance_once(self, now: datetime) -> None:
+    # ───────────────────── 직전 레짐 상태(전환 판정용) ─────────────────────
+    def _regime_key(self) -> str:
+        return f"{_REGIME_PREFIX}{self.strategy_id}"
+
+    async def _get_regime(self) -> bool | None:
+        """직전 tick 의 risk-off 여부. 미기록(최초)이면 None."""
+        raw = await self.redis.get(self._regime_key())
+        if raw is None:
+            return None
+        return raw == "1"
+
+    async def _set_regime(self, risk_off: bool) -> None:
+        await self.redis.set(self._regime_key(), "1" if risk_off else "0", ex=_LAST_TTL)
+
+    async def _has_holdings(self) -> bool:
+        """universe 종목의 보유 포지션(수량>0)이 하나라도 있는지."""
         universe = list(self._cfg.get("universe", []))
-        history = await self._seed_history(universe)
-        targets = compute_target_weights(history, self._cfg)
-        if not targets:
-            logger.warning("리밸런싱 전략 %d 선정 종목 없음(데이터 부족) — 건너뜀", self.strategy_id)
-            return
+        async with AsyncSessionLocal() as db:
+            positions = await self._holdings(db, universe)
+        return bool(positions)
+
+    # ───────────────────── 리밸런싱 1회 ─────────────────────
+    async def _rebalance_once(
+        self, now: datetime, risk_off: bool | None = None, bar_tag: str = "rebal"
+    ) -> None:
+        """리밸런싱 1회 실행.
+
+        :param risk_off: 레짐 판정 결과를 호출부에서 미리 계산해 주입(중복 지수조회 회피).
+            None 이면 이 함수가 _is_risk_off 로 직접 판정한다.
+        :param bar_tag: 멱등성 키에 들어가는 봉 태그. 같은 거래일에 정기 리밸런싱("rebal")과
+            레짐 액션("regime")이 서로 다른 키를 갖도록 구분해 중복주문을 방지·허용한다.
+        """
+        universe = list(self._cfg.get("universe", []))
+
+        # 현금화 오버레이(레짐 필터): 위험회피 국면이면 목표를 빈 dict 로 두어 보유를
+        # 전량 청산(현금화)하고 신규 매수를 하지 않는다. 백테스트 엔진과 동일 규약.
+        if risk_off is None:
+            risk_off = await self._is_risk_off()
+        if risk_off:
+            targets: dict[str, float] = {}
+            logger.info(
+                "리밸런싱 전략 %d 레짐 위험회피 — 보유 청산·신규 매수 중단", self.strategy_id
+            )
+        else:
+            selection = self._cfg.get("selection", {})
+            scores: dict[str, float] | None = None
+            if selection.get("method") == "score":
+                # 종합점수는 확정 영업일(직전 거래일 종가) 기준으로만 산정해 미래참조를 방지한다
+                # (rebalance_time 은 통상 장중이라 당일 종가는 아직 미확정).
+                as_of = _last_business_day()
+                factor_weights = selection.get("factor_weights")
+                scores = await asyncio.to_thread(
+                    compute_universe_scores, universe, as_of, factor_weights
+                )
+                history: dict[str, pd.Series] = {}
+            else:
+                history = await self._seed_history(universe)
+            targets = compute_target_weights(history, self._cfg, scores=scores)
+            if not targets:
+                logger.warning("리밸런싱 전략 %d 선정 종목 없음(데이터 부족) — 건너뜀", self.strategy_id)
+                return
 
         async with AsyncSessionLocal() as db:
             positions = await self._holdings(db, universe)
+
+        # 청산 국면인데 보유도 없으면 할 일이 없다.
+        if not targets and not positions:
+            logger.info("리밸런싱 전략 %d 레짐 위험회피 & 보유 없음 — 매매 없음", self.strategy_id)
+            return
 
         # 매매 후보 = 목표 종목 ∪ 현재 보유 종목
         symbols = set(targets) | set(positions)
         prices = await self._quotes(symbols)
 
+        # 청산 국면에서는 드리프트 밴드를 무시(0)하고 보유를 전량 매도한다.
+        drift_band = 0.0 if risk_off else float(self._cfg.get("drift_band_pct", 0.05))
         orders = compute_rebalance_orders(
             targets=targets,
             positions={s: float(q) for s, q in positions.items()},
             prices={s: float(p) for s, p in prices.items()},
             capital=float(self._cfg.get("capital", 10_000_000)),
-            drift_band=float(self._cfg.get("drift_band_pct", 0.05)),
+            drift_band=drift_band,
         )
         if not orders:
             logger.info("리밸런싱 전략 %d 드리프트 밴드 내 — 매매 없음", self.strategy_id)
             return
 
-        bar_ts = f"{now.date().isoformat()}:rebal"
+        bar_ts = f"{now.date().isoformat()}:{bar_tag}"
         await self._execute_orders(orders, prices, positions, bar_ts)
+
+    async def _is_risk_off(self) -> bool:
+        """현금화 오버레이(레짐 필터) 판정 — stateful 히스테리시스(비대칭 밴드).
+
+        무상태 rs<ma 대신 직전 레짐 상태(Redis rebalance:regime:{id})를 읽어 밴드로 판정한다.
+        백테스트 _regime_on_flags 와 동일 규약:
+          - 직전 위험선호(on): 지수 < MA×(1 − exit_buffer) 일 때만 청산(off).
+          - 직전 위험회피(off): 지수 ≥ MA×(1 + reentry_buffer) 일 때만 재진입(on).
+          - 상태 없음(최초): 지수 ≥ MA 면 on(off=False), 아니면 off.
+        exit_buffer=reentry_buffer=0.0 이면 기존 무상태 rs<ma 와 완전히 동일하다(하위호환).
+
+        미래참조 방지를 위해 직전 확정 영업일까지의 종가로 이동평균을 계산한다.
+        레짐 필터가 꺼져 있거나 기준지수 조회에 실패하면 False(투자 유지)를 반환한다.
+        새 상태 저장은 호출부(_maybe_rebalance 의 _set_regime)가 담당한다.
+        """
+        rf = self._cfg.get("regime_filter") or {}
+        if not rf.get("enabled"):
+            return False
+
+        ma_period = int(rf.get("ma_period", 200))
+        exit_buffer = max(0.0, float(rf.get("exit_buffer_pct", 0.0) or 0.0))
+        reentry_buffer = max(0.0, float(rf.get("reentry_buffer_pct", 0.0) or 0.0))
+        ticker = _REGIME_INDEX_TICKER.get(rf.get("index", "KOSPI"), "1001")
+        as_of = _last_business_day()
+        start = _approx_start(as_of, ma_period + 10)  # 이동평균에 필요한 거래일 확보
+
+        df = await asyncio.to_thread(
+            _fetch_index_ohlcv, _ymd(start), _ymd(as_of), ticker
+        )
+        if df is None or df.empty or "close" not in df.columns:
+            logger.warning(
+                "리밸런싱 전략 %d 레짐 기준지수 조회 실패 — 오버레이 미적용(투자 유지)",
+                self.strategy_id,
+            )
+            return False
+
+        close = df["close"].dropna()
+        if len(close) < ma_period:
+            logger.warning(
+                "리밸런싱 전략 %d 레짐 기준지수 데이터 부족(%d<%d) — 투자 유지",
+                self.strategy_id, len(close), ma_period,
+            )
+            return False
+
+        ma = float(close.tail(ma_period).mean())
+        last = float(close.iloc[-1])
+
+        # 직전 레짐 상태(risk-off 여부). 미기록(최초)이면 None → 무상태 초기화.
+        prev_off = await self._get_regime()
+        if prev_off is None:
+            off = last < ma
+        elif prev_off is False:               # 직전 위험선호(on)
+            off = last < ma * (1.0 - exit_buffer)
+        else:                                 # 직전 위험회피(off)
+            off = not (last >= ma * (1.0 + reentry_buffer))
+
+        logger.info(
+            "리밸런싱 전략 %d 레짐 판정(히스테리시스): 지수=%.1f MA%d=%.1f "
+            "exitθ=%.1f reentryθ=%.1f 직전=%s → %s",
+            self.strategy_id, last, ma_period, ma,
+            ma * (1.0 - exit_buffer), ma * (1.0 + reentry_buffer),
+            "없음" if prev_off is None else ("위험회피" if prev_off else "위험선호"),
+            "위험회피(현금화)" if off else "위험선호(투자)",
+        )
+        return off
 
     async def _seed_history(self, universe: list[str]) -> dict[str, pd.Series]:
         """universe 각 종목의 종가 Series 를 시드한다(부족하면 외부 적재)."""
-        lookback = int(self._cfg.get("selection", {}).get("lookback", 120))
+        selection = self._cfg.get("selection", {})
+        lookback = int(selection.get("lookback", 120))
         need = lookback + 1
+        # custom 규칙 선정은 룩백이 아니라 규칙 내 최장 지표 기간이 필요 봉 수를 결정한다.
+        if selection.get("method") == "custom":
+            from app.services.backtest.signals import _custom_min_periods
+
+            rule_cfg = {"entry": selection.get("entry"), "exit": selection.get("exit")}
+            need = max(need, _custom_min_periods(rule_cfg))
         end = datetime.now()
         start = end - pd.Timedelta(days=need * 3)  # 거래일 고려 여유
 
@@ -225,10 +402,23 @@ class RebalanceRunner:
                     continue
                 async with AsyncSessionLocal() as db:
                     if side == "sell":
-                        held = await self._holding_qty(db, sym)
+                        pos = await db.scalar(
+                            select(Position).where(
+                                Position.user_id == self._user_id,
+                                Position.symbol == sym,
+                            )
+                        )
+                        held = pos.qty if pos else Decimal("0")
                         sell_qty = min(int(qty), int(held))
                         if sell_qty <= 0:
                             continue
+                        # 사후 전략 개선용: 매도 시점의 포지션 손익률을 로그로 남긴다.
+                        if pos and pos.avg_price and pos.avg_price > 0:
+                            pnl = (price - pos.avg_price) / pos.avg_price
+                            logger.info(
+                                "리밸런싱 매도 %s x%d @%s — 평단 %s, 손익률 %.2f%%",
+                                sym, sell_qty, price, pos.avg_price, float(pnl) * 100,
+                            )
                         await self._place(db, sym, "sell", sell_qty, price, bar_ts)
                     else:  # buy
                         if not buys_allowed:
@@ -241,6 +431,9 @@ class RebalanceRunner:
                         if not decision.approved:
                             logger.info("리밸런싱 매수 보류 %s: %s", sym, decision.reason)
                             continue
+                        logger.info(
+                            "리밸런싱 매수 %s x%d @%s", sym, decision.qty, price
+                        )
                         await self._place(db, sym, "buy", decision.qty, price, bar_ts)
 
     async def _holding_qty(self, db, symbol: str) -> Decimal:

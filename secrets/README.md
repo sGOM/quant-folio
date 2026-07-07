@@ -17,6 +17,9 @@ docker compose 가 이 파일들을 `/run/secrets/*`(tmpfs)로 마운트하고, 
 | `kis_app_secret.txt` | (선택) KIS app_secret 폴백 | 미사용 시 빈 파일 |
 | `toss_app_key.txt` | (선택) 토스 client_id 폴백 | 미사용 시 빈 파일 |
 | `toss_app_secret.txt` | (선택) 토스 client_secret 폴백 | 미사용 시 빈 파일 |
+| `krx_id.txt` | (선택) KRX 데이터 포털 로그인 ID | 지표 화면용. 미사용 시 빈 파일 |
+| `krx_pw.txt` | (선택) KRX 데이터 포털 비밀번호 | 지표 화면용. 미사용 시 빈 파일 |
+| `opendart_api_key.txt` | (선택) OpenDART 인증키 | 재무데이터용(준비/미배선). 미사용 시 빈 파일 |
 
 브로커 키 폴백을 쓰지 않고 앱(웹 UI)에서 사용자별로 등록한다면 브로커 파일들은
 빈 파일로 두면 됩니다(파일 자체는 존재해야 compose 가 기동됩니다).
@@ -30,6 +33,10 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 # 미사용 브로커 키는 빈 파일로 생성
 : > secrets/kis_app_key.txt;  : > secrets/kis_app_secret.txt
 : > secrets/toss_app_key.txt; : > secrets/toss_app_secret.txt
+# KRX 데이터 포털(지표 화면용). 무료 가입 https://data.krx.co.kr — 미사용 시 빈 파일
+: > secrets/krx_id.txt; : > secrets/krx_pw.txt
+# OpenDART 재무데이터(준비/미배선). 무료 발급 https://opendart.fss.or.kr — 미사용 시 빈 파일
+: > secrets/opendart_api_key.txt
 ```
 
 > 🔁 `credential_enc_key.txt` 를 교체하면 기존에 암호화 저장된 DB 자격증명을

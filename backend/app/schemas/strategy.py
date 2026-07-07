@@ -257,15 +257,143 @@ class CustomConfig(_BaseConfig):
 # ───────────────────── 리밸런싱(포트폴리오) ─────────────────────
 
 
+class FactorWeights(BaseModel):
+    """종합점수 합성 시 카테고리별 가중치(합=1.0).
+
+    app.services.metrics._compute_stock_scores 와 동일한 5개 카테고리
+    (모멘텀/밸류/저변동/퀄리티/성장)를 사용한다. 기본값은 metrics 화면과 동일한
+    0.4/0.3/0.3/0.0/0.0 이며(quality=growth=0 이면 기존 3팩터 전략과 동일하게 동작),
+    전략별로 다른 가중치를 자유롭게 설정할 수 있다.
+
+    퀄리티(quality: ROE·부채비율·FCF)·성장(growth: 영업이익/순이익 YoY·흑자전환)은
+    OpenDART 재무데이터로 산출하므로, 배정된 가중치를 실제로 반영하려면 OpenDART API
+    키가 필요하다(키 부재 시 해당 카테고리는 중립 0 처리되어 남은 팩터로만 점수가
+    산출된다 → 결과가 편향될 수 있으니 주의).
+    """
+    momentum: float = Field(default=0.4, ge=0, le=1, description="모멘텀 카테고리 가중치")
+    value: float = Field(default=0.3, ge=0, le=1, description="밸류에이션 카테고리 가중치")
+    lowvol: float = Field(default=0.3, ge=0, le=1, description="저변동성 카테고리 가중치")
+    quality: float = Field(
+        default=0.0, ge=0, le=1,
+        description="퀄리티 카테고리 가중치(ROE·저부채·FCF, OpenDART 필요)",
+    )
+    growth: float = Field(
+        default=0.0, ge=0, le=1,
+        description="성장 카테고리 가중치(영업이익/순이익 YoY·흑자전환, OpenDART 필요)",
+    )
+
+    @model_validator(mode="after")
+    def _sum_to_one(self):
+        total = self.momentum + self.value + self.lowvol + self.quality + self.growth
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                "factor_weights 합은 1.0 이어야 합니다"
+                f"(momentum+value+lowvol+quality+growth={total:.4f})."
+            )
+        return self
+
+
+class UniverseRule(BaseModel):
+    """동적 유니버스 규칙 — 리밸런싱 시점마다 후보풀에서 규칙으로 사전선정.
+
+    고정 종목 리스트의 사후선택(look-ahead) 편향을 제거하기 위한 장치. 지정 시
+    universe 는 매매 대상이 아니라 '후보풀'로 해석되며, 각 리밸런싱일에 그 시점까지의
+    가격 데이터만으로 상대강도(추세) 상위 pick 종목을 추린 뒤, 그 부분집합에서만
+    최종 선정(method 의 top_n)을 수행한다. 미래참조 방지를 위해 규칙은 종가 패널의
+    d 시점까지 데이터만 사용한다.
+    """
+    type: Literal["momentum"] = Field(
+        default="momentum", description="사전선정 기준. momentum=직전 lookback 거래일 상대강도."
+    )
+    lookback: int = Field(
+        default=120, ge=20, le=480, description="상대강도 측정 거래일(예: 120≈6개월)"
+    )
+    pick: int = Field(
+        default=20, ge=1, le=100, description="후보풀에서 사전선정할 종목 수(이후 top_n 으로 최종 선정)"
+    )
+
+
 class RebalanceSelection(BaseModel):
     """리밸런싱 종목 선정 규칙.
 
     - method="momentum": lookback 봉 수익률 상위 top_n 종목 선정
     - method="all": universe 전체 사용(top_n 무시)
+    - method="score": 종합점수(멀티팩터, app.services.metrics 와 동일 로직) 상위
+      top_n 종목 선정. factor_weights 로 모멘텀/밸류/저변동 가중치를 조정한다.
+      실제 점수는 실거래 러너/백테스트가 as_of(직전 확정 영업일) 기준으로
+      compute_universe_scores 를 호출해 주입한다(이 스키마는 파라미터만 정의).
+    - method="custom": universe 각 종목에 사용자 정의 진입/청산 규칙(entry/exit)을
+      독립 적용해, '현재 진입 국면(진입 신호 후 아직 청산 안 됨)'인 종목만 동일비중으로
+      편입한다(top_n 무시). 규칙은 리밸런싱 백테스트/실거래가 종가 패널만 사용하므로
+      종가 기반 지표(가격 close·SMA·EMA·RSI·MACD·상수)만 허용된다(OHLC/거래량 불가).
     """
-    method: Literal["momentum", "all"] = "momentum"
-    lookback: int = Field(default=120, ge=2, le=480, description="모멘텀 측정 봉 수")
-    top_n: int = Field(default=5, ge=1, le=50, description="선정 종목 수(momentum)")
+    method: Literal["momentum", "all", "score", "custom"] = "momentum"
+    lookback: int = Field(default=120, ge=2, le=480, description="모멘텀 측정 봉 수(method=momentum)")
+    top_n: int = Field(default=5, ge=1, le=50, description="선정 종목 수(momentum/score)")
+    factor_weights: FactorWeights = Field(
+        default_factory=FactorWeights, description="종합점수 카테고리 가중치(method=score)"
+    )
+    universe_rule: UniverseRule | None = Field(
+        default=None,
+        description="동적 유니버스 규칙(method=momentum/score). 지정 시 universe 는 후보풀로 해석된다.",
+    )
+    entry: ConditionGroup | None = Field(
+        default=None, description="편입(매수) 논리식(method=custom). 각 종목에 독립 적용."
+    )
+    exit: ConditionGroup | None = Field(
+        default=None, description="청산(매도) 논리식(method=custom). 각 종목에 독립 적용."
+    )
+
+    @field_validator("entry", "exit", mode="before")
+    @classmethod
+    def _wrap_legacy_list(cls, v):
+        """레거시 조건 list(AND) → 그룹 dict 로 정규화(CustomConfig 와 동일 규약)."""
+        if isinstance(v, list):
+            return {"combinator": "and", "children": v}
+        return v
+
+
+def _iter_group_operands(node: "RuleNode"):
+    """조건/그룹 트리를 순회하며 모든 피연산자(Operand)를 yield 한다(검증용)."""
+    if isinstance(node, ConditionGroup):
+        for child in node.children:
+            yield from _iter_group_operands(child)
+    else:  # Condition
+        yield node.left
+        yield node.right
+
+
+class RegimeFilter(BaseModel):
+    """현금화 오버레이(레짐 필터) — 시계열(절대) 모멘텀 기반 하방 방어 장치.
+
+    크로스섹션 선정(종합점수/모멘텀)은 '상대적으로 좋은 종목'을 고를 뿐, 시장 전체가
+    무너지는 국면에서 '시장에서 나가라'는 신호는 주지 못한다. 이 필터는 기준지수
+    (KOSPI/KOSDAQ)의 종가가 ma_period 이동평균 아래로 내려가면 위험회피(risk-off)로
+    보고 신규 매수를 중단하고 보유를 청산해 현금화한다. 지수가 이동평균 위로 회복하면
+    다음 리밸런싱일에 정상 선정·매수를 재개한다.
+
+    Faber(2007), Antonacci(Dual Momentum) 등에서 장기 수익률은 크게 훼손하지 않으면서
+    최대낙폭(MDD)을 완화하는 효과가 보고된다.
+    """
+    enabled: bool = Field(default=True, description="오버레이 사용 여부")
+    index: Literal["KOSPI", "KOSDAQ"] = Field(
+        default="KOSPI", description="추세 판정 기준지수"
+    )
+    ma_period: int = Field(
+        default=200, ge=5, le=400, description="추세 판정 이동평균 기간(거래일)"
+    )
+    # 히스테리시스(비대칭 밴드). 무상태 rs>=ma 대신 경로 의존 판정으로 박스권 휩쏘를
+    # 걸러 잦은 청산·재진입(bull-trap)을 줄인다. 둘 다 0.0(기본)이면 기존 무상태 동작과 동일.
+    reentry_buffer_pct: float = Field(
+        default=0.0, ge=0, le=0.20,
+        description="재진입 버퍼(off→on). 지수가 MA×(1+이 값) 이상으로 회복해야 재진입"
+        "(예: 0.02 = MA 2% 상회 시 재진입). 0.0 이면 MA 회복 즉시 재진입.",
+    )
+    exit_buffer_pct: float = Field(
+        default=0.0, ge=0, le=0.20,
+        description="청산 버퍼(on→off). 지수가 MA×(1−이 값) 미만으로 하락해야 청산"
+        "(예: 0.0 = MA 하회 즉시 청산). 값이 클수록 청산을 늦춰 얕은 조정을 버틴다.",
+    )
 
 
 class RebalanceConfig(BaseModel):
@@ -277,10 +405,16 @@ class RebalanceConfig(BaseModel):
     """
     type: Literal["rebalance"] = "rebalance"
     universe: list[str] = Field(
-        min_length=1, max_length=50, description="후보 종목코드 목록"
+        min_length=1, max_length=300,
+        description="종목코드 목록. selection.method=all/momentum/custom 은 매매 대상,"
+        " universe_rule 지정 시(동적 유니버스)는 사전선정용 후보풀로 해석된다.",
     )
     selection: RebalanceSelection = Field(default_factory=RebalanceSelection)
-    weighting: Literal["equal"] = Field(default="equal", description="선정 종목 비중 방식")
+    weighting: Literal["equal", "score"] = Field(
+        default="equal",
+        description="선정 종목 비중 방식. 'score' 는 selection.method='score' 일 때만 허용"
+        "(순위 기반 선형 가중 — 1위가 가장 큰 비중, 음수 점수에도 안전).",
+    )
     cadence: Literal["daily", "weekly", "monthly"] = "monthly"
     # weekly: 0=월~4=금 / monthly: 1~28(영업일 보정은 러너가 수행)
     rebalance_weekday: int | None = Field(default=None, ge=0, le=4)
@@ -290,6 +424,10 @@ class RebalanceConfig(BaseModel):
     )
     drift_band_pct: float = Field(
         default=0.05, ge=0, le=1, description="목표 대비 비중 편차 임계(초과만 매매)"
+    )
+    regime_filter: RegimeFilter | None = Field(
+        default=None,
+        description="현금화 오버레이(레짐 필터). None 이면 미적용(항상 100% 투자).",
     )
     capital: float = Field(default=10_000_000, gt=0, description="이 전략이 운용할 배정 자본")
     fees: float = Field(default=0.00015, ge=0, le=0.01, description="위탁수수료율")
@@ -320,8 +458,32 @@ class RebalanceConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_consistency(self):
-        if self.selection.method == "momentum" and self.selection.top_n > len(self.universe):
-            raise ValueError("selection.top_n 은 universe 종목 수 이하여야 합니다.")
+        rule = self.selection.universe_rule
+        if self.selection.method in ("momentum", "score"):
+            if rule is not None:
+                # 동적 유니버스: universe 는 후보풀. pick≤풀크기, top_n≤pick 이어야 한다.
+                if rule.pick > len(self.universe):
+                    raise ValueError("universe_rule.pick 은 universe(후보풀) 종목 수 이하여야 합니다.")
+                if self.selection.top_n > rule.pick:
+                    raise ValueError("selection.top_n 은 universe_rule.pick 이하여야 합니다.")
+            elif self.selection.top_n > len(self.universe):
+                raise ValueError("selection.top_n 은 universe 종목 수 이하여야 합니다.")
+        if self.weighting == "score" and self.selection.method != "score":
+            raise ValueError("weighting='score' 는 selection.method='score' 일 때만 사용할 수 있습니다.")
+        if self.selection.method == "custom":
+            if self.selection.entry is None or self.selection.exit is None:
+                raise ValueError("selection.method='custom' 은 entry·exit 규칙이 모두 필요합니다.")
+            if self.weighting != "equal":
+                raise ValueError("selection.method='custom' 은 weighting='equal' 만 지원합니다.")
+            # 리밸런싱 백테스트/실거래는 종가 패널만 사용하므로 종가 기반 지표만 허용한다.
+            ohlc = {"open", "high", "low", "volume"}
+            for grp in (self.selection.entry, self.selection.exit):
+                for op in _iter_group_operands(grp):
+                    if op.kind == "price" and op.source in ohlc:
+                        raise ValueError(
+                            "리밸런싱 커스텀 규칙은 종가 기반 지표만 사용할 수 있습니다"
+                            "(open/high/low/volume 불가)."
+                        )
         if self.cadence == "weekly" and self.rebalance_weekday is None:
             self.rebalance_weekday = 0  # 기본: 월요일
         if self.cadence == "monthly" and self.rebalance_dom is None:

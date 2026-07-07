@@ -614,6 +614,21 @@ def _custom_signals(data, cfg: dict) -> tuple[pd.Series, pd.Series]:
     return entries, exits
 
 
+def custom_position_state(data, cfg: dict) -> pd.Series:
+    """custom 진입/청산 신호로부터 '보유 여부(0/1)' 상태 시계열을 만든다.
+
+    진입 에지에서 1(편입), 청산 에지에서 0(청산)으로 놓고 앞으로 채워(ffill) 각 시점의
+    보유 상태를 얻는다. 리밸런싱+커스텀규칙 선정에서 각 종목이 '지금 보유 국면인지'를
+    판정하는 데 쓴다(마지막 값 > 0 이면 현재 편입 대상). 신호가 없던 초기 구간은 0(미보유).
+    동일 봉의 진입/청산은 _custom_signals 에서 이미 진입 우선 처리된다.
+    """
+    entries, exits = _custom_signals(data, cfg)
+    state = pd.Series(float("nan"), index=entries.index)
+    state[entries] = 1.0
+    state[exits] = 0.0
+    return state.ffill().fillna(0.0)
+
+
 def _custom_operands(cfg: dict):
     """custom config(레거시 list 또는 AND/OR 그룹)의 모든 피연산자를 순회 제너레이터로 반환."""
     for cond in _iter_conditions(cfg.get("entry")):

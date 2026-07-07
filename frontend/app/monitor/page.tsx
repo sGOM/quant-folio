@@ -55,6 +55,18 @@ function MonitorContent() {
 
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const strategies = useQuery({ queryKey: ["strategies"], queryFn: api.listStrategies });
+  // 종목코드 → 한글명 매핑(로그·표에 종목명 표시). 거의 불변이라 오래 캐시한다.
+  const names = useQuery({
+    queryKey: ["symbol-names"],
+    queryFn: api.symbolNames,
+    staleTime: Infinity,
+  });
+  // "종목명(코드)" 형태로 표기. 이름을 모르면 코드만 반환한다.
+  const nameOf = (code?: string | null) => {
+    const c = code == null ? "" : String(code);
+    const n = names.data?.[c];
+    return n ? `${n}(${c})` : c;
+  };
   // WS 이벤트를 놓쳐도 화면이 영구히 stale 되지 않도록 보수적 폴백 폴링.
   const positions = useQuery({
     queryKey: ["positions"],
@@ -83,10 +95,10 @@ function MonitorContent() {
       const f = (v: unknown) => (v == null ? "" : String(v));
       const desc =
         type === "execution"
-          ? `체결 ${f(data.side)} ${f(data.symbol)} ${f(data.qty)}주 @ ${f(data.price)}`
+          ? `체결 ${f(data.side)} ${nameOf(data.symbol as string)} ${f(data.qty)}주 @ ${f(data.price)}`
           : type === "order"
-            ? `주문 ${f(data.status)} ${f(data.symbol)}`
-            : `${type} ${f(data.symbol)}`;
+            ? `주문 ${f(data.status)} ${nameOf(data.symbol as string)}`
+            : `${type} ${nameOf(data.symbol as string)}`;
       const id = logSeq.current++;
       setLog((l) => [{ id, text: `${t}  ${desc}` }, ...l].slice(0, 30));
     }
@@ -167,7 +179,7 @@ function MonitorContent() {
               head={["종목", "수량", "평균단가"]}
               rows={
                 positions.data?.map((p) => [
-                  p.symbol,
+                  nameOf(p.symbol),
                   p.qty.toLocaleString(),
                   p.avg_price.toLocaleString(),
                 ]) ?? []
@@ -206,7 +218,7 @@ function MonitorContent() {
             rows={
               orders.data?.map((o) => [
                 new Date(o.created_at).toLocaleString("ko-KR"),
-                o.symbol,
+                nameOf(o.symbol),
                 o.side === "buy" ? "매수" : "매도",
                 o.qty.toLocaleString(),
                 o.status,

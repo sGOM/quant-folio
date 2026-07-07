@@ -95,6 +95,7 @@ export function defaultConfig(
       rebalance_dom: 1,
       rebalance_time: "14:30",
       drift_band_pct: 0.05,
+      regime_filter: null,
       capital: 10_000_000,
       fees: COMMON_DEFAULTS.fees,
       tax: COMMON_DEFAULTS.tax,
@@ -181,7 +182,11 @@ export function summarizeConfig(c: StrategyConfig): string {
     const sel =
       c.selection.method === "momentum"
         ? `모멘텀 상위 ${c.selection.top_n}`
-        : "전체 동일비중";
+        : c.selection.method === "score"
+          ? `멀티팩터 상위 ${c.selection.top_n}`
+          : c.selection.method === "custom"
+            ? "사용자 규칙 편입"
+            : "전체 동일비중";
     return `${label} · ${c.universe.length}종목 · ${sel} · ${cadenceLabel} 리밸런싱`;
   }
   let params: string;

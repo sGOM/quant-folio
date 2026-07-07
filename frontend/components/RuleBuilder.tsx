@@ -16,9 +16,9 @@ import {
   PRICE_SOURCE_LABELS,
 } from "@/lib/strategy";
 
-/** 입력/셀렉트 공용 스타일(StrategyForm 과 동일). */
+/** 입력/셀렉트 공용 스타일(StrategyForm 과 동일). text-foreground 로 select 글씨 대비를 명시한다. */
 const INPUT =
-  "w-full rounded-md border border-input bg-background px-2 py-1.5 text-sm outline-none focus:border-ring";
+  "w-full rounded-md border border-input bg-background text-foreground px-2 py-1.5 text-sm outline-none focus:border-ring";
 
 const KINDS: OperandKind[] = [
   "price",
@@ -209,7 +209,7 @@ function ConditionRow({
       <select
         value={cond.op}
         onChange={(e) => onChange({ ...cond, op: e.target.value as CompareOp })}
-        className="mt-0 w-28 rounded-md border border-input bg-background px-2 py-1.5 text-sm outline-none focus:border-ring"
+        className="mt-0 w-28 rounded-md border border-input bg-background text-foreground px-2 py-1.5 text-sm outline-none focus:border-ring"
       >
         {OPS.map((o) => (
           <option key={o} value={o}>

@@ -11,6 +11,8 @@ import {
   BookOpen,
   LogOut,
   Share2,
+  BarChart3,
+  TrendingUp,
 } from "lucide-react";
 import { useLogout } from "@/lib/useAuth";
 import { GlossaryDrawer } from "@/components/GlossaryDrawer";
@@ -23,6 +25,8 @@ const LINKS = [
   { href: "/strategies", label: "전략", icon: LineChart },
   { href: "/strategies/shared", label: "공유 전략", icon: Share2 },
   { href: "/monitor", label: "실시간", icon: Activity },
+  { href: "/metrics", label: "지표", icon: BarChart3 },
+  { href: "/screener", label: "스크리너", icon: TrendingUp },
   { href: "/settings", label: "설정", icon: Settings },
 ];
 
