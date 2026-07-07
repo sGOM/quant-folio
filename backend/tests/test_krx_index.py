@@ -76,3 +76,38 @@ def test_unknown_index_raises(monkeypatch):
     monkeypatch.setattr(krx_index, "_session", lambda: _FakeSession({}))
     with pytest.raises(ValueError):
         krx_index.index_members(date(2025, 6, 30), "NASDAQ")
+
+
+# ───────────────────── 라우트 PIT 풀 빌더(_build_pit_pool) ─────────────────────
+
+
+def test_build_pit_pool_fixed_source_returns_none():
+    from app.api.routes.backtests import _build_pit_pool
+    cfg = {"universe": ["005930"], "selection": {"universe_rule": {"source": "fixed"}}}
+    assert _build_pit_pool(cfg, date(2023, 1, 1), date(2023, 3, 31)) == (None, None)
+
+    # universe_rule 없음도 fixed 취급
+    assert _build_pit_pool({"selection": {}}, date(2023, 1, 1), date(2023, 3, 31)) == (None, None)
+
+
+def test_build_pit_pool_index_source_union_and_provider(monkeypatch):
+    import pandas as pd
+    from app.api.routes import backtests as bt
+
+    # 월별 멤버십을 다르게 주고 합집합·시점별 공급을 검증.
+    per_month = {
+        (2023, 1): ["005930", "000660"],
+        (2023, 2): ["005930", "035420"],   # 000660 편출, 035420 편입
+        (2023, 3): ["005930", "035420"],
+    }
+    import app.services.data.krx_index as ki
+    monkeypatch.setattr(
+        ki, "index_members",
+        lambda as_of, index="KOSPI200": per_month.get((as_of.year, as_of.month), []),
+    )
+
+    cfg = {"universe": [], "selection": {"universe_rule": {"source": "KOSPI200"}}}
+    union, provider = bt._build_pit_pool(cfg, date(2023, 1, 1), date(2023, 3, 31))
+    assert set(union) == {"005930", "000660", "035420"}   # 편출·편입 모두 포함
+    assert provider(pd.Timestamp("2023-01-15")) == ["005930", "000660"]
+    assert provider(pd.Timestamp("2023-02-15")) == ["005930", "035420"]

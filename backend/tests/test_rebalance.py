@@ -212,6 +212,45 @@ def test_targets_at_pool_provider_supplies_pointintime_universe():
     assert set(targets) == {"A", "B"}    # 풀(A,B)이 그대로 선정(빈 결과 아님)
 
 
+# ───────────────────── 스키마: PIT 지수 소스(universe_rule.source) ─────────────────────
+
+
+def test_config_allows_empty_universe_when_index_source():
+    from app.schemas.strategy import RebalanceConfig
+    cfg = {
+        "type": "rebalance", "universe": [],
+        "selection": {"method": "score", "top_n": 10,
+                      "universe_rule": {"source": "KOSPI200", "pick": 20}},
+    }
+    v = RebalanceConfig.model_validate(cfg)
+    assert v.selection.universe_rule.source == "KOSPI200"
+    assert v.universe == []
+
+
+def test_config_rejects_empty_universe_when_fixed():
+    from app.schemas.strategy import RebalanceConfig
+    with pytest.raises(ValueError):
+        RebalanceConfig.model_validate({"type": "rebalance", "universe": [],
+                                        "selection": {"method": "momentum", "top_n": 3}})
+
+
+def test_config_index_source_skips_pick_vs_universe_check():
+    from app.schemas.strategy import RebalanceConfig
+    # pick=50 > len(universe)=0 이지만 지수 소스라 통과. 단 top_n<=pick 은 유지.
+    v = RebalanceConfig.model_validate({
+        "type": "rebalance", "universe": [],
+        "selection": {"method": "score", "top_n": 10,
+                      "universe_rule": {"source": "KOSPI200", "pick": 50}},
+    })
+    assert v.selection.universe_rule.pick == 50
+    with pytest.raises(ValueError):  # top_n > pick 은 여전히 거부
+        RebalanceConfig.model_validate({
+            "type": "rebalance", "universe": [],
+            "selection": {"method": "score", "top_n": 60,
+                          "universe_rule": {"source": "KOSPI200", "pick": 50}},
+        })
+
+
 # ───────────────────── method="custom"(규칙 기반 편입/청산) ─────────────────────
 
 

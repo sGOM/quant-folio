@@ -297,13 +297,21 @@ class UniverseRule(BaseModel):
     """동적 유니버스 규칙 — 리밸런싱 시점마다 후보풀에서 규칙으로 사전선정.
 
     고정 종목 리스트의 사후선택(look-ahead) 편향을 제거하기 위한 장치. 지정 시
-    universe 는 매매 대상이 아니라 '후보풀'로 해석되며, 각 리밸런싱일에 그 시점까지의
-    가격 데이터만으로 상대강도(추세) 상위 pick 종목을 추린 뒤, 그 부분집합에서만
-    최종 선정(method 의 top_n)을 수행한다. 미래참조 방지를 위해 규칙은 종가 패널의
-    d 시점까지 데이터만 사용한다.
+    후보풀에서 각 리밸런싱일에 그 시점까지의 가격 데이터만으로 상대강도(추세) 상위 pick
+    종목을 추린 뒤, 그 부분집합에서만 최종 선정(method 의 top_n)을 수행한다. 미래참조
+    방지를 위해 규칙은 종가 패널의 d 시점까지 데이터만 사용한다.
+
+    후보풀은 source 로 정한다:
+    - "fixed"(기본): config.universe 를 후보풀로 사용(고정 목록).
+    - 지수명(예: "KOSPI200"): 각 리밸런싱 시점의 실제 지수 구성종목을 후보풀로 사용한다
+      (시점별 멤버십 = survivorship bias 제거). 이때 config.universe 는 비워도 된다.
     """
     type: Literal["momentum"] = Field(
         default="momentum", description="사전선정 기준. momentum=직전 lookback 거래일 상대강도."
+    )
+    source: Literal["fixed", "KOSPI200", "KOSPI100", "KRX300"] = Field(
+        default="fixed",
+        description="후보풀 출처. fixed=config.universe, 지수명=그 시점 실제 구성종목(PIT).",
     )
     lookback: int = Field(
         default=120, ge=20, le=480, description="상대강도 측정 거래일(예: 120≈6개월)"
@@ -405,9 +413,10 @@ class RebalanceConfig(BaseModel):
     """
     type: Literal["rebalance"] = "rebalance"
     universe: list[str] = Field(
-        min_length=1, max_length=300,
+        default_factory=list, max_length=300,
         description="종목코드 목록. selection.method=all/momentum/custom 은 매매 대상,"
-        " universe_rule 지정 시(동적 유니버스)는 사전선정용 후보풀로 해석된다.",
+        " universe_rule 지정 시(동적 유니버스)는 사전선정용 후보풀로 해석된다."
+        " universe_rule.source 가 지수명이면 후보풀을 지수 구성종목에서 얻으므로 비워도 된다.",
     )
     selection: RebalanceSelection = Field(default_factory=RebalanceSelection)
     weighting: Literal["equal", "score"] = Field(
@@ -460,10 +469,14 @@ class RebalanceConfig(BaseModel):
     @model_validator(mode="after")
     def _validate_consistency(self):
         rule = self.selection.universe_rule
+        pit = rule is not None and rule.source != "fixed"
+        if not self.universe and not pit:
+            raise ValueError("universe 가 비어 있습니다(지수 소스가 아니면 종목 목록 필수).")
         if self.selection.method in ("momentum", "score"):
             if rule is not None:
-                # 동적 유니버스: universe 는 후보풀. pick≤풀크기, top_n≤pick 이어야 한다.
-                if rule.pick > len(self.universe):
+                # 동적 유니버스: top_n≤pick. 후보풀이 지수(PIT)면 크기가 가변이라
+                # pick≤풀크기 검사는 fixed(config.universe) 일 때만 적용한다.
+                if not pit and rule.pick > len(self.universe):
                     raise ValueError("universe_rule.pick 은 universe(후보풀) 종목 수 이하여야 합니다.")
                 if self.selection.top_n > rule.pick:
                     raise ValueError("selection.top_n 은 universe_rule.pick 이하여야 합니다.")
