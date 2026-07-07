@@ -24,6 +24,9 @@ _SECRET_FILE_FIELDS = (
     "KIS_APP_SECRET",
     "TOSS_APP_KEY",
     "TOSS_APP_SECRET",
+    "KRX_ID",
+    "KRX_PW",
+    "OPENDART_API_KEY",
 )
 
 
@@ -97,8 +100,38 @@ class Settings(BaseSettings):
     TOSS_APP_SECRET: str = ""
     TOSS_ACCOUNT_NO: str = ""
 
+    # --- KRX 데이터 포털 (지표 화면용 일괄 시세) ---
+    # pykrx 1.2.x 가 data.krx.co.kr 로그인에 사용한다(전 종목 펀더멘털·시총·업종지수).
+    # 시크릿 파일(/run/secrets/krx_id, krx_pw)로 주입하며, 아래 검증기가 os.environ
+    # 으로 내보내 pykrx(os.getenv)가 읽게 한다. 미설정이면 일괄 시세만 비활성(개별
+    # 종목 시세는 FinanceDataReader 로 계속 동작).
+    KRX_ID: str = ""
+    KRX_PW: str = ""
+
+    # --- OpenDART (금융감독원 전자공시 API) — 준비/스캐폴딩 ---
+    # 재무제표 기반 지표(ROE·부채비율·영업이익/순이익·FCF 등)를 공급해 pykrx의
+    # PER/PBR/DIV를 보완하기 위한 소스. 무료 API 키 발급 후 시크릿 파일
+    # (secrets/opendart_api_key.txt → OPENDART_API_KEY_FILE)로 주입한다.
+    # 미설정이면 OpenDART 조회는 전부 비활성(None 반환)되고 기존 동작에 영향 없음.
+    # 발급: https://opendart.fss.or.kr (일 20,000건). 배선 계획: docs/opendart-integration.md
+    OPENDART_API_KEY: str = ""
+    OPENDART_BASE_URL: str = "https://opendart.fss.or.kr/api"
+
     # --- CORS ---
     FRONTEND_ORIGIN: str = "http://localhost:3000"
+
+    @model_validator(mode="after")
+    def _export_krx_credentials(self) -> "Settings":
+        """KRX 자격증명을 os.environ 으로 내보낸다(pykrx 가 os.getenv 로 직접 읽음).
+
+        시크릿 파일/평문 env 어느 경로로 들어왔든, 비어 있지 않을 때만 환경변수로
+        설정해 pykrx 의 KRX 데이터 포털 자동 로그인을 활성화한다.
+        """
+        if self.KRX_ID:
+            os.environ["KRX_ID"] = self.KRX_ID
+        if self.KRX_PW:
+            os.environ["KRX_PW"] = self.KRX_PW
+        return self
 
     @field_validator("SECRET_KEY", "CREDENTIAL_ENC_KEY", mode="after")
     @classmethod
@@ -175,6 +208,11 @@ class Settings(BaseSettings):
     def is_paper_trading(self) -> bool:
         """모의투자 여부. 기본값은 안전하게 모의투자."""
         return self.KIS_ENV != "prod"
+
+    @property
+    def has_opendart(self) -> bool:
+        """OpenDART API 키가 주입되어 재무 데이터 조회가 가능한지 여부."""
+        return bool(self.OPENDART_API_KEY.strip())
 
 
 @lru_cache

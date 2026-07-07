@@ -4,8 +4,9 @@
 데이터가 없으면 FinanceDataReader 로 적재 후 price_ticks 를 단일 출처로 사용한다.
 """
 import logging
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
+import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
@@ -15,7 +16,7 @@ from app.api.routes.strategies import _get_owned
 from app.core.database import get_db
 from app.models import Backtest, Strategy, StrategyStatus, User
 from app.schemas.strategy import BacktestOut, BacktestRequest
-from app.services.backtest import run_backtest
+from app.services.backtest import run_backtest, run_rebalance_backtest
 from app.services.backtest.signals import requires_ohlc
 from app.services.data import load_ohlcv, upsert_price_ticks
 from app.services.data.loader import get_close_series, get_ohlcv_frame
@@ -37,32 +38,11 @@ def _to_dt(d, end: bool = False) -> datetime:
     return datetime.combine(d, t, tzinfo=KST)
 
 
-@router.post(
-    "/strategies/{strategy_id}/backtest",
-    response_model=BacktestOut,
-    status_code=status.HTTP_201_CREATED,
-)
-async def run_strategy_backtest(
-    strategy_id: int,
-    req: BacktestRequest,
-    current: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """전략을 지정 기간으로 백테스트한다.
-
-    시세(price_ticks)가 없으면 외부 소스에서 적재 후 단일 출처로 사용하며,
-    CPU 바운드 계산은 스레드풀에서 실행해 이벤트 루프를 막지 않는다. 결과는 저장된다.
-    """
-    strategy: Strategy = await _get_owned(db, current, strategy_id)
-    config = strategy.config
-    if config.get("type") == "rebalance":
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "리밸런싱(포트폴리오) 전략의 백테스트는 아직 지원되지 않습니다.",
-        )
+async def _run_single_symbol_backtest(
+    db: AsyncSession, config: dict, req: BacktestRequest, start_dt, end_dt
+) -> dict:
+    """단일 종목 전략 백테스트(기존 vectorbt 경로)."""
     symbol = config["symbol"]
-    start_dt, end_dt = _to_dt(req.period_start), _to_dt(req.period_end, end=True)
-
     # OHLC 전략이면 OHLCV 프레임을, close-only 전략이면 종가만 신호 입력으로 사용.
     use_ohlc = requires_ohlc(config)
 
@@ -88,12 +68,166 @@ async def run_strategy_backtest(
 
     # 2) 백테스트 실행 (CPU 바운드 → 스레드풀)
     try:
-        result = await run_in_threadpool(run_backtest, series, config)
+        return await run_in_threadpool(run_backtest, series, config)
     except ValueError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
     except Exception as e:  # noqa: BLE001
         logger.exception("백테스트 실행 오류")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"백테스트 실패: {e}")
+
+
+# pykrx 종합지수 티커(레짐 필터 기준지수).
+_REGIME_INDEX_TICKER = {"KOSPI": "1001", "KOSDAQ": "2001"}
+
+
+def _load_regime_series(start_d, end_d, ticker: str):
+    """레짐 필터용 기준지수 종가 Series 를 조회한다(블로킹, 스레드풀 내 호출).
+
+    metrics._fetch_index_ohlcv 를 재사용한다. 실패/부재 시 None 을 반환하면
+    백테스트 엔진이 오버레이를 적용하지 않는다(항상 투자).
+    """
+    from app.services.metrics import _fetch_index_ohlcv, _ymd
+
+    df = _fetch_index_ohlcv(_ymd(start_d), _ymd(end_d), ticker)
+    if df is None or df.empty or "close" not in df.columns:
+        return None
+    return df["close"]
+
+
+def _fundamentals_provider(as_of_date, codes):
+    """score 선정용 as_of 시점 펀더멘털을 조회한다(블로킹, 스레드풀 내 호출).
+
+    - 밸류(PER/PBR/DIV): metrics._fetch_fundamentals(pykrx) — 실거래 점수와 동일 소스.
+    - 퀄리티(roe/debt_ratio/fcf): OpenDART 재무데이터(PIT 공시지연 반영). API 키가
+      없으면 빈 결과라 quality 컬럼이 붙지 않고, 백테스트 엔진이 중립 처리한다.
+
+    둘 다 실패/부재면 None 을 반환하면 엔진이 밸류·퀄리티 팩터를 중립 처리한다.
+    """
+    from app.services.data import opendart
+    from app.services.metrics import _fetch_fundamentals, _ymd
+
+    norm_codes = [str(c).zfill(6) for c in codes]
+    fdf = None
+    try:
+        raw = _fetch_fundamentals(_ymd(as_of_date), ["KOSPI", "KOSDAQ"])
+        if raw is not None and not raw.empty:
+            fdf = raw.copy()
+            fdf.index = fdf.index.astype(str).str.zfill(6)
+            fdf = fdf.reindex(norm_codes)
+    except Exception:  # noqa: BLE001
+        fdf = None
+
+    # 퀄리티 팩터(OpenDART). 키 부재/미배선 시 {} → 병합 없음.
+    try:
+        qmetrics = opendart.metrics_by_symbol(norm_codes, as_of_date)
+    except Exception:  # noqa: BLE001
+        qmetrics = {}
+
+    if not qmetrics:
+        return fdf  # 밸류만(또는 None)
+
+    qdf = pd.DataFrame.from_dict(qmetrics, orient="index")
+    qcols = ("roe", "debt_ratio", "fcf", "f_score",
+             "op_growth", "net_growth", "turnaround")
+    qdf = qdf[[c for c in qcols if c in qdf.columns]]
+    qdf = qdf.reindex(norm_codes)
+    if fdf is None:
+        return qdf
+    return fdf.join(qdf, how="left")
+
+
+async def _run_rebalance_backtest(
+    db: AsyncSession, config: dict, req: BacktestRequest, start_dt, end_dt
+) -> dict:
+    """리밸런싱(다종목 포트폴리오) 전략 백테스트.
+
+    universe 전 종목의 종가 패널을 워밍업 구간 포함해 적재한 뒤, 실거래와 동일한
+    선정·점수 로직으로 일별 시뮬레이션한다.
+    """
+    universe = list(config.get("universe", []))
+    if not universe:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "universe 가 비어 있습니다.")
+
+    # 팩터 워밍업: 52주 고가·MDD(252) + 모멘텀(126)에 필요. 넉넉히 500일 앞부터 적재.
+    warmup_start = req.period_start - timedelta(days=500)
+    warmup_dt = _to_dt(warmup_start)
+
+    # 각 종목 종가 시드(없으면 외부 적재 후 재조회)
+    columns: dict[str, pd.Series] = {}
+    for sym in universe:
+        series = await get_close_series(db, sym, warmup_dt, end_dt)
+        if series.empty:
+            try:
+                df = await run_in_threadpool(load_ohlcv, sym, warmup_start, req.period_end)
+                await upsert_price_ticks(db, sym, df)
+                series = await get_close_series(db, sym, warmup_dt, end_dt)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("리밸런싱 백테스트 %s 시세 적재 실패: %s", sym, e)
+        if not series.empty:
+            columns[sym] = series
+
+    if not columns:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "universe 종목의 시세를 확보하지 못했습니다."
+        )
+
+    panel = pd.DataFrame(columns)
+    method = config.get("selection", {}).get("method", "momentum")
+    provider = _fundamentals_provider if method == "score" else None
+
+    # 현금화 오버레이(레짐 필터): 켜져 있으면 기준지수 종가 시리즈를 적재해 주입한다.
+    regime_series = None
+    rf = config.get("regime_filter") or {}
+    if rf.get("enabled"):
+        ticker = _REGIME_INDEX_TICKER.get(rf.get("index", "KOSPI"), "1001")
+        try:
+            regime_series = await run_in_threadpool(
+                _load_regime_series, warmup_start, req.period_end, ticker
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("레짐 필터 기준지수 적재 실패(오버레이 미적용): %s", e)
+
+    try:
+        return await run_in_threadpool(
+            run_rebalance_backtest,
+            panel,
+            config,
+            start_dt,
+            end_dt,
+            provider,
+            regime_series,
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("리밸런싱 백테스트 실행 오류")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"백테스트 실패: {e}")
+
+
+@router.post(
+    "/strategies/{strategy_id}/backtest",
+    response_model=BacktestOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def run_strategy_backtest(
+    strategy_id: int,
+    req: BacktestRequest,
+    current: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """전략을 지정 기간으로 백테스트한다.
+
+    시세(price_ticks)가 없으면 외부 소스에서 적재 후 단일 출처로 사용하며,
+    CPU 바운드 계산은 스레드풀에서 실행해 이벤트 루프를 막지 않는다. 결과는 저장된다.
+    """
+    strategy: Strategy = await _get_owned(db, current, strategy_id)
+    config = strategy.config
+    start_dt, end_dt = _to_dt(req.period_start), _to_dt(req.period_end, end=True)
+
+    if config.get("type") == "rebalance":
+        result = await _run_rebalance_backtest(db, config, req, start_dt, end_dt)
+    else:
+        result = await _run_single_symbol_backtest(db, config, req, start_dt, end_dt)
 
     # 3) 결과 저장 + 전략 상태 갱신
     bt = Backtest(

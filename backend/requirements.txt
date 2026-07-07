@@ -15,10 +15,11 @@ python-multipart==0.0.20
 email-validator==2.2.0
 
 # 백테스팅/데이터 (2단계에서 사용)
+setuptools==75.8.0  # pykrx 가 import 하는 pkg_resources 제공 (Python 3.12 에 미번들)
 pandas==2.2.3
 numpy==2.2.1
 vectorbt==0.27.2
-pykrx==1.0.51
+pykrx==1.2.8  # 1.2.x 는 KRX 데이터 포털 로그인(KRX_ID/KRX_PW 환경변수) 필요
 finance-datareader==0.9.96
 
 # 개발/테스트

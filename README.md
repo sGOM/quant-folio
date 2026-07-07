@@ -99,19 +99,21 @@
 운용을 전제로 한다. 아래 **1→8단계**를 순서대로 따라 하면 된다.
 
 **구조 한눈에:** Caddy 리버스 프록시가 프론트(Next.js)와 백엔드(FastAPI)를
-**한 포트(`:8080`)로 합치고**, **Tailscale** 사설망으로 외부에서 접속한다.
+**한 포트(`:8080`)로 합치고**, **WireGuard** VPN 터널로 외부에서 접속한다.
 외부 진입점은 `:8080` 하나뿐이며, 나머지 포트(`web`/`frontend`/`db`/`redis`)는
 `127.0.0.1` 에만 바인딩되어 외부에 노출되지 않는다.
 
 ```
-폰(Tailscale 앱) ──테일넷(암호화)──▶ 노트북:8080 (Caddy proxy)
-                                       ├─ /        → frontend:3000
-                                       └─ /api,/ws → web:8000
+폰(WireGuard 앱) ──암호화 터널(UDP)──▶ 노트북:8080 (Caddy proxy)
+                                          ├─ /        → frontend:3000
+                                          └─ /api,/ws → web:8000
 ```
 
 ### 사전 요구사항
 - **Windows 노트북 + Docker Desktop**(Docker Compose 포함)
-- (외부/폰 접속용) **Tailscale 계정** — 개인 무료
+- (외부/폰 접속용) **WireGuard** — 노트북용 Windows 클라이언트 + 폰 앱(무료)
+- (외부/폰 접속용) **공유기 UDP 포트포워딩 + DDNS**(또는 고정 공인 IP)
+  — 집 밖(LTE)에서 노트북에 닿기 위함. ISP 가 CGNAT 면 막힐 수 있다(5단계 주의 참고).
 - (자동매매 검증용, 선택) KIS Developers 계정 + **모의투자** App Key/Secret/계좌번호
 
 ---
@@ -144,7 +146,7 @@ cp .env.example .env
 | `APP_PORT` | **외부 접속 단일 진입 포트(proxy)** | `8080` |
 | `NEXT_PUBLIC_API_BASE_URL` | 프론트가 호출할 API 주소. **비우면 상대경로(같은 출처)** → 폰이 어떤 주소로 들어와도 동작 | **(비움)** |
 | `KIS_ENV` | `vts`(모의투자) / `prod`(실전) | `vts`(검증 전) |
-| `COOKIE_SECURE` | HTTPS 에서만 쿠키 전송 | `false`→**6단계 후 `true`** |
+| `COOKIE_SECURE` | HTTPS 에서만 쿠키 전송 | `false`(HTTP 유지) / HTTPS 적용 시 `true` |
 | `COOKIE_SAMESITE` | 단일 출처 운용이면 `lax` 로 충분 | `lax` |
 | `SESSION_TTL_MINUTES` | 로그인 세션 유효기간(분, 슬라이딩 갱신) | `20160`(14일) |
 | `SECRET_KEY` / `CREDENTIAL_ENC_KEY` | 1단계 시크릿 파일로 주입(이 변수는 비워둠) | (파일 사용) |
@@ -172,37 +174,116 @@ docker compose exec web alembic upgrade head
 
 `/login` 에서 회원가입·로그인이 되면 정상이다.
 
-### 5단계 — Tailscale 로 외부(폰) 접속 열기
+### 5단계 — WireGuard 로 외부(폰) 접속 열기
 
-공인 IP·포트포워딩 없이, URL 노출 없이 폰과 노트북을 사설망으로 잇는다.
+폰과 노트북을 WireGuard 암호화 터널로 직접 잇는다. 중계 서비스 없이 노트북이
+직접 VPN 서버가 되므로, **집 공유기에서 UDP 포트 하나를 노트북으로 포워딩**하고
+변동 공인 IP 를 추적할 **DDNS** 가 필요하다.
 
-1. **노트북**: <https://tailscale.com> 가입 → Windows 클라이언트 설치·로그인.
-   트레이에서 이 기기의 주소를 확인한다.
-   - Tailscale IP: `100.x.y.z`
-   - (권장) 관리자 콘솔 → DNS → **MagicDNS** 켜면 머신명으로 접속:
-     `my-laptop.<tailnet>.ts.net`
-2. **폰**: App Store/Play 스토어에서 **Tailscale** 설치 → **같은 계정** 로그인 →
-   VPN 연결 ON(상시 켜두면 LTE·외부에서도 자동 연결).
-3. **접속**: 폰 브라우저에서
-   - `http://100.x.y.z:8080` 또는
-   - `http://my-laptop.<tailnet>.ts.net:8080`
+#### 5-1. 노트북에 WireGuard 설치 & 키 생성
+
+1. <https://www.wireguard.com/install/> 에서 **WireGuard for Windows** 설치.
+2. 앱에서 **"빈 터널 추가"**(Add empty tunnel)를 누르면 노트북 키쌍이 자동
+   생성된다. 표시되는 **공개키(노트북)** 를 복사해 두고 설정을 아래처럼 채운다:
+
+```ini
+[Interface]
+PrivateKey = <자동 생성된 노트북 개인키>
+Address    = 10.8.0.1/24
+ListenPort = 51820
+
+# 폰(피어)
+[Peer]
+PublicKey  = <5-2 에서 만든 폰 공개키>
+AllowedIPs = 10.8.0.2/32
+```
+
+#### 5-2. 폰에 WireGuard 설치 & 피어 설정
+
+1. App Store/Play 스토어에서 **WireGuard** 앱 설치 → **빈 터널 추가**로 폰
+   키쌍을 만들고 **공개키(폰)** 를 노트북 `[Peer] PublicKey` 에 채워 넣는다.
+2. 폰 터널 설정:
+
+```ini
+[Interface]
+PrivateKey = <폰 개인키>
+Address    = 10.8.0.2/24
+
+[Peer]
+PublicKey           = <노트북 공개키>
+Endpoint            = <DDNS주소>:51820   # 예: myhome.duckdns.org:51820
+AllowedIPs          = 10.8.0.0/24        # 이 서버 트래픽만 터널로(스플릿)
+PersistentKeepalive = 25
+```
+
+> `AllowedIPs = 10.8.0.0/24` 는 **스플릿 터널**이라 노트북 서버로 가는
+> 트래픽만 VPN 을 타고 나머지 폰 인터넷은 평소대로 흐른다. 폰의 모든
+> 트래픽을 노트북을 거쳐 보내려면 `0.0.0.0/0` 으로 바꾼다.
+
+#### 5-3. 공유기 포트포워딩 + DDNS
+
+1. 공유기 관리 페이지에서 **UDP 51820 → 노트북 LAN IP:51820** 포워딩 추가.
+2. 노트북 **Windows 방화벽**에서 UDP 51820 인바운드 허용(WireGuard 설치 시
+   대개 자동 등록됨).
+3. 집 공인 IP 가 바뀌므로 **DDNS**(예: DuckDNS, 공유기 내장 DDNS)를 설정해
+   `myhome.duckdns.org` 같은 고정 주소를 폰 `Endpoint` 에 쓴다.
+
+> **주의 — CGNAT:** 통신사가 공인 IP 를 주지 않고 CGNAT 를 쓰면 포트포워딩이
+> 동작하지 않는다. 이 경우 순수 WireGuard 로는 외부 접속이 불가하며, 홀펀칭
+> 기반 서비스(Tailscale 등)가 필요하다(git 히스토리의 이전 README 참고).
+
+#### 5-4. 접속
+
+노트북·폰 양쪽 WireGuard 터널을 **ON** 한 뒤, 폰 브라우저에서:
+
+- `http://10.8.0.1:8080`
 
 > 상대경로 + 단일 출처 구성이라 **어떤 주소로 들어와도 그대로 동작**하며,
 > 주소가 바뀌어도 재빌드·재설정이 필요 없다.
 
-### 6단계 — HTTPS 적용 (권장)
+### 6단계 — HTTPS 적용
 
-평문 HTTP 라도 테일넷 트래픽은 종단간 암호화되지만, 브라우저 자물쇠·HTTPS 전용
-기능·로그인 payload 암호화를 위해 Tailscale 인증서로 TLS 를 씌운다.
+WireGuard 터널 자체가 종단간 암호화라 평문 HTTP 로 써도 폰↔노트북 구간은
+보호된다. 다만 브라우저 자물쇠·HTTPS 전용 기능(서비스워커 등)·`COOKIE_SECURE`
+운용을 위해 TLS 를 씌운다. 공인 도메인이 없는 사설 IP 라 **Caddy 내부 CA 가
+자체 서명 인증서를 자동 발급**하도록 구성돼 있다(`Caddyfile` 의 `tls internal`).
 
-```bash
-# 노트북에서 — :8080(프록시) 앞에 HTTPS 종단 추가
-tailscale serve --bg --https=443 http://localhost:8080
+#### 6-1. HTTPS 대상 IP 확인
+
+`.env` 의 `WG_HOST` 가 **노트북 WireGuard IP(5단계 `Address`)와 같은지** 확인한다.
+
+```dotenv
+WG_HOST=10.8.0.1      # 5단계 [Interface] Address 와 일치
+HTTPS_PORT=443        # 그대로 두면 포트 없이 https://10.8.0.1 로 접속
 ```
 
-이후 `.env` 에서 쿠키 보안을 올리고 web 을 재시작한다.
+#### 6-2. 기동 → 인증서 자동 발급
 
 ```bash
+docker compose up -d
+```
+
+proxy 컨테이너가 처음 HTTPS 요청을 받을 때 `10.8.0.1` 용 인증서를 **내부 CA 로
+자동 발급**한다(루트 CA 는 `caddy_data` 볼륨에 영속되어 재시작해도 바뀌지 않음).
+
+#### 6-3. 루트 CA 를 폰에 설치(자물쇠 신뢰)
+
+자체 서명이라 폰이 발급자(내부 CA)를 신뢰해야 경고 없이 자물쇠가 뜬다.
+노트북에서 루트 CA 인증서를 꺼내 폰으로 옮긴다.
+
+```bash
+# 노트북 — 내부 CA 루트 인증서 추출
+docker compose cp proxy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt
+```
+
+- 이 `caddy-root.crt` 를 폰으로 전송(메일·드라이브 등) 후 설치:
+  - **iOS**: 파일 열기 → 프로파일 설치 → **설정 → 일반 → VPN 및 기기 관리**에서
+    설치 → **설정 → 일반 → 정보 → 인증서 신뢰 설정**에서 이 루트 CA **신뢰 ON**.
+  - **Android**: **설정 → 보안 → 암호화 및 자격 증명 → CA 인증서 설치**.
+
+#### 6-4. 쿠키 보안 올리고 접속
+
+```dotenv
 APP_ENV=prod
 COOKIE_SECURE=true
 ```
@@ -210,7 +291,15 @@ COOKIE_SECURE=true
 docker compose up -d
 ```
 
-이제 폰에서 `https://my-laptop.<tailnet>.ts.net` (포트 없이)로 접속한다.
+폰·노트북 WireGuard 를 켠 상태에서 폰 브라우저로 **`https://10.8.0.1`** 접속 →
+자물쇠가 정상 표시되면 완료다.
+
+> **공인 인증서(도메인 보유 시):** 도메인이 있다면 자체 서명 대신 진짜 공인
+> 인증서를 받을 수 있다. `Caddyfile` 의 `https://{$WG_HOST}:443 { tls internal }`
+> 블록을 `your.domain.com { tls { dns <provider> <token> } }` 로 바꿔 **DNS-01
+> 챌린지**로 Let's Encrypt 인증서를 발급하고(서버가 공인 IP 없이도 가능),
+> 폰 WireGuard `AllowedIPs`/DNS 로 그 도메인이 `10.8.0.1` 을 가리키게 하면
+> 루트 CA 설치 없이 자물쇠가 뜬다.
 
 ### 7단계 — 부팅 시 자동 시작 (24시간)
 
@@ -235,7 +324,8 @@ docker compose up -d
 
 - [ ] `docker compose ps` — 모든 서비스 `running`/`healthy`
 - [ ] 노트북 <http://localhost:8080> 로그인 OK
-- [ ] 폰 Tailscale 연결 후 머신명:8080(또는 HTTPS) 로그인 OK
+- [ ] 폰 WireGuard 연결 후 <http://10.8.0.1:8080> 로그인 OK
+- [ ] (HTTPS 적용 시) 폰에 루트 CA 설치 후 `https://10.8.0.1` 자물쇠 정상
 - [ ] `실시간` 화면 WebSocket 갱신 동작
 - [ ] 노트북 재부팅 후 자동 기동 확인
 - [ ] 절전/덮개 설정으로 화면 꺼져도 엔진 유지 확인

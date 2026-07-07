@@ -10,6 +10,8 @@ from app.api.routes import (
     backtests,
     engine,
     kis,
+    metrics,
+    screener,
     strategies,
     symbols,
     trading,
@@ -51,6 +53,8 @@ app.include_router(backtests.router)
 app.include_router(engine.router)
 app.include_router(trading.router)
 app.include_router(symbols.router)
+app.include_router(metrics.router)
+app.include_router(screener.router)
 app.include_router(ws.router)
 
 

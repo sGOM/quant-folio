@@ -11,6 +11,9 @@ x-backend-secret-env: &backend-secret-env
   KIS_APP_SECRET_FILE: /run/secrets/kis_app_secret
   TOSS_APP_KEY_FILE: /run/secrets/toss_app_key
   TOSS_APP_SECRET_FILE: /run/secrets/toss_app_secret
+  KRX_ID_FILE: /run/secrets/krx_id
+  KRX_PW_FILE: /run/secrets/krx_pw
+  OPENDART_API_KEY_FILE: /run/secrets/opendart_api_key
 
 x-backend-secrets: &backend-secrets
   - secret_key
@@ -19,6 +22,9 @@ x-backend-secrets: &backend-secrets
   - kis_app_secret
   - toss_app_key
   - toss_app_secret
+  - krx_id
+  - krx_pw
+  - opendart_api_key
 
 services:
   db:
@@ -70,6 +76,14 @@ services:
         condition: service_healthy
     # 24시간 운용: --reload 제거(파일 변경에 의한 의도치 않은 재시작 방지).
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    # uvicorn 이 무거운 임포트(pandas·pykrx·vectorbt) 후 :8000 을 실제 listen 할 때까지는
+    # 준비 전이다. proxy/frontend 가 이 헬스체크(service_healthy)를 기다려 기동 레이스를 막는다.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     volumes:
       - ./backend:/app
 
@@ -118,7 +132,8 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:
-      - web
+      web:
+        condition: service_healthy
     command: npm run dev
     volumes:
       - ./frontend:/app
@@ -129,13 +144,21 @@ services:
   proxy:
     image: caddy:2-alpine
     restart: unless-stopped
+    environment:
+      # HTTPS 자체 서명 인증서를 발급할 대상(WireGuard IP). .env 에서 주입.
+      WG_HOST: ${WG_HOST:-10.8.0.1}
     ports:
       - "${APP_PORT:-8080}:80"
+      - "${HTTPS_PORT:-443}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # 내부 CA·인증서 영속화(재시작해도 루트 CA 가 바뀌지 않게 → 폰 재설치 불필요).
+      - caddy_data:/data
     depends_on:
-      - web
-      - frontend
+      web:
+        condition: service_healthy
+      frontend:
+        condition: service_started
 
 # 시크릿 파일 소스. secrets/ 디렉터리는 .gitignore 로 커밋 제외된다.
 # 사용하지 않는 브로커(예: 토스 미사용)는 빈 파일로 두면 된다.
@@ -152,6 +175,13 @@ secrets:
     file: ./secrets/toss_app_key.txt
   toss_app_secret:
     file: ./secrets/toss_app_secret.txt
+  krx_id:
+    file: ./secrets/krx_id.txt
+  krx_pw:
+    file: ./secrets/krx_pw.txt
+  opendart_api_key:
+    file: ./secrets/opendart_api_key.txt
 
 volumes:
   pgdata:
+  caddy_data:

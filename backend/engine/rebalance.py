@@ -18,22 +18,61 @@ from app.services.market import is_market_open
 
 
 def compute_target_weights(
-    price_history: dict[str, pd.Series], cfg: dict
+    price_history: dict[str, pd.Series],
+    cfg: dict,
+    scores: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """선정 규칙에 따라 (선정 종목 → 목표 비중) 을 반환한다.
 
-    :param price_history: 종목코드 → 종가 Series(시간 오름차순). 데이터 부족 종목은 제외.
-    :param cfg: 전략 config(selection.method/lookback/top_n, weighting).
-    :return: 선정 종목의 목표 비중 dict(동일비중). 미선정 종목은 키에 없음(=목표 0).
+    :param price_history: 종목코드 → 종가 Series(시간 오름차순). momentum/all 선정에
+        사용된다. method="score" 에서는 참조하지 않는다(점수만으로 선정).
+    :param cfg: 전략 config(selection.method/lookback/top_n/factor_weights, weighting).
+    :param scores: method="score" 일 때 사용할 (종목코드 → 종합점수) dict. 호출자
+        (RebalanceRunner/백테스트)가 미래참조 없는 as_of(직전 확정 영업일) 기준으로
+        app.services.metrics.compute_universe_scores 등을 통해 미리 계산해 주입한다.
+        None/미포함 종목은 선정 후보에서 제외된다.
+    :return: 선정 종목의 목표 비중 dict. weighting="equal"(기본)이면 동일비중,
+        weighting="score"(method="score" 전용)이면 순위 기반 선형 가중(_rank_weighted).
+        미선정 종목은 키에 없음(=목표 0).
     """
     selection = cfg.get("selection", {})
     method = selection.get("method", "momentum")
     lookback = int(selection.get("lookback", 120))
     top_n = int(selection.get("top_n", 5))
+    weighting = cfg.get("weighting", "equal")
 
     universe = list(cfg.get("universe", []))
+    ranked: list[tuple[str, float]] | None = None  # (symbol, score) 내림차순, score 방식 전용
 
-    if method == "all":
+    if method == "score":
+        scores = scores or {}
+        candidates = [
+            (sym, scores[sym])
+            for sym in universe
+            if sym in scores and scores[sym] is not None and not math.isnan(scores[sym])
+        ]
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        ranked = candidates[:top_n]
+        selected = [sym for sym, _ in ranked]
+    elif method == "custom":
+        # 각 종목에 사용자 정의 진입/청산 규칙을 독립 적용해 '현재 진입 국면'인 종목만 선정.
+        # 종가 시계열만 사용(리밸런싱 데이터 경로가 종가 패널이라 스키마가 종가지표로 제한).
+        from app.services.backtest.signals import (  # 지연 임포트(모듈 로드 비용·순환 회피)
+            _custom_min_periods,
+            custom_position_state,
+        )
+
+        rule_cfg = {"entry": selection.get("entry"), "exit": selection.get("exit")}
+        need = _custom_min_periods(rule_cfg)
+        selected = []
+        for sym in universe:
+            series = price_history.get(sym)
+            if not _has_data(series, need):
+                continue
+            state = custom_position_state(series.dropna(), rule_cfg)
+            if len(state) and float(state.iloc[-1]) > 0:
+                selected.append(sym)
+    elif method == "all":
         selected = [s for s in universe if _has_data(price_history.get(s), 1)]
     else:  # momentum
         scored: list[tuple[str, float]] = []
@@ -51,8 +90,25 @@ def compute_target_weights(
 
     if not selected:
         return {}
+
+    if weighting == "score" and ranked is not None:
+        return _rank_weighted(ranked)
+
     weight = 1.0 / len(selected)
     return {sym: weight for sym in selected}
+
+
+def _rank_weighted(ranked: list[tuple[str, float]]) -> dict[str, float]:
+    """순위 기반 선형 가중치(1위가 최대, 꼴찌도 항상 양수).
+
+    점수는 부호·스케일이 임의(z-score 합성이라 음수 가능)이므로 점수값 자체를
+    비중으로 정규화하면 음수·0 근접값에서 불안정하다. 대신 순위만 사용해
+    n위 종목에 (N-순위+1) 에 비례하는 비중을 부여한다(1위=N, 꼴찌=1, 합=N(N+1)/2).
+    :param ranked: (symbol, score) 내림차순 정렬된 선정 종목 리스트.
+    """
+    n = len(ranked)
+    total = n * (n + 1) / 2
+    return {sym: (n - i) / total for i, (sym, _) in enumerate(ranked)}
 
 
 def _has_data(series: pd.Series | None, need: int) -> bool:
