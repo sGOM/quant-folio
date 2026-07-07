@@ -187,14 +187,29 @@ def test_targets_at_pool_provider_supplies_pointintime_universe():
         "B": [10, 10, 10, 10, 15],
         "C": [10, 10, 10, 10, 99],   # 최강이지만 그 시점 풀에 없음
     })
-    d = panel.index[-1]
+    # score 팩터(모멘텀 1·3·6개월·52주고가·변동성)가 모두 계산되도록 260거래일 패널.
+    import numpy as np
+    idx = pd.date_range("2022-01-03", periods=260, freq="B")
+    long_panel = pd.DataFrame({
+        "A": pd.Series(np.linspace(100, 200, 260), index=idx),  # 강세
+        "B": pd.Series(np.linspace(100, 150, 260), index=idx),  # 중간
+        "C": pd.Series(np.linspace(100, 400, 260), index=idx),  # 최강이나 풀 밖
+    })
+    d = long_panel.index[-1]
+    # config.universe 를 비워도 pool_provider 가 공급한 풀로 선정돼야 한다
+    # (compute_target_weights 가 config.universe 로 재필터하지 않음을 검증).
     cfg = {
-        "universe": ["A", "B", "C"],  # 무시됨
-        "selection": {"method": "score", "top_n": 2},
+        "universe": [],  # 비어 있음 — pool_provider 가 대체
+        "selection": {
+            "method": "score", "top_n": 2,
+            # 가격 팩터만(밸류/퀄리티/성장 데이터 없음 → 0 가중, 점수 NaN 오염 방지)
+            "factor_weights": {"momentum": 0.7, "value": 0.0, "lowvol": 0.3,
+                               "quality": 0.0, "growth": 0.0},
+        },
     }
-    targets = _targets_at(d, panel, cfg, None, pool_provider=lambda ts: ["A", "B"])
-    assert "C" not in targets
-    assert set(targets) <= {"A", "B"}
+    targets = _targets_at(d, long_panel, cfg, None, pool_provider=lambda ts: ["A", "B"])
+    assert "C" not in targets            # 풀 밖 최강 종목은 절대 편입 안 됨
+    assert set(targets) == {"A", "B"}    # 풀(A,B)이 그대로 선정(빈 결과 아님)
 
 
 # ───────────────────── method="custom"(규칙 기반 편입/청산) ─────────────────────

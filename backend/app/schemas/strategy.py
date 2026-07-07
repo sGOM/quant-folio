@@ -415,8 +415,9 @@ class RebalanceConfig(BaseModel):
         description="선정 종목 비중 방식. 'score' 는 selection.method='score' 일 때만 허용"
         "(순위 기반 선형 가중 — 1위가 가장 큰 비중, 음수 점수에도 안전).",
     )
-    cadence: Literal["daily", "weekly", "monthly"] = "monthly"
-    # weekly: 0=월~4=금 / monthly: 1~28(영업일 보정은 러너가 수행)
+    cadence: Literal["daily", "weekly", "monthly", "quarterly"] = "monthly"
+    # weekly: 0=월~4=금 / monthly·quarterly: 1~28(영업일 보정은 러너가 수행)
+    # quarterly: 각 분기(1·4·7·10월)의 rebalance_dom 이후 첫 영업일에 리밸런싱
     rebalance_weekday: int | None = Field(default=None, ge=0, le=4)
     rebalance_dom: int | None = Field(default=None, ge=1, le=28)
     rebalance_time: str = Field(
@@ -486,7 +487,7 @@ class RebalanceConfig(BaseModel):
                         )
         if self.cadence == "weekly" and self.rebalance_weekday is None:
             self.rebalance_weekday = 0  # 기본: 월요일
-        if self.cadence == "monthly" and self.rebalance_dom is None:
+        if self.cadence in ("monthly", "quarterly") and self.rebalance_dom is None:
             self.rebalance_dom = 1  # 기본: 1일(영업일 보정)
         return self
 

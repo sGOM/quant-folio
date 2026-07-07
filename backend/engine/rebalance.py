@@ -174,6 +174,8 @@ def _period_key(dt: datetime, cadence: str):
     if cadence == "weekly":
         iso = dt.isocalendar()
         return (iso[0], iso[1])  # (ISO year, ISO week)
+    if cadence == "quarterly":
+        return (dt.year, (dt.month - 1) // 3)  # (year, 분기 0~3)
     return (dt.year, dt.month)  # monthly
 
 
@@ -207,7 +209,7 @@ def is_rebalance_due(
     if cadence == "weekly":
         if now.weekday() < int(cfg.get("rebalance_weekday") or 0):
             return False
-    elif cadence == "monthly":
+    elif cadence in ("monthly", "quarterly"):
         if now.day < int(cfg.get("rebalance_dom") or 1):
             return False
 

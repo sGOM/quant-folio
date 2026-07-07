@@ -78,7 +78,7 @@ def _rebalance_dates(dates: pd.DatetimeIndex, cfg: dict) -> set[pd.Timestamp]:
             continue
         if cadence == "weekly" and d.weekday() < weekday:
             continue
-        if cadence == "monthly" and d.day < dom:
+        if cadence in ("monthly", "quarterly") and d.day < dom:
             continue
         seen_periods.add(key)
         picked.add(d)
@@ -232,6 +232,10 @@ def _targets_at(
     if rule:
         universe = _dynamic_universe(hist, universe, rule)
     method = selection.get("method", "momentum")
+    # compute_target_weights 는 cfg["universe"] 로 후보를 필터하므로, 동적/시점별로
+    # 해소된 실제 유니버스를 반영한 config 를 넘긴다(그러지 않으면 pool_provider·
+    # universe_rule 로 고른 종목이 원래 config.universe 에 없다는 이유로 탈락한다).
+    config = {**config, "universe": universe}
 
     if method == "score":
         fac = _score_factor_frame(hist, universe)
