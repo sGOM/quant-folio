@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { ConditionGroup, Operand, RebalanceConfig, StrategyConfig, StrategyType } from "@/lib/api";
+import { ConditionGroup, Operand, RebalanceConfig, StrategyConfig, StrategyType, UniverseRule } from "@/lib/api";
 import {
   STRATEGY_TYPES,
   STRATEGY_TYPE_LABELS,
@@ -146,15 +146,21 @@ export function StrategyForm({
 
     // 리밸런싱은 단일종목 전략과 검증 항목이 다르다(universe·선정·자본).
     if (config.type === "rebalance") {
-      if (config.universe.length < 1) return "리밸런싱 종목을 1개 이상 추가하세요.";
+      const rule = config.selection.universe_rule;
+      const isPit = rule != null && rule.source !== "fixed";
+      // PIT 소스는 지수 구성종목을 자동 후보풀로 쓰므로 universe 를 비워도 된다.
+      if (!isPit && config.universe.length < 1) return "리밸런싱 종목을 1개 이상 추가하세요.";
       if (config.universe.some((s) => !s.trim())) return "빈 종목코드가 있습니다.";
       if (new Set(config.universe).size !== config.universe.length)
         return "중복 종목코드가 있습니다.";
-      if (
-        (config.selection.method === "momentum" || config.selection.method === "score") &&
-        config.selection.top_n > config.universe.length
-      )
+      const isSelect = config.selection.method === "momentum" || config.selection.method === "score";
+      if (isPit) {
+        // PIT + 상대강도 축소(pick) 사용 시 top_n ≤ pick 이어야 한다.
+        if (isSelect && rule.type === "momentum" && rule.pick != null && config.selection.top_n > rule.pick)
+          return "선정 종목 수(top_n)는 후보 종목 수(pick) 이하여야 합니다.";
+      } else if (isSelect && config.selection.top_n > config.universe.length) {
         return "선정 종목 수(top_n)는 종목 수 이하여야 합니다.";
+      }
       if (config.selection.method === "score") {
         const fw = config.selection.factor_weights ?? DEFAULT_FACTOR_WEIGHTS;
         const sum = fw.momentum + fw.value + fw.lowvol + fw.quality + fw.growth;
@@ -669,6 +675,28 @@ function RebalanceFields({
   function patchSelection(p: Partial<RebalanceConfig["selection"]>) {
     patch({ selection: { ...config.selection, ...p } } as Partial<StrategyConfig>);
   }
+  // 후보풀 소스(fixed=고정 목록 / 지수명=시점별 PIT 구성종목으로 생존편향 제거).
+  const uniRule: UniverseRule = config.selection.universe_rule ?? { source: "fixed" };
+  const pitSource = uniRule.source !== "fixed";
+  const narrowing = pitSource && uniRule.type === "momentum";
+  function changeUniverseSource(source: UniverseRule["source"]) {
+    if (source === "fixed") {
+      const { universe_rule: _drop, ...rest } = config.selection;
+      patch({ selection: rest } as Partial<StrategyConfig>);
+    } else {
+      patchSelection({
+        universe_rule: {
+          source,
+          type: uniRule.type ?? "momentum",
+          lookback: uniRule.lookback ?? 250,
+          pick: uniRule.pick ?? 40,
+        },
+      });
+    }
+  }
+  function patchUniverseRule(p: Partial<UniverseRule>) {
+    patchSelection({ universe_rule: { ...uniRule, ...p } });
+  }
   /** 선정 방식 변경. custom 전환 시 진입/청산 규칙, score 전환 시 팩터 가중치 기본값을 채운다. */
   function changeSelectionMethod(method: RebalanceConfig["selection"]["method"]) {
     if (method === "custom") {
@@ -715,7 +743,67 @@ function RebalanceFields({
 
   return (
     <div className="space-y-3">
-      <Field label={`운용 종목 (universe · ${config.universe.length}개)`}>
+      <Field label="후보풀 소스">
+        <select
+          value={uniRule.source}
+          onChange={(e) => changeUniverseSource(e.target.value as UniverseRule["source"])}
+          className={INPUT}
+        >
+          <option value="fixed">고정 목록(아래에서 직접 선택)</option>
+          <option value="KOSPI200">KOSPI200 구성종목(시점별·PIT)</option>
+          <option value="KOSPI100">KOSPI100 구성종목(시점별·PIT)</option>
+          <option value="KRX300">KRX300 구성종목(시점별·PIT)</option>
+        </select>
+        {pitSource && (
+          <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+            각 리밸런싱 시점의 <b>실제 지수 구성종목</b>을 후보풀로 사용합니다(편출·상폐 반영 →
+            생존편향 제거). 아래 종목 목록은 지수 조회 실패 시의 <b>폴백</b>으로만 쓰입니다.
+          </p>
+        )}
+      </Field>
+
+      {pitSource && (
+        <div className="rounded-md border p-3 space-y-3">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={narrowing}
+              onChange={(e) =>
+                patchUniverseRule(
+                  e.target.checked
+                    ? { type: "momentum", lookback: uniRule.lookback ?? 250, pick: uniRule.pick ?? 40 }
+                    : { type: undefined },
+                )
+              }
+            />
+            <span>상대강도 상위만 후보로 축소</span>
+          </label>
+          {narrowing && (
+            <div className="grid grid-cols-2 gap-3">
+              <NumField
+                label="상대강도 룩백(봉)"
+                min={2}
+                value={uniRule.lookback ?? 250}
+                onChange={(v) => patchUniverseRule({ lookback: v })}
+              />
+              <NumField
+                label="후보 종목 수(pick)"
+                min={1}
+                value={uniRule.pick ?? 40}
+                onChange={(v) => patchUniverseRule({ pick: v })}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      <Field
+        label={
+          pitSource
+            ? `폴백 종목 (선택 · ${config.universe.length}개)`
+            : `운용 종목 (universe · ${config.universe.length}개)`
+        }
+      >
         <div className="flex flex-wrap gap-2">
           {config.universe.map((code) => (
             <span
@@ -734,7 +822,9 @@ function RebalanceFields({
             </span>
           ))}
           {config.universe.length === 0 && (
-            <span className="text-xs text-muted-foreground">종목을 추가하세요.</span>
+            <span className="text-xs text-muted-foreground">
+              {pitSource ? "지수 구성종목을 자동 사용합니다(폴백 없음)." : "종목을 추가하세요."}
+            </span>
           )}
         </div>
       </Field>
@@ -883,6 +973,7 @@ function RebalanceFields({
             <option value="daily">매일</option>
             <option value="weekly">매주</option>
             <option value="monthly">매월</option>
+            <option value="quarterly">매분기</option>
           </select>
         </Field>
         <Field label="실행 시각 (HH:MM, KST)">
@@ -914,9 +1005,9 @@ function RebalanceFields({
             </select>
           </Field>
         )}
-        {config.cadence === "monthly" && (
+        {(config.cadence === "monthly" || config.cadence === "quarterly") && (
           <NumField
-            label="실행 일자(1~28)"
+            label={config.cadence === "quarterly" ? "실행 일자(분기 첫달 1~28)" : "실행 일자(1~28)"}
             min={1}
             max={28}
             value={config.rebalance_dom ?? 1}

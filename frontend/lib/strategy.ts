@@ -178,7 +178,9 @@ export function summarizeConfig(c: StrategyConfig): string {
   const label = STRATEGY_TYPE_LABELS[c.type];
   // 리밸런싱은 단일 종목이 아니므로 별도 요약(종목수·선정규칙·주기).
   if (c.type === "rebalance") {
-    const cadenceLabel = { daily: "일간", weekly: "주간", monthly: "월간" }[c.cadence];
+    const cadenceLabel = { daily: "일간", weekly: "주간", monthly: "월간", quarterly: "분기" }[
+      c.cadence
+    ];
     const sel =
       c.selection.method === "momentum"
         ? `모멘텀 상위 ${c.selection.top_n}`
@@ -187,7 +189,11 @@ export function summarizeConfig(c: StrategyConfig): string {
           : c.selection.method === "custom"
             ? "사용자 규칙 편입"
             : "전체 동일비중";
-    return `${label} · ${c.universe.length}종목 · ${sel} · ${cadenceLabel} 리밸런싱`;
+    // PIT 지수 소스면 종목수 대신 소스명을 표기(universe 는 폴백일 뿐).
+    const rule = c.selection.universe_rule;
+    const poolLabel =
+      rule != null && rule.source !== "fixed" ? rule.source : `${c.universe.length}종목`;
+    return `${label} · ${poolLabel} · ${sel} · ${cadenceLabel} 리밸런싱`;
   }
   let params: string;
   switch (c.type) {
