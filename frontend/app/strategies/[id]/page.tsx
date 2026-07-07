@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useState } from "react";
+import { use, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -48,11 +48,30 @@ function StrategyDetailContent({ sid }: { sid: number }) {
   const [start, setStart] = useState("2023-01-01");
   const [end, setEnd] = useState(today);
   const [editing, setEditing] = useState(false);
+  // 체결 로그: 기본 최근 60건, "더 보기"로 60건씩 추가 노출.
+  const TRADE_PAGE = 60;
+  const [tradeLimit, setTradeLimit] = useState(TRADE_PAGE);
+  // 체결 로그 정렬: 일자(기본, 최근 우선) 또는 종목코드. 헤더 클릭으로 토글.
+  const [tradeSort, setTradeSort] = useState<{
+    key: "time" | "code";
+    dir: "asc" | "desc";
+  }>({ key: "time", dir: "desc" });
 
   const strategy = useQuery({
     queryKey: ["strategy", sid],
     queryFn: () => api.getStrategy(sid),
   });
+  // 종목코드 → 한글명 매핑(체결 로그에 종목명 표시). 거의 불변이라 오래 캐시.
+  const names = useQuery({
+    queryKey: ["symbol-names"],
+    queryFn: api.symbolNames,
+    staleTime: Infinity,
+  });
+  // "종목명(코드)" 형태로 표기. 이름을 모르면 코드만 반환.
+  const nameOf = (code: string) => {
+    const n = names.data?.[code];
+    return n ? `${n}(${code})` : code;
+  };
   const backtests = useQuery({
     queryKey: ["backtests", sid],
     queryFn: () => api.listBacktests(sid),
@@ -114,6 +133,37 @@ function StrategyDetailContent({ sid }: { sid: number }) {
         (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at),
       )[0]
     : undefined;
+
+  const isRebalance = strategy.data?.config.type === "rebalance";
+  // 체결 로그 총 건수(클로저 안에서 안전하게 참조하기 위한 파생 상수).
+  const tradeCount = latest?.result?.trades?.length ?? 0;
+
+  // 표시할 체결: 최근 tradeLimit 건을 창으로 잡고, 선택한 기준으로 정렬한다.
+  // (limit=최근 몇 건을 볼지, sort=그 창 안의 정렬 순서 — 두 개념을 분리)
+  const shownTrades = useMemo(() => {
+    const window = (latest?.result?.trades ?? []).slice(-tradeLimit);
+    const d = tradeSort.dir === "asc" ? 1 : -1;
+    return [...window].sort((a, b) => {
+      if (tradeSort.key === "code") {
+        const c = String(a.symbol).localeCompare(String(b.symbol));
+        // 같은 종목이면 시간 오름차순으로 안정 정렬
+        return c !== 0 ? c * d : String(a.t).localeCompare(String(b.t));
+      }
+      return String(a.t).localeCompare(String(b.t)) * d;
+    });
+  }, [latest, tradeLimit, tradeSort]);
+
+  // 헤더 클릭: 같은 열이면 방향 토글, 다른 열이면 기본 방향으로 전환
+  // (일자=최근 우선 desc, 종목코드=오름차순 asc).
+  function toggleTradeSort(key: "time" | "code") {
+    setTradeSort((prev) =>
+      prev.key === key
+        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: key === "time" ? "desc" : "asc" },
+    );
+  }
+  const sortArrow = (key: "time" | "code") =>
+    tradeSort.key === key ? (tradeSort.dir === "asc" ? " ↑" : " ↓") : "";
 
   return (
     <>
@@ -179,14 +229,6 @@ function StrategyDetailContent({ sid }: { sid: number }) {
           />
         )}
 
-        {strategy.data?.config.type === "rebalance" && (
-          <section className="mt-6 rounded-lg border border-border bg-card p-4 text-sm text-muted-foreground">
-            리밸런싱(포트폴리오) 전략은 백테스트를 지원하지 않습니다. 운용은 모니터링
-            화면에서 전략을 시작하면 설정한 주기에 따라 자동 실행됩니다.
-          </section>
-        )}
-
-        {strategy.data?.config.type !== "rebalance" && (
         <section className="mt-6 flex flex-wrap items-end gap-3 rounded-lg border border-border bg-card p-4">
           <label className="space-y-1">
             <span className="block text-xs text-muted-foreground">시작일</span>
@@ -217,7 +259,6 @@ function StrategyDetailContent({ sid }: { sid: number }) {
             <span className="text-sm text-destructive">{(run.error as Error).message}</span>
           )}
         </section>
-        )}
 
         {latest?.result && (
           <section className="mt-6 space-y-4">
@@ -228,16 +269,172 @@ function StrategyDetailContent({ sid }: { sid: number }) {
                 label="샤프지수"
                 value={latest.sharpe?.toFixed(2) ?? "-"}
               />
-              <Metric
-                label="승률 / 매매수"
-                value={`${pct(latest.result.win_rate)} / ${latest.result.num_trades}`}
-              />
+              {isRebalance ? (
+                <Metric
+                  label="CAGR / 매매수"
+                  value={`${pct(latest.result.cagr)} / ${latest.result.num_trades}`}
+                />
+              ) : (
+                <Metric
+                  label="승률 / 매매수"
+                  value={`${pct(latest.result.win_rate)} / ${latest.result.num_trades}`}
+                />
+              )}
             </div>
 
             <div className="rounded-lg border border-border bg-card p-4">
               <h2 className="mb-2 text-sm text-muted-foreground">자산 곡선 (Equity Curve)</h2>
               <LineChart data={latest.result.equity_curve} />
+              {isRebalance && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  리밸런싱 {latest.result.num_rebalances ?? 0}회 · 평균 회전율{" "}
+                  {pct(latest.result.avg_turnover)}
+                </p>
+              )}
             </div>
+
+            {isRebalance &&
+              latest.result.holdings &&
+              Object.keys(latest.result.holdings).length > 0 && (
+                <div className="rounded-lg border border-border bg-card p-4">
+                  <h2 className="mb-2 text-sm text-muted-foreground">
+                    종료 시점 보유 종목 (비중)
+                  </h2>
+                  <div className="flex flex-wrap gap-2">
+                    {Object.entries(latest.result.holdings).map(([sym, w]) => (
+                      <span
+                        key={sym}
+                        className="rounded-md border border-border bg-background px-2 py-1 text-xs"
+                      >
+                        {sym} · {pct(w)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+            {isRebalance &&
+              latest.result.trades &&
+              latest.result.trades.length > 0 && (
+                <div className="rounded-lg border border-border bg-card p-4">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <h2 className="text-sm text-muted-foreground">
+                      체결 로그 (매수/매도 · 최근{" "}
+                      {Math.min(tradeLimit, tradeCount)}건 / 전체 {tradeCount}건)
+                    </h2>
+                    <div className="flex shrink-0 gap-1">
+                      {tradeLimit < tradeCount && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setTradeLimit((n) => n + TRADE_PAGE)
+                          }
+                          className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                        >
+                          더 보기 (+
+                          {Math.min(TRADE_PAGE, tradeCount - tradeLimit)}건)
+                        </button>
+                      )}
+                      {tradeLimit < tradeCount && (
+                        <button
+                          type="button"
+                          onClick={() => setTradeLimit(tradeCount)}
+                          className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                        >
+                          전체 보기
+                        </button>
+                      )}
+                      {tradeLimit > TRADE_PAGE && (
+                        <button
+                          type="button"
+                          onClick={() => setTradeLimit(TRADE_PAGE)}
+                          className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                        >
+                          접기
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="max-h-96 overflow-auto">
+                    <table className="w-full text-xs">
+                      <thead className="text-muted-foreground">
+                        <tr className="border-b border-border">
+                          <th className="py-1 text-left font-normal">
+                            <button
+                              type="button"
+                              onClick={() => toggleTradeSort("time")}
+                              className="font-normal transition-colors hover:text-foreground"
+                              title="일자순 정렬"
+                            >
+                              일자{sortArrow("time")}
+                            </button>
+                          </th>
+                          <th className="py-1 text-left font-normal">
+                            <button
+                              type="button"
+                              onClick={() => toggleTradeSort("code")}
+                              className="font-normal transition-colors hover:text-foreground"
+                              title="종목코드순 정렬"
+                            >
+                              종목{sortArrow("code")}
+                            </button>
+                          </th>
+                          <th className="py-1 text-center font-normal">구분</th>
+                          <th className="py-1 text-right font-normal">거래대금</th>
+                          <th className="py-1 text-right font-normal">체결가</th>
+                          <th className="py-1 text-right font-normal">포지션손익</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {shownTrades
+                          .map((tr, i) => (
+                            <tr key={i} className="border-b border-border/50">
+                              <td className="py-1">{tr.t.slice(0, 10)}</td>
+                              <td className="py-1">{nameOf(tr.symbol)}</td>
+                              <td className="py-1 text-center">
+                                <span
+                                  className={
+                                    tr.side === "buy"
+                                      ? "text-red-500"
+                                      : tr.reason === "regime_exit"
+                                        ? "text-amber-500"
+                                        : "text-blue-500"
+                                  }
+                                >
+                                  {tr.side === "buy"
+                                    ? "매수"
+                                    : tr.reason === "regime_exit"
+                                      ? "청산"
+                                      : "매도"}
+                                </span>
+                              </td>
+                              <td className="py-1 text-right">
+                                {tr.amount.toLocaleString()}원
+                              </td>
+                              <td className="py-1 text-right">
+                                {tr.price?.toLocaleString() ?? "-"}
+                              </td>
+                              <td
+                                className={`py-1 text-right ${
+                                  (tr.position_return ?? 0) > 0
+                                    ? "text-red-500"
+                                    : (tr.position_return ?? 0) < 0
+                                      ? "text-blue-500"
+                                      : ""
+                                }`}
+                              >
+                                {tr.position_return === null ||
+                                tr.position_return === undefined
+                                  ? "-"
+                                  : pct(tr.position_return)}
+                              </td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
           </section>
         )}
 

@@ -59,4 +59,19 @@
   .tabular-nums {
     font-variant-numeric: tabular-nums;
   }
+
+  /*
+   * 네이티브 <select>/<option> 가독성 보정.
+   * Windows Chromium 등에서는 select 배경이 transparent 로 계산되면 OS 기본
+   * 콤보박스(흰 배경)로 렌더되므로, color-scheme 을 명시해 강제로 다크 위젯을
+   * 사용하게 하고 펼침 목록(option)의 배경·글씨색도 팝오버 톤으로 고정한다.
+   * (각 select 요소의 박스 배경/글씨색은 공용 INPUT/SELECT 클래스에서 처리)
+   */
+  select {
+    color-scheme: dark;
+  }
+  select option {
+    background-color: hsl(var(--popover));
+    color: hsl(var(--popover-foreground));
+  }
 }

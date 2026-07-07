@@ -13,9 +13,13 @@ import { Card } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
-/** 입력 공용 스타일(shadcn input 토큰). */
+/**
+ * 입력 공용 스타일(shadcn input 토큰).
+ * bg-transparent 대신 bg-input 을 명시해 네이티브 select 가 OS 기본(흰 배경)
+ * 콤보박스로 렌더되는 것을 방지하고, text-foreground 로 글씨 대비를 보장한다.
+ */
 const INPUT =
-  "flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
+  "flex h-9 w-full rounded-md border border-input bg-input text-foreground px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
 
 /** 정렬 옵션 라벨. */
 const SORT_LABELS: Record<NonNullable<SharedQuery["sort"]>, string> = {
