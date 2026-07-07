@@ -4,7 +4,12 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import pytest
 
-from app.services.backtest.portfolio import _regime_on_flags, run_rebalance_backtest
+from app.services.backtest.portfolio import (
+    _dynamic_universe,
+    _regime_on_flags,
+    _targets_at,
+    run_rebalance_backtest,
+)
 from engine import rebalance, rebalance_runner
 from engine.rebalance import (
     compute_rebalance_orders,
@@ -108,6 +113,70 @@ def test_score_weighting_ignored_when_method_not_score():
     history = {s: _series([1, 2, 3]) for s in ["A", "B"]}
     weights = compute_target_weights(history, cfg)
     assert weights == {"A": pytest.approx(0.5), "B": pytest.approx(0.5)}
+
+
+# ───────────────────── 동적 유니버스(_dynamic_universe) ─────────────────────
+
+
+def _panel(cols: dict[str, list[float]]) -> pd.DataFrame:
+    n = max(len(v) for v in cols.values())
+    idx = pd.date_range("2023-01-02", periods=n, freq="B")
+    return pd.DataFrame({k: pd.Series(v, index=idx[: len(v)]) for k, v in cols.items()})
+
+
+def test_dynamic_universe_ranks_by_relative_strength_and_picks_top():
+    # lookback=2 상대강도: WIN=+100%, MID=+20%, LAG=-10% → pick=2 는 WIN,MID.
+    panel = _panel({
+        "WIN": [10, 10, 20],
+        "MID": [10, 10, 12],
+        "LAG": [10, 10, 9],
+    })
+    d = panel.index[-1]
+    picked = _dynamic_universe(panel.loc[:d], ["WIN", "MID", "LAG"], {"lookback": 2, "pick": 2})
+    assert picked == ["WIN", "MID"]
+
+
+def test_dynamic_universe_excludes_insufficient_history():
+    # NEW 는 lookback+1 개 미만 → 제외. 이력 충분한 OLD 만 선정된다.
+    panel = _panel({
+        "OLD": [10, 11, 12, 13, 15],
+        "NEW": [float("nan"), float("nan"), float("nan"), 100, 101],
+    })
+    d = panel.index[-1]
+    picked = _dynamic_universe(panel.loc[:d], ["OLD", "NEW"], {"lookback": 3, "pick": 5})
+    assert picked == ["OLD"]
+
+
+def test_dynamic_universe_is_look_ahead_safe():
+    # 미래에 급등하는 종목이라도, 리밸런싱 시점(중간일) 이전까지는 저조하면 선정 안 됨.
+    panel = _panel({
+        "EARLY": [10, 12, 14, 14, 14],   # 초반 강세
+        "LATE":  [10, 10, 10, 30, 60],   # 후반 급등(미래)
+    })
+    mid = panel.index[2]  # 3번째 거래일 기준
+    picked = _dynamic_universe(panel.loc[:mid], ["EARLY", "LATE"], {"lookback": 2, "pick": 1})
+    assert picked == ["EARLY"]  # 미래의 LATE 급등을 참조하지 않는다
+
+
+def test_targets_at_applies_dynamic_universe_before_scoring():
+    # universe_rule 지정 시 후보풀에서 상대강도 상위 pick 만 스코어링 대상이 된다.
+    panel = _panel({
+        "A": [10, 10, 10, 10, 20],   # 강세
+        "B": [10, 10, 10, 10, 15],   # 중간
+        "C": [10, 10, 10, 10, 9],    # 약세 → 후보 탈락
+    })
+    d = panel.index[-1]
+    cfg = {
+        "universe": ["A", "B", "C"],
+        "selection": {
+            "method": "score",
+            "top_n": 2,
+            "universe_rule": {"type": "momentum", "lookback": 4, "pick": 2},
+        },
+    }
+    targets = _targets_at(d, panel, cfg, None)
+    assert set(targets) <= {"A", "B"}  # C 는 동적 유니버스에서 배제
+    assert "C" not in targets
 
 
 # ───────────────────── method="custom"(규칙 기반 편입/청산) ─────────────────────

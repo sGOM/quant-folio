@@ -182,6 +182,29 @@ def _score_factor_frame(hist: pd.DataFrame, codes: list[str]) -> pd.DataFrame:
     return pd.DataFrame.from_dict(rows, orient="index")
 
 
+def _dynamic_universe(hist: pd.DataFrame, pool: list[str], rule: dict) -> list[str]:
+    """리밸런싱일까지의 가격으로 후보풀에서 상대강도 상위 pick 종목을 고른다.
+
+    미래참조 방지: hist(=panel.loc[:d]) 만 사용한다. 이력이 lookback 에 못 미치는
+    종목은 자연히 제외된다(신규상장 등). 동점/무자료는 배제한다.
+    """
+    lookback = int(rule.get("lookback", 120))
+    pick = int(rule.get("pick", 20))
+    scores: dict[str, float] = {}
+    for code in pool:
+        if code not in hist.columns:
+            continue
+        c = hist[code].dropna()
+        if len(c) < lookback + 1:
+            continue
+        p0 = float(c.iloc[-lookback - 1])
+        p1 = float(c.iloc[-1])
+        if p0 > 0:
+            scores[code] = p1 / p0 - 1.0
+    ranked = sorted(scores, key=lambda k: scores[k], reverse=True)
+    return ranked[:pick]
+
+
 def _targets_at(
     d: pd.Timestamp,
     panel: pd.DataFrame,
@@ -192,8 +215,13 @@ def _targets_at(
     from app.services.metrics import _compute_stock_scores  # 지연(순환 회피)
 
     hist = panel.loc[:d]
+    selection = config.get("selection", {})
     universe = list(config.get("universe", []))
-    method = config.get("selection", {}).get("method", "momentum")
+    # 동적 유니버스: 지정 시 universe 를 후보풀로 보고 d 시점 규칙으로 사전선정한다.
+    rule = selection.get("universe_rule")
+    if rule:
+        universe = _dynamic_universe(hist, universe, rule)
+    method = selection.get("method", "momentum")
 
     if method == "score":
         fac = _score_factor_frame(hist, universe)
