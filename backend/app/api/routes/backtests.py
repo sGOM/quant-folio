@@ -4,7 +4,7 @@
 데이터가 없으면 FinanceDataReader 로 적재 후 price_ticks 를 단일 출처로 사용한다.
 """
 import logging
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -136,20 +136,58 @@ def _fundamentals_provider(as_of_date, codes):
     return fdf.join(qdf, how="left")
 
 
+def _build_pit_pool(config: dict, start, end):
+    """universe_rule.source 가 지수명이면 (합집합 universe, pool_provider) 를 만든다.
+
+    각 월(month) 의 실제 지수 구성종목을 조회해, 가격 적재용 '합집합'과 리밸런싱일별
+    후보풀을 공급하는 pool_provider 를 반환한다(생존편향 제거·PIT). 네트워크 호출을
+    백테스트 루프 밖으로 빼기 위해 월별 멤버십을 미리 조회해 dict 로 캐시한다.
+    source="fixed" 이면 (None, None) 을 반환해 기존 고정 universe 경로를 쓴다.
+    (블로킹 — 호출부가 run_in_threadpool 로 감쌀 것.)
+    """
+    rule = (config.get("selection") or {}).get("universe_rule") or {}
+    source = rule.get("source", "fixed")
+    if source == "fixed":
+        return None, None
+
+    from app.services.data import krx_index
+
+    # start~end 를 포함하는 각 월의 1일(휴장이면 krx_index 가 직전 영업일로 스냅) 멤버십.
+    by_month: dict[tuple[int, int], list[str]] = {}
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        by_month[(y, m)] = krx_index.index_members(date(y, m, 1), source)
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+    union = sorted({c for codes in by_month.values() for c in codes})
+
+    def pool_provider(ts):
+        return by_month.get((ts.year, ts.month), [])
+
+    return union, pool_provider
+
+
 async def _run_rebalance_backtest(
     db: AsyncSession, config: dict, req: BacktestRequest, start_dt, end_dt
 ) -> dict:
     """리밸런싱(다종목 포트폴리오) 전략 백테스트.
 
     universe 전 종목의 종가 패널을 워밍업 구간 포함해 적재한 뒤, 실거래와 동일한
-    선정·점수 로직으로 일별 시뮬레이션한다.
+    선정·점수 로직으로 일별 시뮬레이션한다. universe_rule.source 가 지수명이면 각
+    리밸런싱 시점의 실제 구성종목(PIT)을 후보풀로 써 생존편향을 제거한다.
     """
-    universe = list(config.get("universe", []))
+    # 팩터 워밍업: 52주 고가·MDD(252) + 모멘텀(126)에 필요. 넉넉히 500일 앞부터 적재.
+    warmup_start = req.period_start - timedelta(days=500)
+
+    # 시점별 지수 멤버십(PIT) 후보풀 준비. 지수 소스가 아니면 (None, None).
+    pit_union, pool_provider = await run_in_threadpool(
+        _build_pit_pool, config, warmup_start, req.period_end
+    )
+    universe = pit_union if pit_union is not None else list(config.get("universe", []))
     if not universe:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "universe 가 비어 있습니다.")
 
-    # 팩터 워밍업: 52주 고가·MDD(252) + 모멘텀(126)에 필요. 넉넉히 500일 앞부터 적재.
-    warmup_start = req.period_start - timedelta(days=500)
     warmup_dt = _to_dt(warmup_start)
 
     # 각 종목 종가 시드(없으면 외부 적재 후 재조회)
@@ -196,6 +234,7 @@ async def _run_rebalance_backtest(
             end_dt,
             provider,
             regime_series,
+            pool_provider,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))

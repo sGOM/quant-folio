@@ -1,5 +1,5 @@
 """리밸런싱 코어 순수함수 검증 — 목표비중·주문생성·발화시점."""
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
@@ -177,6 +177,78 @@ def test_targets_at_applies_dynamic_universe_before_scoring():
     targets = _targets_at(d, panel, cfg, None)
     assert set(targets) <= {"A", "B"}  # C 는 동적 유니버스에서 배제
     assert "C" not in targets
+
+
+def test_targets_at_pool_provider_supplies_pointintime_universe():
+    # pool_provider 가 그 시점 후보풀을 공급한다. config.universe 는 무시되고
+    # 제공된 풀(A,B) 안에서만 선정 → 풀 밖 C 는 절대 편입되지 않는다(생존편향 제거).
+    panel = _panel({
+        "A": [10, 10, 10, 10, 20],
+        "B": [10, 10, 10, 10, 15],
+        "C": [10, 10, 10, 10, 99],   # 최강이지만 그 시점 풀에 없음
+    })
+    # score 팩터(모멘텀 1·3·6개월·52주고가·변동성)가 모두 계산되도록 260거래일 패널.
+    import numpy as np
+    idx = pd.date_range("2022-01-03", periods=260, freq="B")
+    long_panel = pd.DataFrame({
+        "A": pd.Series(np.linspace(100, 200, 260), index=idx),  # 강세
+        "B": pd.Series(np.linspace(100, 150, 260), index=idx),  # 중간
+        "C": pd.Series(np.linspace(100, 400, 260), index=idx),  # 최강이나 풀 밖
+    })
+    d = long_panel.index[-1]
+    # config.universe 를 비워도 pool_provider 가 공급한 풀로 선정돼야 한다
+    # (compute_target_weights 가 config.universe 로 재필터하지 않음을 검증).
+    cfg = {
+        "universe": [],  # 비어 있음 — pool_provider 가 대체
+        "selection": {
+            "method": "score", "top_n": 2,
+            # 가격 팩터만(밸류/퀄리티/성장 데이터 없음 → 0 가중, 점수 NaN 오염 방지)
+            "factor_weights": {"momentum": 0.7, "value": 0.0, "lowvol": 0.3,
+                               "quality": 0.0, "growth": 0.0},
+        },
+    }
+    targets = _targets_at(d, long_panel, cfg, None, pool_provider=lambda ts: ["A", "B"])
+    assert "C" not in targets            # 풀 밖 최강 종목은 절대 편입 안 됨
+    assert set(targets) == {"A", "B"}    # 풀(A,B)이 그대로 선정(빈 결과 아님)
+
+
+# ───────────────────── 스키마: PIT 지수 소스(universe_rule.source) ─────────────────────
+
+
+def test_config_allows_empty_universe_when_index_source():
+    from app.schemas.strategy import RebalanceConfig
+    cfg = {
+        "type": "rebalance", "universe": [],
+        "selection": {"method": "score", "top_n": 10,
+                      "universe_rule": {"source": "KOSPI200", "pick": 20}},
+    }
+    v = RebalanceConfig.model_validate(cfg)
+    assert v.selection.universe_rule.source == "KOSPI200"
+    assert v.universe == []
+
+
+def test_config_rejects_empty_universe_when_fixed():
+    from app.schemas.strategy import RebalanceConfig
+    with pytest.raises(ValueError):
+        RebalanceConfig.model_validate({"type": "rebalance", "universe": [],
+                                        "selection": {"method": "momentum", "top_n": 3}})
+
+
+def test_config_index_source_skips_pick_vs_universe_check():
+    from app.schemas.strategy import RebalanceConfig
+    # pick=50 > len(universe)=0 이지만 지수 소스라 통과. 단 top_n<=pick 은 유지.
+    v = RebalanceConfig.model_validate({
+        "type": "rebalance", "universe": [],
+        "selection": {"method": "score", "top_n": 10,
+                      "universe_rule": {"source": "KOSPI200", "pick": 50}},
+    })
+    assert v.selection.universe_rule.pick == 50
+    with pytest.raises(ValueError):  # top_n > pick 은 여전히 거부
+        RebalanceConfig.model_validate({
+            "type": "rebalance", "universe": [],
+            "selection": {"method": "score", "top_n": 60,
+                          "universe_rule": {"source": "KOSPI200", "pick": 50}},
+        })
 
 
 # ───────────────────── method="custom"(규칙 기반 편입/청산) ─────────────────────
@@ -629,3 +701,164 @@ async def test_is_risk_off_no_prev_state_uses_stateless(monkeypatch):
         monkeypatch, close_vals=[100, 100, 100, 100, 90], prev_off=None,
         reentry_buffer=0.03, exit_buffer=0.05,
     ) is True
+
+
+# ───────── 실거래 러너 시점별(PIT) 유니버스 해석 · 동적 축소 배선 ─────────
+
+
+class _FakeDbCtx:
+    """AsyncSessionLocal() 대체 — 실제 DB 없이 async with 를 통과시킨다."""
+
+    async def __aenter__(self):
+        return object()
+
+    async def __aexit__(self, *a):
+        return False
+
+
+async def test_resolve_universe_fixed_returns_config_universe():
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._cfg = {"universe": ["005930", "000660"], "selection": {}}
+    assert await r._resolve_universe(date(2025, 6, 30)) == ["005930", "000660"]
+
+
+async def test_resolve_universe_pit_source_uses_index_members(monkeypatch):
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._cfg = {"universe": [], "selection": {"universe_rule": {"source": "KOSPI200"}}}
+    import app.services.data.krx_index as ki
+
+    monkeypatch.setattr(ki, "index_members", lambda as_of, index="KOSPI200": ["A", "B", "C"])
+    assert await r._resolve_universe(date(2025, 6, 30)) == ["A", "B", "C"]
+
+
+async def test_resolve_universe_pit_empty_falls_back_to_config(monkeypatch):
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._cfg = {"universe": ["005930"], "selection": {"universe_rule": {"source": "KOSPI200"}}}
+    import app.services.data.krx_index as ki
+
+    monkeypatch.setattr(ki, "index_members", lambda as_of, index="KOSPI200": [])
+    assert await r._resolve_universe(date(2025, 6, 30)) == ["005930"]  # 공백 → 폴백
+
+
+async def test_resolve_universe_pit_error_falls_back_to_config(monkeypatch):
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._cfg = {"universe": ["005930"], "selection": {"universe_rule": {"source": "KOSPI200"}}}
+    import app.services.data.krx_index as ki
+
+    def _boom(as_of, index="KOSPI200"):
+        raise RuntimeError("인증 실패")
+
+    monkeypatch.setattr(ki, "index_members", _boom)
+    assert await r._resolve_universe(date(2025, 6, 30)) == ["005930"]  # 예외 → 폴백
+
+
+async def test_rebalance_once_pit_narrows_and_scores_injected_universe(monkeypatch):
+    """score+PIT+동적룰: 지수 멤버십 → 상대강도 상위 pick 축소 → 그 유니버스로 스코어링."""
+    from decimal import Decimal
+
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._user_id = 1
+    r._cfg = {
+        "universe": [],
+        "capital": 10_000_000,
+        "cadence": "quarterly",
+        "selection": {
+            "method": "score",
+            "top_n": 2,
+            "factor_weights": {"value": 1.0},
+            "universe_rule": {
+                "source": "KOSPI200", "type": "momentum", "lookback": 2, "pick": 2,
+            },
+        },
+    }
+
+    # PIT 후보풀 4종목.
+    monkeypatch.setattr(r, "_resolve_universe", lambda as_of: _async(["A", "B", "C", "D"]))
+
+    # 상대강도(lookback=2) 랭킹: C(2.0) > B(0.5) > A(0.2) > D(-0.2) → pick 2 = [C, B].
+    hist = {
+        "A": _series([10, 11, 12]),
+        "B": _series([10, 11, 15]),
+        "C": _series([10, 20, 30]),
+        "D": _series([10, 9, 8]),
+    }
+    monkeypatch.setattr(r, "_seed_history", lambda pool, min_bars=0: _async(hist))
+
+    captured: dict = {}
+
+    def fake_scores(universe, as_of, factor_weights):
+        captured["universe"] = list(universe)
+        return {sym: 1.0 for sym in universe}
+
+    monkeypatch.setattr(rebalance_runner, "compute_universe_scores", fake_scores)
+    monkeypatch.setattr(rebalance_runner, "AsyncSessionLocal", lambda: _FakeDbCtx())
+    monkeypatch.setattr(r, "_holdings", lambda db, pool: _async({}))
+    monkeypatch.setattr(
+        r, "_quotes",
+        lambda syms: _async({s: Decimal("10000") for s in syms}),
+    )
+    orders_seen: list = []
+    monkeypatch.setattr(
+        r, "_execute_orders",
+        lambda orders, prices, positions, bar_ts: _async(orders_seen.extend(orders)),
+    )
+
+    await r._rebalance_once(datetime(2025, 4, 1, 14, 30, tzinfo=KST), risk_off=False)
+
+    # 스코어링은 상대강도로 축소된 [C, B] 에만 수행돼야 한다(전체 4종목 아님).
+    assert set(captured["universe"]) == {"C", "B"}
+    # 목표 2종목(C·B) 신규 매수 주문이 생성된다.
+    assert {sym for sym, side, qty in orders_seen} == {"C", "B"}
+    assert all(side == "buy" for _, side, _ in orders_seen)
+
+
+async def test_preview_returns_orders_without_executing(monkeypatch):
+    """preview 는 실제 주문을 내지 않고 산출 주문·목표·보유를 dict 로 돌려준다."""
+    from decimal import Decimal
+
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._user_id = 1
+    r._cfg = {
+        "universe": [],
+        "capital": 10_000_000,
+        "selection": {
+            "method": "score", "top_n": 2, "factor_weights": {"value": 1.0},
+            "universe_rule": {"source": "KOSPI200", "type": "momentum", "lookback": 2, "pick": 2},
+        },
+    }
+    monkeypatch.setattr(r, "_is_risk_off", lambda: _async(False))
+    monkeypatch.setattr(r, "_resolve_universe", lambda as_of: _async(["A", "B", "C", "D"]))
+    hist = {
+        "A": _series([10, 11, 12]), "B": _series([10, 11, 15]),
+        "C": _series([10, 20, 30]), "D": _series([10, 9, 8]),
+    }
+    monkeypatch.setattr(r, "_seed_history", lambda pool, min_bars=0: _async(hist))
+    monkeypatch.setattr(
+        rebalance_runner, "compute_universe_scores",
+        lambda universe, as_of, fw: {sym: 1.0 for sym in universe},
+    )
+    monkeypatch.setattr(rebalance_runner, "AsyncSessionLocal", lambda: _FakeDbCtx())
+    monkeypatch.setattr(r, "_holdings", lambda db, pool: _async({}))
+    monkeypatch.setattr(
+        r, "_quotes", lambda syms: _async({s: Decimal("10000") for s in syms})
+    )
+    executed: list = []
+    monkeypatch.setattr(
+        r, "_execute_orders",
+        lambda *a, **k: _async(executed.append(True)),
+    )
+
+    out = await r.preview()
+
+    assert executed == []  # 미체결(주문 실행 안 함)
+    assert out["risk_off"] is False
+    assert set(out["targets"]) == {"C", "B"}  # 상대강도 축소 후 스코어 선정
+    assert {sym for sym, side, qty in out["orders"]} == {"C", "B"}
+
+
+def _async(value):
+    """monkeypatch 용 코루틴 팩토리 — 지정 값을 반환하는 완료된 코루틴."""
+    async def _coro():
+        return value
+
+    return _coro()

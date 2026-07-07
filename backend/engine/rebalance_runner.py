@@ -87,9 +87,12 @@ class RebalanceRunner:
         """전략 적재 후 stop_event 가 설정될 때까지 주기적으로 발화 조건을 점검한다."""
         if not await self._load():
             return
+        rule = (self._cfg.get("selection", {}) or {}).get("universe_rule") or {}
+        src = rule.get("source", "fixed")
+        pool_desc = src if src != "fixed" else f"{len(self._cfg.get('universe', []))}종목"
         logger.info(
-            "리밸런싱 전략 %d 실행 시작 (universe=%d종목, %s)",
-            self.strategy_id, len(self._cfg.get("universe", [])), self._cfg.get("cadence"),
+            "리밸런싱 전략 %d 실행 시작 (universe=%s, %s)",
+            self.strategy_id, pool_desc, self._cfg.get("cadence"),
         )
         while not stop_event.is_set():
             try:
@@ -176,11 +179,97 @@ class RebalanceRunner:
         await self.redis.set(self._regime_key(), "1" if risk_off else "0", ex=_LAST_TTL)
 
     async def _has_holdings(self) -> bool:
-        """universe 종목의 보유 포지션(수량>0)이 하나라도 있는지."""
-        universe = list(self._cfg.get("universe", []))
+        """후보풀(고정/PIT) 종목의 보유 포지션(수량>0)이 하나라도 있는지."""
+        pool = await self._resolve_universe(_last_business_day())
         async with AsyncSessionLocal() as db:
-            positions = await self._holdings(db, universe)
+            positions = await self._holdings(db, pool)
         return bool(positions)
+
+    # ───────────────────── 목표비중 산정(주문 I/O 없음) ─────────────────────
+    async def _compute_plan(
+        self, as_of, risk_off: bool
+    ) -> tuple[list[str], dict[str, float]]:
+        """리밸런싱 목표비중을 산정한다 — 주문·체결 없는 순수 계획.
+
+        백테스트 _targets_at 와 동일 파이프라인: 후보풀 해석(고정/PIT) → 동적 상대강도
+        축소 → (score 면) 종합점수 산정 → compute_target_weights.
+
+        :param risk_off: 현금화 오버레이 여부. True 면 목표 빈 dict(전량 청산).
+        :return: (pool, targets). pool 은 축소 전 후보풀 전체(보유 청산 판정용). risk_off
+            여도 pool 을 함께 반환해 후보풀 밖 보유를 매도 대상으로 삼는다.
+        """
+        # 후보풀(pool): 고정 목록 또는 시점별(PIT) 지수 구성종목. 보유 청산 판정은 축소 전
+        # pool 전체로 해야 후보풀에서 빠진 보유종목도 목표 0 으로 매도된다.
+        pool = await self._resolve_universe(as_of)
+        if risk_off:
+            return pool, {}
+
+        selection = self._cfg.get("selection", {})
+        method = selection.get("method")
+        rule = selection.get("universe_rule") or {}
+        scores: dict[str, float] | None = None
+        history: dict[str, pd.Series] = {}
+
+        # 가격기반 선정(momentum/custom/all) 또는 동적 상대강도 축소에 종가 히스토리 필요.
+        need_hist = bool(rule.get("type")) or method in ("momentum", "custom", "all")
+        if need_hist:
+            min_bars = int(rule.get("lookback", 0)) + 1 if rule.get("type") else 0
+            history = await self._seed_history(pool, min_bars=min_bars)
+
+        # 동적 유니버스: 상대강도 상위 pick 으로 후보풀 축소(백테스트 _dynamic_universe 동일).
+        universe = pool
+        if rule.get("type"):
+            from app.services.backtest.portfolio import _dynamic_universe
+
+            universe = _dynamic_universe(pd.DataFrame(history), pool, rule)
+
+        # compute_target_weights 는 cfg["universe"] 로 후보를 재필터하므로 해석된 유니버스를 주입.
+        cfg = {**self._cfg, "universe": universe}
+        if method == "score":
+            # 종합점수는 확정 영업일(직전 거래일 종가) 기준으로만 산정해 미래참조를 방지한다
+            # (rebalance_time 은 통상 장중이라 당일 종가는 아직 미확정).
+            factor_weights = selection.get("factor_weights")
+            scores = await asyncio.to_thread(
+                compute_universe_scores, universe, as_of, factor_weights
+            )
+        targets = compute_target_weights(history, cfg, scores=scores)
+        return pool, targets
+
+    async def preview(self) -> dict:
+        """주문을 내지 않고 '지금 리밸런싱하면 낼 주문'을 계산해 반환한다(노트북·점검용).
+
+        선정·목표비중·현재 보유·현재가·산출 주문을 그대로 담아 돌려준다. 실제 매매는
+        하지 않으므로 모의투자 전에 무엇을 살지/팔지 안전하게 확인할 수 있다.
+        """
+        if not self._cfg and not await self._load():
+            raise RuntimeError(f"전략 {self.strategy_id} 적재 실패(없거나 자격증명 미등록)")
+
+        as_of = _last_business_day()
+        risk_off = await self._is_risk_off()
+        pool, targets = await self._compute_plan(as_of, risk_off)
+
+        async with AsyncSessionLocal() as db:
+            positions = await self._holdings(db, pool)
+
+        symbols = set(targets) | set(positions)
+        prices = await self._quotes(symbols)
+        drift_band = 0.0 if risk_off else float(self._cfg.get("drift_band_pct", 0.05))
+        orders = compute_rebalance_orders(
+            targets=targets,
+            positions={s: float(q) for s, q in positions.items()},
+            prices={s: float(p) for s, p in prices.items()},
+            capital=float(self._cfg.get("capital", 10_000_000)),
+            drift_band=drift_band,
+        )
+        return {
+            "as_of": as_of.isoformat(),
+            "risk_off": risk_off,
+            "pool_size": len(pool),
+            "targets": targets,
+            "positions": {s: float(q) for s, q in positions.items()},
+            "prices": {s: float(p) for s, p in prices.items()},
+            "orders": orders,
+        }
 
     # ───────────────────── 리밸런싱 1회 ─────────────────────
     async def _rebalance_once(
@@ -193,38 +282,23 @@ class RebalanceRunner:
         :param bar_tag: 멱등성 키에 들어가는 봉 태그. 같은 거래일에 정기 리밸런싱("rebal")과
             레짐 액션("regime")이 서로 다른 키를 갖도록 구분해 중복주문을 방지·허용한다.
         """
-        universe = list(self._cfg.get("universe", []))
-
+        as_of = _last_business_day()
         # 현금화 오버레이(레짐 필터): 위험회피 국면이면 목표를 빈 dict 로 두어 보유를
         # 전량 청산(현금화)하고 신규 매수를 하지 않는다. 백테스트 엔진과 동일 규약.
         if risk_off is None:
             risk_off = await self._is_risk_off()
+
+        pool, targets = await self._compute_plan(as_of, risk_off)
         if risk_off:
-            targets: dict[str, float] = {}
             logger.info(
                 "리밸런싱 전략 %d 레짐 위험회피 — 보유 청산·신규 매수 중단", self.strategy_id
             )
-        else:
-            selection = self._cfg.get("selection", {})
-            scores: dict[str, float] | None = None
-            if selection.get("method") == "score":
-                # 종합점수는 확정 영업일(직전 거래일 종가) 기준으로만 산정해 미래참조를 방지한다
-                # (rebalance_time 은 통상 장중이라 당일 종가는 아직 미확정).
-                as_of = _last_business_day()
-                factor_weights = selection.get("factor_weights")
-                scores = await asyncio.to_thread(
-                    compute_universe_scores, universe, as_of, factor_weights
-                )
-                history: dict[str, pd.Series] = {}
-            else:
-                history = await self._seed_history(universe)
-            targets = compute_target_weights(history, self._cfg, scores=scores)
-            if not targets:
-                logger.warning("리밸런싱 전략 %d 선정 종목 없음(데이터 부족) — 건너뜀", self.strategy_id)
-                return
+        elif not targets:
+            logger.warning("리밸런싱 전략 %d 선정 종목 없음(데이터 부족) — 건너뜀", self.strategy_id)
+            return
 
         async with AsyncSessionLocal() as db:
-            positions = await self._holdings(db, universe)
+            positions = await self._holdings(db, pool)
 
         # 청산 국면인데 보유도 없으면 할 일이 없다.
         if not targets and not positions:
@@ -316,8 +390,48 @@ class RebalanceRunner:
         )
         return off
 
-    async def _seed_history(self, universe: list[str]) -> dict[str, pd.Series]:
-        """universe 각 종목의 종가 Series 를 시드한다(부족하면 외부 적재)."""
+    async def _resolve_universe(self, as_of) -> list[str]:
+        """후보 유니버스(pool)를 해석한다 — 고정 목록 또는 시점별(PIT) 지수 구성종목.
+
+        selection.universe_rule.source 가 지수명(KOSPI200/KOSPI100/KRX300)이면 as_of
+        기준 '현재 구성종목'을 후보풀로 쓴다. 백테스트는 리밸런싱일별 롤링 멤버십이지만,
+        실거래에서는 '지금 이 시점의 구성'이 곧 PIT 다(미래참조 없음). source='fixed'
+        (기본)이면 config.universe 를 그대로 쓴다. 조회 실패/공백이면 config.universe 폴백.
+
+        :param as_of: 멤버십 기준일(직전 확정 영업일). 반환값은 6자리 종목코드 목록.
+        """
+        selection = self._cfg.get("selection", {})
+        rule = selection.get("universe_rule") or {}
+        source = rule.get("source", "fixed")
+        fixed = list(self._cfg.get("universe", []))
+        if source == "fixed":
+            return fixed
+
+        from app.services.data import krx_index
+
+        try:
+            members = await asyncio.to_thread(krx_index.index_members, as_of, source)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "전략 %d PIT 유니버스(%s) 조회 실패 — config.universe 폴백: %s",
+                self.strategy_id, source, e,
+            )
+            return fixed
+        if not members:
+            logger.warning(
+                "전략 %d PIT 유니버스(%s) 비어있음 — config.universe 폴백",
+                self.strategy_id, source,
+            )
+            return fixed
+        return members
+
+    async def _seed_history(
+        self, universe: list[str], min_bars: int = 0
+    ) -> dict[str, pd.Series]:
+        """universe 각 종목의 종가 Series 를 시드한다(부족하면 외부 적재).
+
+        :param min_bars: 추가로 보장할 최소 봉 수(동적 유니버스 상대강도 lookback 등).
+        """
         selection = self._cfg.get("selection", {})
         lookback = int(selection.get("lookback", 120))
         need = lookback + 1
@@ -327,6 +441,7 @@ class RebalanceRunner:
 
             rule_cfg = {"entry": selection.get("entry"), "exit": selection.get("exit")}
             need = max(need, _custom_min_periods(rule_cfg))
+        need = max(need, int(min_bars))
         end = datetime.now()
         start = end - pd.Timedelta(days=need * 3)  # 거래일 고려 여유
 
