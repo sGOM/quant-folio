@@ -302,6 +302,24 @@ export interface RebalanceSelection {
   entry?: ConditionGroup;
   /** method="custom": 청산(매도) 논리식. 각 종목에 독립 적용. */
   exit?: ConditionGroup;
+  /** 후보풀 규칙. 지수 소스(PIT) 사용 시 생존편향 제거. 미설정이면 fixed(아래 universe). */
+  universe_rule?: UniverseRule;
+}
+
+/**
+ * 후보풀(universe) 소스 규칙.
+ * - source="fixed"(기본): 아래 universe 목록을 고정 후보풀로 사용.
+ * - source=지수명: 각 리밸런싱 시점의 실제 지수 구성종목(PIT)을 후보풀로 사용 → 생존편향 제거.
+ *   type 을 지정하면 그 후보풀에서 상대강도 상위 pick 종목만 추려 선정에 넘긴다.
+ */
+export interface UniverseRule {
+  source: "fixed" | "KOSPI200" | "KOSPI100" | "KRX300";
+  /** 동적 축소 방식. "momentum"=상대강도. 미설정이면 축소 없이 전체 구성종목 사용. */
+  type?: "momentum";
+  /** 상대강도 측정 봉 수. */
+  lookback?: number;
+  /** 상대강도 상위 몇 종목을 후보로 남길지. */
+  pick?: number;
 }
 
 /** 현금화 오버레이(레짐 필터): 기준지수가 이동평균 아래면 전량 청산·매수 중단. */
@@ -329,7 +347,7 @@ export interface RebalanceConfig {
   selection: RebalanceSelection;
   /** 선정 종목 비중 방식. "equal"=동일비중 / "score"=순위 기반 선형 가중(method="score" 전용). */
   weighting: "equal" | "score";
-  cadence: "daily" | "weekly" | "monthly";
+  cadence: "daily" | "weekly" | "monthly" | "quarterly";
   /** weekly: 0=월~4=금. */
   rebalance_weekday?: number | null;
   /** monthly: 1~28(영업일 보정). */
