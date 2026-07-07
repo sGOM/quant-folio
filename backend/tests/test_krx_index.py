@@ -1,0 +1,78 @@
+"""KRX 지수 구성종목 클라이언트 — 파싱·휴장일 스냅·캐시 검증(네트워크 목).
+
+실제 KRX 호출(인증 필요) 대신 세션을 목으로 주입해 순수 로직만 검증한다.
+"""
+from datetime import date
+
+import pytest
+
+from app.services.data import krx_index
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    """trdDd 별 응답을 미리 정해두는 목 세션. 없는 날짜는 빈 output."""
+
+    def __init__(self, by_date):
+        self.by_date = by_date
+        self.calls = []
+
+    def post(self, url, data=None, timeout=None):
+        dd = data["trdDd"]
+        self.calls.append(dd)
+        rows = self.by_date.get(dd, [])
+        return _FakeResp({"output": rows})
+
+
+@pytest.fixture(autouse=True)
+def _clear_cache(monkeypatch):
+    krx_index._MEMBERS_CACHE.clear()
+    yield
+    krx_index._MEMBERS_CACHE.clear()
+
+
+def _rows(*codes):
+    return [{"ISU_SRT_CD": c, "ISU_ABBRV": f"종목{c}"} for c in codes]
+
+
+def test_index_members_parses_and_zfills(monkeypatch):
+    fake = _FakeSession({"20250630": _rows("5930", "000660", "207940")})
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+    out = krx_index.index_members(date(2025, 6, 30), "KOSPI200")
+    assert out == ["005930", "000660", "207940"]  # 6자리 zfill
+
+
+def test_index_members_snaps_back_over_holiday(monkeypatch):
+    # 2025-06-01(일)·05-31(토) 휴장 → 빈 응답, 05-30(금) 에 구성 존재.
+    fake = _FakeSession({"20250530": _rows("005930", "000660")})
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+    out = krx_index.index_members(date(2025, 6, 1), "KOSPI200")
+    assert out == ["005930", "000660"]
+    assert fake.calls[:3] == ["20250601", "20250531", "20250530"]  # 하루씩 소급
+
+
+def test_index_members_empty_when_unauthenticated(monkeypatch):
+    monkeypatch.setattr(krx_index, "_session", lambda: None)
+    assert krx_index.index_members(date(2025, 6, 30)) == []
+
+
+def test_index_members_cached(monkeypatch):
+    fake = _FakeSession({"20250630": _rows("005930")})
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+    krx_index.index_members(date(2025, 6, 30))
+    n_first = len(fake.calls)
+    krx_index.index_members(date(2025, 6, 30))  # 캐시 히트 → 추가 호출 없음
+    assert len(fake.calls) == n_first
+
+
+def test_unknown_index_raises(monkeypatch):
+    monkeypatch.setattr(krx_index, "_session", lambda: _FakeSession({}))
+    with pytest.raises(ValueError):
+        krx_index.index_members(date(2025, 6, 30), "NASDAQ")

@@ -210,14 +210,24 @@ def _targets_at(
     panel: pd.DataFrame,
     config: dict,
     fundamentals_provider,
+    pool_provider=None,
 ) -> dict[str, float]:
-    """리밸런싱일 d 의 목표비중을 산정한다(d 종가까지의 데이터만 사용)."""
+    """리밸런싱일 d 의 목표비중을 산정한다(d 종가까지의 데이터만 사용).
+
+    :param pool_provider: 지정 시 (d)->list[code] 로 그 시점의 후보풀을 공급한다.
+        시점별 지수 구성종목(예: KOSPI200 멤버십)을 넣으면 생존편향이 제거된다.
+        None 이면 config.universe(고정)를 후보풀로 쓴다.
+    """
     from app.services.metrics import _compute_stock_scores  # 지연(순환 회피)
 
     hist = panel.loc[:d]
     selection = config.get("selection", {})
-    universe = list(config.get("universe", []))
-    # 동적 유니버스: 지정 시 universe 를 후보풀로 보고 d 시점 규칙으로 사전선정한다.
+    # 후보풀: 시점별 provider 가 있으면 그 시점 멤버십, 없으면 config.universe(고정).
+    if pool_provider is not None:
+        universe = list(pool_provider(d) or [])
+    else:
+        universe = list(config.get("universe", []))
+    # 동적 유니버스: 지정 시 후보풀을 d 시점 규칙으로 사전선정(상대강도 상위)한다.
     rule = selection.get("universe_rule")
     if rule:
         universe = _dynamic_universe(hist, universe, rule)
@@ -393,6 +403,7 @@ def run_rebalance_backtest(
     sim_end,
     fundamentals_provider=None,
     regime_series: pd.Series | None = None,
+    pool_provider=None,
 ) -> dict:
     """리밸런싱 전략을 일별 시뮬레이션한다.
 
@@ -404,6 +415,10 @@ def run_rebalance_backtest(
         columns 포함 PER/PBR/DIV). None 이면 밸류 팩터는 중립(0) 처리된다.
     :param regime_series: 현금화 오버레이용 기준지수 종가 Series(워밍업 포함). config.regime_filter
         가 켜져 있을 때만 사용된다. None 이면 오버레이 미적용.
+    :param pool_provider: 지정 시 (리밸런싱일 Timestamp)->list[code] 로 그 시점의 후보풀을
+        공급한다. 시점별 지수 구성종목(KOSPI200 멤버십 등)을 넣으면 생존편향이 제거된다.
+        None 이면 config.universe(고정 후보풀)를 쓴다. universe_rule 과 함께 쓰면
+        (그 시점 멤버십 → 상대강도 상위 pick → 최종 top_n) 순으로 적용된다.
     :return: {total_return, mdd, sharpe, cagr, win_rate, num_trades, num_rebalances,
         avg_turnover, equity_curve, markers, holdings, trades} — Backtest.result 로 저장 가능한 JSON.
     """
@@ -483,7 +498,7 @@ def run_rebalance_backtest(
         )
         if not risk_off and (d in rebal_dates or regime_reentry):
             equity = cash + sum(val.values())
-            targets = _targets_at(d, panel, config, fundamentals_provider)
+            targets = _targets_at(d, panel, config, fundamentals_provider, pool_provider)
             # 목표 종목 중 당일 가격이 없는 종목은 제외(매매 불가)
             targets = {
                 s: w for s, w in targets.items()

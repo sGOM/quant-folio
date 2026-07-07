@@ -179,6 +179,24 @@ def test_targets_at_applies_dynamic_universe_before_scoring():
     assert "C" not in targets
 
 
+def test_targets_at_pool_provider_supplies_pointintime_universe():
+    # pool_provider 가 그 시점 후보풀을 공급한다. config.universe 는 무시되고
+    # 제공된 풀(A,B) 안에서만 선정 → 풀 밖 C 는 절대 편입되지 않는다(생존편향 제거).
+    panel = _panel({
+        "A": [10, 10, 10, 10, 20],
+        "B": [10, 10, 10, 10, 15],
+        "C": [10, 10, 10, 10, 99],   # 최강이지만 그 시점 풀에 없음
+    })
+    d = panel.index[-1]
+    cfg = {
+        "universe": ["A", "B", "C"],  # 무시됨
+        "selection": {"method": "score", "top_n": 2},
+    }
+    targets = _targets_at(d, panel, cfg, None, pool_provider=lambda ts: ["A", "B"])
+    assert "C" not in targets
+    assert set(targets) <= {"A", "B"}
+
+
 # ───────────────────── method="custom"(규칙 기반 편입/청산) ─────────────────────
 
 
