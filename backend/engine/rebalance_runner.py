@@ -207,13 +207,20 @@ class RebalanceRunner:
         selection = self._cfg.get("selection", {})
         method = selection.get("method")
         rule = selection.get("universe_rule") or {}
+        weighting = self._cfg.get("weighting", "equal")
         scores: dict[str, float] | None = None
         history: dict[str, pd.Series] = {}
 
-        # 가격기반 선정(momentum/custom/all) 또는 동적 상대강도 축소에 종가 히스토리 필요.
-        need_hist = bool(rule.get("type")) or method in ("momentum", "custom", "all")
+        # 가격기반 선정(momentum/custom/all)·동적 상대강도 축소·inverse_vol 변동성 산출에는
+        # 종가 히스토리가 필요하다(method="score" 만으로는 불필요하지만 weighting=
+        # "inverse_vol" 이면 method 무관하게 필요 — compute_target_weights 가 vols 미주입 시
+        # price_history 로 변동성을 산출한다. 백테스트의 _compute_vol_ann(tail(253))과
+        # 동일 정의를 맞추려면 최소 253봉을 확보해야 한다).
+        need_hist = bool(rule.get("type")) or method in ("momentum", "custom", "all") or weighting == "inverse_vol"
         if need_hist:
             min_bars = int(rule.get("lookback", 0)) + 1 if rule.get("type") else 0
+            if weighting == "inverse_vol":
+                min_bars = max(min_bars, 253)
             history = await self._seed_history(pool, min_bars=min_bars)
 
         # 동적 유니버스: 상대강도 상위 pick 으로 후보풀 축소(백테스트 _dynamic_universe 동일).
