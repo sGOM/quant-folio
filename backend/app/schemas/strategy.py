@@ -38,6 +38,10 @@ class _BaseConfig(BaseModel):
     slippage_vol_scale: float = Field(
         default=0.0, ge=0, le=5, description="변동성 비례 슬리피지 스케일(0=고정)"
     )
+    # 위험조정지표(Sharpe·Sortino)의 무위험수익률(연). 0=구 동작(rf 미반영).
+    risk_free_rate: float = Field(
+        default=0.0, ge=0, le=0.2, description="위험조정지표용 무위험수익률(연)"
+    )
 
 
 class _MaCrossMixin(_BaseConfig):
@@ -479,6 +483,13 @@ class RebalanceConfig(BaseModel):
     )
     slippage_vol_scale: float = Field(
         default=0.0, ge=0, le=5, description="변동성 비례 슬리피지 스케일(0=고정 bps)"
+    )
+    # 벤치마크 상대성과(alpha·beta·IR)용 지수. 위험조정지표 무위험수익률(연).
+    benchmark_index: Literal["KOSPI200", "KOSPI", "KOSDAQ"] = Field(
+        default="KOSPI200", description="벤치마크 상대성과 산출용 지수"
+    )
+    risk_free_rate: float = Field(
+        default=0.0, ge=0, le=0.2, description="위험조정지표용 무위험수익률(연)"
     )
 
     @field_validator("universe")

@@ -42,8 +42,9 @@ def run_backtest(data, config: dict) -> dict:
         체결 가격은 항상 종가(close)를 사용한다(체결가는 종가 기준 유지).
     config: {type, ...유형별 파라미터, cash, fees,
              stop_loss_pct?, take_profit_pct?, trailing_stop_pct?}
-    반환: {total_return, mdd, sharpe, win_rate, num_trades,
+    반환: {total_return, mdd, sharpe, sortino, win_rate, num_trades,
            equity_curve:[{t,v}], markers:[{t,type,price}]}
+        sharpe·sortino 는 config.risk_free_rate(연) 초과 기준(기본 rf=0).
     """
     import vectorbt as vbt
 
@@ -60,6 +61,8 @@ def run_backtest(data, config: dict) -> dict:
     fill_mode = str(config.get("fill_mode", "next_close"))
     base_slip = max(0.0, float(config.get("slippage_bps", 5.0) or 0.0) / 10_000.0)
     slip_vol_scale = max(0.0, float(config.get("slippage_vol_scale", 0.0) or 0.0))
+    rf_annual = float(config.get("risk_free_rate", 0.0) or 0.0)
+    rf_daily = (1.0 + rf_annual) ** (1.0 / 252.0) - 1.0  # 위험조정지표용 일간 무위험수익률
 
     # OHLC DataFrame 이면 결측 봉(어느 컬럼이든 NaN)을 제거하고 close 를 별도 추출.
     if isinstance(data, pd.DataFrame):
@@ -113,6 +116,17 @@ def run_backtest(data, config: dict) -> dict:
     except Exception:  # noqa: BLE001
         win_rate = None
 
+    # 위험조정지표: 무위험수익률(rf_daily) 초과 기준. Sortino 는 하방편차만 반영.
+    try:
+        sharpe = _safe(pf.sharpe_ratio(risk_free=rf_daily))
+    except Exception:  # noqa: BLE001
+        sharpe = _safe(pf.sharpe_ratio())
+    try:
+        # vectorbt sortino 는 목표수익(required_return, MAR)으로 하방편차를 잰다 → rf_daily 사용.
+        sortino = _safe(pf.sortino_ratio(required_return=rf_daily))
+    except Exception:  # noqa: BLE001
+        sortino = None
+
     equity_curve = [
         {"t": ts.isoformat(), "v": _safe(v)}
         for ts, v in equity.items()
@@ -129,7 +143,8 @@ def run_backtest(data, config: dict) -> dict:
     return {
         "total_return": _safe(pf.total_return()),
         "mdd": _safe(pf.max_drawdown()),
-        "sharpe": _safe(pf.sharpe_ratio()),
+        "sharpe": sharpe,
+        "sortino": sortino,
         "win_rate": win_rate,
         "num_trades": int(trades.count()),
         "equity_curve": equity_curve,

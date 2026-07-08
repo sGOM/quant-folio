@@ -456,6 +456,56 @@ def _safe(x) -> float | None:
     return None if (math.isnan(f) or math.isinf(f)) else f
 
 
+def _risk_adjusted_metrics(
+    rets: np.ndarray, bench_rets: np.ndarray | None, rf_annual: float
+) -> dict[str, float | None]:
+    """일간 수익률로 위험조정·벤치마크 상대 지표를 산출한다(연율화 √252).
+
+    - Sharpe/Sortino: 무위험수익률(rf_annual, 연) 초과분 기준. Sortino 는 하방편차만 쓴다.
+    - beta/alpha: 포트 일간수익을 벤치마크 일간수익에 회귀(OLS 기울기=beta, Jensen alpha 연율).
+    - information_ratio/tracking_error: 초과수익(포트−벤치) 기준.
+    - benchmark_return/excess_return: 구간 누적 벤치마크 수익률·초과.
+
+    NaN 인 벤치마크 일자는 짝지어 제거한다. 벤치마크가 없으면 관련 키는 None.
+    """
+    out: dict[str, float | None] = {
+        "sharpe": None, "sortino": None, "beta": None, "alpha": None,
+        "information_ratio": None, "tracking_error": None,
+        "benchmark_return": None, "excess_return": None,
+    }
+    rf_daily = (1.0 + rf_annual) ** (1.0 / 252.0) - 1.0
+    ann = math.sqrt(252.0)
+
+    if len(rets) > 1:
+        std = rets.std(ddof=1)
+        if std > 0:
+            out["sharpe"] = _safe((rets.mean() - rf_daily) / std * ann)
+        downside = np.minimum(rets - rf_daily, 0.0)
+        dstd = math.sqrt(float((downside ** 2).mean()))  # 하방편차(목표수익 rf 기준)
+        if dstd > 0:
+            out["sortino"] = _safe((rets.mean() - rf_daily) / dstd * ann)
+
+    if bench_rets is None:
+        return out
+
+    mask = ~np.isnan(bench_rets)
+    p = rets[mask]
+    b = bench_rets[mask]
+    if len(b) > 1:
+        out["benchmark_return"] = _safe(float(np.prod(1.0 + b) - 1.0))
+        bvar = b.var(ddof=1)
+        if bvar > 0:
+            beta = float(np.cov(p, b, ddof=1)[0, 1] / bvar)
+            out["beta"] = _safe(beta)
+            out["alpha"] = _safe(((p.mean() - rf_daily) - beta * (b.mean() - rf_daily)) * 252.0)
+        active = p - b
+        astd = active.std(ddof=1)
+        if astd > 0:
+            out["tracking_error"] = _safe(astd * ann)
+            out["information_ratio"] = _safe(active.mean() / astd * ann)
+    return out
+
+
 def run_rebalance_backtest(
     close_panel: pd.DataFrame,
     config: dict,
@@ -464,6 +514,7 @@ def run_rebalance_backtest(
     fundamentals_provider=None,
     regime_series: pd.Series | None = None,
     pool_provider=None,
+    benchmark_series: pd.Series | None = None,
 ) -> dict:
     """리밸런싱 전략을 일별 시뮬레이션한다.
 
@@ -479,8 +530,13 @@ def run_rebalance_backtest(
         공급한다. 시점별 지수 구성종목(KOSPI200 멤버십 등)을 넣으면 생존편향이 제거된다.
         None 이면 config.universe(고정 후보풀)를 쓴다. universe_rule 과 함께 쓰면
         (그 시점 멤버십 → 상대강도 상위 pick → 최종 top_n) 순으로 적용된다.
-    :return: {total_return, mdd, sharpe, cagr, win_rate, num_trades, num_rebalances,
-        avg_turnover, equity_curve, markers, holdings, trades} — Backtest.result 로 저장 가능한 JSON.
+    :param benchmark_series: 벤치마크(예: KOSPI200) 종가 Series(워밍업 포함). 주면 벤치마크
+        상대 지표(alpha·beta·IR·tracking_error·benchmark_return·excess_return)를 산출한다.
+        None 이면 해당 지표는 None 으로 반환된다. Sharpe·Sortino 는 config.risk_free_rate(연)
+        초과 기준으로 산출한다(기본 rf=0).
+    :return: {total_return, mdd, sharpe, sortino, cagr, alpha, beta, information_ratio,
+        tracking_error, benchmark_return, excess_return, win_rate, num_trades,
+        num_rebalances, avg_turnover, equity_curve, markers, holdings, trades} — JSON.
     """
     panel = _normalize_index(close_panel).ffill()
     if panel.empty:
@@ -502,6 +558,7 @@ def run_rebalance_backtest(
     defer = str(config.get("fill_mode", "next_close")) == "next_close"
     slip_base = max(0.0, float(config.get("slippage_bps", 5.0) or 0.0) / 10_000.0)
     slip_vol_scale = max(0.0, float(config.get("slippage_vol_scale", 0.0) or 0.0))
+    rf_annual = float(config.get("risk_free_rate", 0.0) or 0.0)  # 위험조정지표용 무위험수익률(연)
 
     # 현금화 오버레이(레짐 필터) 준비
     rf = config.get("regime_filter") or {}
@@ -624,10 +681,20 @@ def run_rebalance_backtest(
     drawdown = series / running_max - 1.0
     mdd = _safe(drawdown.min())
 
-    # Sharpe(무위험 0, 일간→연율 √252)
-    sharpe = None
-    if len(rets) > 1 and rets.std(ddof=1) > 0:
-        sharpe = _safe(rets.mean() / rets.std(ddof=1) * math.sqrt(252))
+    # 위험조정·벤치마크 상대 지표. 벤치마크 일간수익을 패널 인덱스에서 산출해 sim_dates 로
+    # 정렬(각 sim 일자의 '직전 거래일 대비' 수익). 포트 rets 와 길이·순서가 일치한다.
+    bench_rets = None
+    if benchmark_series is not None and not benchmark_series.empty:
+        bs = benchmark_series.copy()
+        bidx = bs.index
+        if isinstance(bidx, pd.DatetimeIndex) and bidx.tz is not None:
+            bidx = bidx.tz_localize(None)
+        bs.index = pd.DatetimeIndex(bidx).normalize()
+        bs = bs[~bs.index.duplicated(keep="last")].sort_index()
+        bs = bs.reindex(panel.index).ffill()
+        bench_rets = bs.pct_change().reindex(sim_dates).to_numpy(dtype=float)
+    radj = _risk_adjusted_metrics(rets, bench_rets, rf_annual)
+    sharpe = radj["sharpe"]
 
     # CAGR
     n_days = len(rets)
@@ -650,6 +717,17 @@ def run_rebalance_backtest(
         "total_return": total_return,
         "mdd": mdd,
         "sharpe": sharpe,
+        "sortino": radj["sortino"],
+        "alpha": radj["alpha"],
+        "beta": radj["beta"],
+        "information_ratio": radj["information_ratio"],
+        "tracking_error": radj["tracking_error"],
+        "benchmark_return": radj["benchmark_return"],
+        "excess_return": _safe(
+            total_return - radj["benchmark_return"]
+            if total_return is not None and radj["benchmark_return"] is not None
+            else None
+        ),
         "cagr": cagr,
         "win_rate": None,  # 포트폴리오 전략에는 종목단위 승률 개념이 맞지 않음
         "num_trades": len(trades),
