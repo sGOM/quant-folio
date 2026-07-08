@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 _JSON_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
 _BLD_INDEX_CONSTITUENTS = "dbms/MDC/STAT/standard/MDCSTAT00601"
+# 종목 검색 finder(전 상장종목 코드·한글명). 날짜 비의존 — 시스템 시계가 미래여도 동작.
+_BLD_STOCK_FINDER = "dbms/comm/finder/finder_stkisu"
+_MARKET_BY_CODE = {"STK": "KOSPI", "KSQ": "KOSDAQ", "KNX": "KONEX"}
 
 # 주요 지수의 MDC 파라미터(indIdx/indIdx2). KOSPI200 = 1/028.
 INDEX_PARAMS: dict[str, dict[str, str]] = {
@@ -34,6 +37,9 @@ INDEX_PARAMS: dict[str, dict[str, str]] = {
 
 # (index, YYYYMMDD) -> list[str]
 _MEMBERS_CACHE: dict[tuple[str, str], list[str]] = {}
+
+# 전 상장종목 목록 캐시(성공 시에만 채움 — 실패를 캐시하지 않아 다음 호출에 재시도).
+_STOCKS_CACHE: list[dict[str, str]] | None = None
 
 
 def _session():
@@ -95,6 +101,50 @@ def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
 
     _MEMBERS_CACHE[key] = codes
     return codes
+
+
+def all_listed_stocks() -> list[dict[str, str]]:
+    """전 상장종목 목록 [{code, name, market}] 을 KRX MDC finder 로 조회한다.
+
+    지수 구성종목과 달리 **날짜에 의존하지 않는 종목 마스터**라, 시스템 시계가 미래여서
+    pykrx 의 '오늘' 기반 조회가 빈 응답을 주는 환경에서도 동작한다. 종목명 매핑(체결/주문
+    로그 표기)의 신뢰 가능한 1차 소스. 미인증/실패 시 빈 리스트(호출부가 폴백).
+
+    성공 결과만 캐시한다(실패를 캐시하면 프로세스 수명 내내 이름이 비므로).
+    """
+    global _STOCKS_CACHE
+    if _STOCKS_CACHE is not None:
+        return _STOCKS_CACHE
+
+    sess = _session()
+    if sess is None:
+        logger.debug("KRX 미인증 — 전종목 목록 조회 건너뜀")
+        return []
+
+    payload = {
+        "bld": _BLD_STOCK_FINDER, "locale": "ko_KR",
+        "mktsel": "ALL", "typeNo": "0", "searchText": "",
+    }
+    try:
+        resp = sess.post(_JSON_URL, data=payload, timeout=20)
+        rows = resp.json().get("block1") or []
+    except Exception as e:  # noqa: BLE001
+        logger.warning("KRX 전종목 목록 조회 실패: %s", e)
+        return []
+
+    out: list[dict[str, str]] = []
+    for r in rows:
+        code = str(r.get("short_code") or "").strip().zfill(6)
+        name = str(r.get("codeName") or "").strip()
+        if not code or not name:
+            continue
+        market = _MARKET_BY_CODE.get(str(r.get("marketCode") or "").strip(), "")
+        out.append({"code": code, "name": name, "market": market})
+
+    if out:  # 성공 시에만 캐시
+        _STOCKS_CACHE = out
+        logger.info("KRX 전종목 목록 로드: %d개", len(out))
+    return out
 
 
 def membership_union(dates: list[date], index: str = "KOSPI200") -> dict[str, list[str]]:

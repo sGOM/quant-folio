@@ -34,8 +34,10 @@ class _FakeSession:
 @pytest.fixture(autouse=True)
 def _clear_cache(monkeypatch):
     krx_index._MEMBERS_CACHE.clear()
+    krx_index._STOCKS_CACHE = None
     yield
     krx_index._MEMBERS_CACHE.clear()
+    krx_index._STOCKS_CACHE = None
 
 
 def _rows(*codes):
@@ -76,6 +78,65 @@ def test_unknown_index_raises(monkeypatch):
     monkeypatch.setattr(krx_index, "_session", lambda: _FakeSession({}))
     with pytest.raises(ValueError):
         krx_index.index_members(date(2025, 6, 30), "NASDAQ")
+
+
+# ───────────────────── 전 상장종목 마스터(all_listed_stocks) ─────────────────────
+
+
+class _FakeFinderSession:
+    """finder_stkisu 응답(block1)을 돌려주는 목 세션."""
+
+    def __init__(self, rows, *, raise_exc=False):
+        self.rows = rows
+        self.raise_exc = raise_exc
+        self.calls = 0
+
+    def post(self, url, data=None, timeout=None):
+        self.calls += 1
+        if self.raise_exc:
+            raise RuntimeError("네트워크 오류")
+        return _FakeResp({"block1": self.rows})
+
+
+def _finder_rows(*items):
+    # items: (short_code, codeName, marketCode)
+    return [
+        {"short_code": c, "codeName": n, "marketCode": mc}
+        for c, n, mc in items
+    ]
+
+
+def test_all_listed_stocks_parses_and_maps_market(monkeypatch):
+    fake = _FakeFinderSession(_finder_rows(
+        ("005930", "삼성전자", "STK"), ("060310", "3S", "KSQ"), ("000000", "", "STK"),
+    ))
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+    out = krx_index.all_listed_stocks()
+    assert {"code": "005930", "name": "삼성전자", "market": "KOSPI"} in out
+    assert {"code": "060310", "name": "3S", "market": "KOSDAQ"} in out
+    # 이름 없는 행은 제외.
+    assert all(s["code"] != "000000" for s in out)
+
+
+def test_all_listed_stocks_caches_on_success(monkeypatch):
+    fake = _FakeFinderSession(_finder_rows(("005930", "삼성전자", "STK")))
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+    krx_index.all_listed_stocks()
+    krx_index.all_listed_stocks()  # 두 번째는 캐시 히트 → post 재호출 없음
+    assert fake.calls == 1
+
+
+def test_all_listed_stocks_unauthenticated_returns_empty(monkeypatch):
+    monkeypatch.setattr(krx_index, "_session", lambda: None)
+    assert krx_index.all_listed_stocks() == []
+    assert krx_index._STOCKS_CACHE is None  # 실패는 캐시하지 않음(자가복구)
+
+
+def test_all_listed_stocks_failure_not_cached(monkeypatch):
+    fake = _FakeFinderSession([], raise_exc=True)
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+    assert krx_index.all_listed_stocks() == []
+    assert krx_index._STOCKS_CACHE is None  # 예외도 캐시 안 함
 
 
 # ───────────────────── 라우트 PIT 풀 빌더(_build_pit_pool) ─────────────────────
