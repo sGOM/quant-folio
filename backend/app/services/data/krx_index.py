@@ -27,6 +27,8 @@ _BLD_INDEX_CONSTITUENTS = "dbms/MDC/STAT/standard/MDCSTAT00601"
 # 종목 검색 finder(전 상장종목 코드·한글명). 날짜 비의존 — 시스템 시계가 미래여도 동작.
 _BLD_STOCK_FINDER = "dbms/comm/finder/finder_stkisu"
 _MARKET_BY_CODE = {"STK": "KOSPI", "KSQ": "KOSDAQ", "KNX": "KONEX"}
+# 전종목 시가총액(MDCSTAT01501). 명시적 trdDd 로 조회 — 과거일이면 그날 종가 기준 시총.
+_BLD_MARKET_CAP = "dbms/MDC/STAT/standard/MDCSTAT01501"
 
 # 주요 지수의 MDC 파라미터(indIdx/indIdx2). KOSPI200 = 1/028.
 INDEX_PARAMS: dict[str, dict[str, str]] = {
@@ -40,6 +42,9 @@ _MEMBERS_CACHE: dict[tuple[str, str], list[str]] = {}
 
 # 전 상장종목 목록 캐시(성공 시에만 채움 — 실패를 캐시하지 않아 다음 호출에 재시도).
 _STOCKS_CACHE: list[dict[str, str]] | None = None
+
+# YYYYMMDD -> {code: 시가총액(원)}. 시점별 시총(유동성 필터용) 캐시.
+_MKTCAP_CACHE: dict[str, dict[str, int]] = {}
 
 
 def _session():
@@ -145,6 +150,50 @@ def all_listed_stocks() -> list[dict[str, str]]:
         _STOCKS_CACHE = out
         logger.info("KRX 전종목 목록 로드: %d개", len(out))
     return out
+
+
+def market_caps(as_of: date) -> dict[str, int]:
+    """as_of 시점 전 종목 시가총액(원) {code: mktcap}. 실패/미인증 시 빈 dict.
+
+    MDCSTAT01501 을 KOSPI(STK)·KOSDAQ(KSQ) 각각 조회해 합친다. 명시적 trdDd 를 쓰므로
+    시스템 시계가 미래여도 과거일 시총을 정상 조회한다. 휴장일이면 최대 6일 소급 스냅.
+    유동성 필터(universe_rule.min_market_cap)에서 소형주를 후보풀에서 걸러내는 용도.
+    성공 결과만 캐시한다(실패를 캐시하지 않음).
+    """
+    key = as_of.strftime("%Y%m%d")
+    if key in _MKTCAP_CACHE:
+        return _MKTCAP_CACHE[key]
+
+    sess = _session()
+    if sess is None:
+        logger.debug("KRX 미인증 — 시가총액 조회 건너뜀")
+        return {}
+
+    caps: dict[str, int] = {}
+    for back in range(7):  # 휴장일 빈 응답 대비 직전 영업일 소급
+        dd = (as_of - timedelta(days=back)).strftime("%Y%m%d")
+        for mkt in ("STK", "KSQ"):
+            payload = {
+                "bld": _BLD_MARKET_CAP, "locale": "ko_KR",
+                "mktId": mkt, "trdDd": dd, "money": "1", "csvxls_isNo": "false",
+            }
+            try:
+                resp = sess.post(_JSON_URL, data=payload, timeout=20)
+                rows = resp.json().get("OutBlock_1") or []
+            except Exception as e:  # noqa: BLE001
+                logger.warning("KRX 시가총액 조회 실패(%s %s): %s", mkt, dd, e)
+                rows = []
+            for r in rows:
+                code = str(r.get("ISU_SRT_CD") or "").strip().zfill(6)
+                raw = str(r.get("MKTCAP") or "").replace(",", "").strip()
+                if code and raw.isdigit():
+                    caps[code] = int(raw)
+        if caps:
+            break
+
+    if caps:
+        _MKTCAP_CACHE[key] = caps
+    return caps
 
 
 def membership_union(dates: list[date], index: str = "KOSPI200") -> dict[str, list[str]]:

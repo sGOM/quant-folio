@@ -319,6 +319,12 @@ class UniverseRule(BaseModel):
     pick: int = Field(
         default=20, ge=1, le=100, description="후보풀에서 사전선정할 종목 수(이후 top_n 으로 최종 선정)"
     )
+    min_market_cap: int | None = Field(
+        default=None, ge=0,
+        description="유동성 필터: 후보풀에서 시가총액(억 원)이 이 값 미만인 종목을 제외한다. "
+        "각 리밸런싱 시점 시총 기준(PIT). None 이면 필터 없음. 소형주 슬리피지 과대평가를 "
+        "방지하는 안전장치(백테스트는 슬리피지를 반영하지 않으므로 대형·유동주로 한정 권장).",
+    )
 
 
 class RebalanceSelection(BaseModel):
@@ -489,6 +495,22 @@ class RebalanceConfig(BaseModel):
                 raise ValueError("selection.top_n 은 universe 종목 수 이하여야 합니다.")
         if self.weighting == "score" and self.selection.method != "score":
             raise ValueError("weighting='score' 는 selection.method='score' 일 때만 사용할 수 있습니다.")
+        # drift_band 가드: 비중 방식·top_n 대비 밴드가 과대하면 목표비중이 밴드 안에 갇혀
+        # 진입/청산이 아예 발생하지 않는다(compute_rebalance_orders 의 abs(dev)<=drift_band
+        # 스킵). 선정 종목 수가 고정인 momentum/score 에만 적용한다(all/custom 은 가변).
+        if self.selection.method in ("momentum", "score") and self.selection.top_n > 0:
+            n = self.selection.top_n
+            if self.weighting == "score":
+                # 순위가중은 상위 집중이 의도 — 최상위 종목(2/(n+1)) 만이라도 진입 가능하면 허용.
+                floor = 2.0 / (n + 1)
+            else:  # equal / inverse_vol — 광범위 보유 의도(각 ~1/n)
+                floor = 1.0 / n
+            if self.drift_band_pct >= floor:
+                raise ValueError(
+                    f"drift_band_pct({self.drift_band_pct})가 과대합니다: 선정 {n}종목·"
+                    f"'{self.weighting}' 비중에선 목표비중이 드리프트 밴드({floor:.3f}) 안에 "
+                    f"갇혀 매매가 발생하지 않습니다. drift_band_pct 를 {floor:.3f} 미만으로 낮추세요."
+                )
         if self.selection.method == "custom":
             if self.selection.entry is None or self.selection.exit is None:
                 raise ValueError("selection.method='custom' 은 entry·exit 규칙이 모두 필요합니다.")

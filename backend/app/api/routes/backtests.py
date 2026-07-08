@@ -152,11 +152,20 @@ def _build_pit_pool(config: dict, start, end):
 
     from app.services.data import krx_index
 
+    # 유동성 필터: 시가총액(억 원) 하한. 각 월 시점 시총 기준으로 소형주를 후보풀에서 제외.
+    min_cap = rule.get("min_market_cap")
+    min_cap_won = int(min_cap) * 10**8 if min_cap else 0
+
     # start~end 를 포함하는 각 월의 1일(휴장이면 krx_index 가 직전 영업일로 스냅) 멤버십.
     by_month: dict[tuple[int, int], list[str]] = {}
     y, m = start.year, start.month
     while (y, m) <= (end.year, end.month):
-        by_month[(y, m)] = krx_index.index_members(date(y, m, 1), source)
+        members = krx_index.index_members(date(y, m, 1), source)
+        if min_cap_won and members:
+            caps = krx_index.market_caps(date(y, m, 1))
+            if caps:  # 조회 성공 시에만 필터(실패 시 원본 유지 — 과도한 축소 방지)
+                members = [c for c in members if caps.get(c, 0) >= min_cap_won]
+        by_month[(y, m)] = members
         m += 1
         if m > 12:
             y, m = y + 1, 1
@@ -226,7 +235,7 @@ async def _run_rebalance_backtest(
             logger.warning("레짐 필터 기준지수 적재 실패(오버레이 미적용): %s", e)
 
     try:
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             run_rebalance_backtest,
             panel,
             config,
@@ -241,6 +250,41 @@ async def _run_rebalance_backtest(
     except Exception as e:  # noqa: BLE001
         logger.exception("리밸런싱 백테스트 실행 오류")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"백테스트 실패: {e}")
+
+    # 팩터 커버리지 경고: quality/growth 가중치>0 인데 OpenDART 재무 커버리지가 낮으면
+    # 해당 팩터가 조용히 중립(0) 처리되어 다른 전략이 된다. 결과에 명시적으로 노출한다.
+    warnings = await run_in_threadpool(_factor_coverage_warnings, config, universe, req.period_end)
+    if warnings:
+        result["factor_warnings"] = warnings
+    return result
+
+
+def _factor_coverage_warnings(config: dict, universe: list[str], as_of) -> list[str]:
+    """quality/growth 가중치가 있으나 OpenDART 재무 커버리지가 낮은지 점검(블로킹).
+
+    커버리지가 임계 미만이면 "그 팩터가 사실상 미반영"이라는 경고 문자열을 반환한다.
+    빈 리스트면 문제 없음. 네트워크 실패 시에는 경고를 생성하지 않는다(오탐 방지).
+    """
+    fw = (config.get("selection") or {}).get("factor_weights") or {}
+    need = [k for k in ("quality", "growth") if float(fw.get(k, 0) or 0) > 0]
+    if not need or not universe:
+        return []
+    sample = universe[:40]
+    try:
+        from app.services.data import opendart
+
+        metrics = opendart.metrics_by_symbol(sample, as_of)
+    except Exception:  # noqa: BLE001
+        return []  # 조회 실패는 경고 대상 아님(오탐 방지)
+    covered = sum(1 for code in sample if metrics.get(code))
+    coverage = covered / len(sample) if sample else 0.0
+    if coverage >= 0.3:
+        return []
+    return [
+        f"OpenDART 재무 커버리지 {coverage * 100:.0f}% (표본 {len(sample)}종목) — "
+        f"가중치를 준 {'·'.join(need)} 팩터가 대부분 중립(0) 처리되어 점수에 거의 반영되지 "
+        f"않습니다. OPENDART API 키·응답을 확인하거나 해당 가중치를 재검토하세요."
+    ]
 
 
 @router.post(
