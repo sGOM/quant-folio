@@ -94,46 +94,64 @@ _SEED: list[tuple[str, str, str, str]] = [
 _cache: list[dict[str, str]] | None = None
 
 
-def _build_catalog() -> list[dict[str, str]]:
-    """내장 목록 + (가능하면) FDR KRX 전체 목록을 병합해 카탈로그를 만든다."""
+def _build_catalog() -> tuple[list[dict[str, str]], bool]:
+    """내장 목록 + 외부 소스(KRX MDC 우선, FDR 보조)를 병합해 카탈로그를 만든다.
+
+    :return: (카탈로그, external_ok). external_ok 는 외부 소스가 하나라도 종목을
+        보탰는지 여부. False(외부 전부 실패)면 seed 만 있으므로 호출부가 캐시하지 않고
+        다음 호출에 재시도하게 한다(일시적 네트워크 실패가 프로세스 수명 내내 이름을
+        비우는 문제 방지).
+    """
     by_code: dict[str, dict[str, str]] = {
         code: {"code": code, "name": name, "name_en": en, "market": market}
         for code, name, en, market in _SEED
     }
+    external_ok = False
 
+    def _merge(code: str, name: str, market: str) -> None:
+        code = str(code).strip()
+        if not code or len(code) != 6 or not code.isdigit() or not name:
+            return
+        if code in by_code:
+            # 내장 항목은 영문명을 보존하고 시장만 보강.
+            if market and not by_code[code]["market"]:
+                by_code[code]["market"] = market
+        else:
+            by_code[code] = {"code": code, "name": name, "name_en": "", "market": market}
+
+    # 1순위: KRX 정보데이터시스템 전종목 마스터(날짜 비의존 → 시스템 시계가 미래여도 동작).
+    # pykrx/FDR 의 '오늘' 기반 조회가 실패하는 환경에서도 이름을 확보하는 신뢰 소스.
+    try:
+        from app.services.data import krx_index
+
+        krx_stocks = krx_index.all_listed_stocks()
+        for s in krx_stocks:
+            _merge(s["code"], s["name"], s.get("market", ""))
+        if krx_stocks:
+            external_ok = True
+            logger.info("종목 카탈로그: KRX MDC %d개 병합", len(krx_stocks))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("KRX 전종목 목록 조회 실패: %s", e)
+
+    # 2순위(보조): FDR KRX 상장목록. 성공하면 누락 종목을 보강한다(실패해도 무해).
     try:
         import FinanceDataReader as fdr
 
         df = fdr.StockListing("KRX")
-        # 컬럼명은 버전에 따라 다를 수 있어 방어적으로 접근한다.
         cols = {c.lower(): c for c in df.columns}
         code_col = cols.get("code") or cols.get("symbol")
         name_col = cols.get("name")
         market_col = cols.get("market")
-        if code_col and name_col:
+        if code_col and name_col and len(df) > 0:
             for _, row in df.iterrows():
-                code = str(row[code_col]).strip()
-                # 보통주(숫자 6자리)만; 우선주/스팩 등도 코드가 6자리라 그대로 둔다.
-                if not code or len(code) != 6 or not code.isdigit():
-                    continue
-                name = str(row[name_col]).strip()
                 market = str(row[market_col]).strip() if market_col else ""
-                if code in by_code:
-                    # 내장 항목은 영문명을 보존하고 시장만 보강.
-                    if market and not by_code[code]["market"]:
-                        by_code[code]["market"] = market
-                else:
-                    by_code[code] = {
-                        "code": code,
-                        "name": name,
-                        "name_en": "",
-                        "market": market,
-                    }
-            logger.info("종목 카탈로그 로드: %d개 (FDR 병합)", len(by_code))
+                _merge(str(row[code_col]).strip(), str(row[name_col]).strip(), market)
+            external_ok = True
+            logger.info("종목 카탈로그: FDR 병합 후 %d개", len(by_code))
     except Exception as e:  # noqa: BLE001
-        logger.warning("FDR 상장목록 조회 실패, 내장 목록만 사용: %s", e)
+        logger.warning("FDR 상장목록 조회 실패(무시): %s", e)
 
-    return list(by_code.values())
+    return list(by_code.values()), external_ok
 
 
 def get_catalog() -> list[dict[str, str]]:
@@ -143,7 +161,12 @@ def get_catalog() -> list[dict[str, str]]:
     """
     global _cache
     if _cache is None:
-        _cache = _build_catalog()
+        catalog, external_ok = _build_catalog()
+        if not external_ok:
+            # 외부 소스 전부 실패(seed 만) — 캐시하지 않고 다음 호출에 재시도(자가복구).
+            logger.warning("종목 카탈로그 외부 소스 실패 — seed(%d) 만 사용, 캐시 보류", len(catalog))
+            return catalog
+        _cache = catalog
     return _cache
 
 
