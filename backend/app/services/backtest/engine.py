@@ -6,7 +6,16 @@
 
 close-only 전략(SMA/EMA/RSI/MACD/볼린저/돌파/모멘텀/z-score/이격도/donchian_squeeze/trix)은
 종가 Series 를, OHLC 전략(atr_trailing/volatility_breakout/keltner/stochastic/obv_trend)은
-OHLCV DataFrame 을 입력으로 받는다. 어느 경우든 **체결 가격은 종가(close)** 를 사용한다.
+OHLCV DataFrame 을 입력으로 받는다. 어느 경우든 체결 기준가는 종가(close)를 사용한다.
+
+체결 현실성(P0-1)
+=================
+- fill_mode="next_close"(기본): 신호는 종가(t) 확정 후 산출하되 체결은 익일 종가(t+1).
+  신호와 동일 봉 종가로 체결하던 당일 미래참조(look-ahead)를 제거한다.
+- fill_mode="same_close": 당일 종가 즉시 체결(구 동작, 민감도 분석용 opt-in).
+- slippage_bps: 편도 슬리피지. 매수는 체결가 ×(1+slip), 매도는 ×(1−slip). vectorbt 의
+  slippage 인자로 대칭 반영한다. slippage_vol_scale>0 이면 최근 20봉 수익률 표준편차/중앙값
+  비로 봉별 슬리피지를 조정한다.
 """
 from __future__ import annotations
 
@@ -47,6 +56,11 @@ def run_backtest(data, config: dict) -> dict:
     # 2*fees + tax 로 정확히 일치한다(매수쪽 tax/2 는 근사이나 왕복 총액은 정확).
     effective_fees = fees + tax / 2.0
 
+    # 체결 현실성(P0-1): 체결 시점(fill_mode)·슬리피지.
+    fill_mode = str(config.get("fill_mode", "next_close"))
+    base_slip = max(0.0, float(config.get("slippage_bps", 5.0) or 0.0) / 10_000.0)
+    slip_vol_scale = max(0.0, float(config.get("slippage_vol_scale", 0.0) or 0.0))
+
     # OHLC DataFrame 이면 결측 봉(어느 컬럼이든 NaN)을 제거하고 close 를 별도 추출.
     if isinstance(data, pd.DataFrame):
         frame = data.astype(float).dropna()
@@ -62,13 +76,30 @@ def run_backtest(data, config: dict) -> dict:
 
     entries, exits = generate_signals(signal_input, config)
 
+    # 체결 시점: next_close 면 신호를 1봉 지연시켜 익일 종가에 체결한다(당일 미래참조 제거).
+    if fill_mode == "next_close":
+        exec_entries = entries.shift(1, fill_value=False)
+        exec_exits = exits.shift(1, fill_value=False)
+    else:
+        exec_entries, exec_exits = entries, exits
+
+    # 슬리피지: 고정(스칼라) 또는 변동성 비례(봉별 Series). vectorbt 는 매수 +slip·매도 −slip.
+    slippage = base_slip
+    if base_slip > 0 and slip_vol_scale > 0:
+        vol = close.pct_change().rolling(20, min_periods=10).std()
+        med = float(vol.median())
+        if med == med and med > 0:  # med 가 NaN 이 아니고 양수
+            factor = 1.0 + slip_vol_scale * (vol / med - 1.0)
+            slippage = (base_slip * factor).clip(lower=0.0).fillna(base_slip)
+
     # 리스크 청산: 트레일링이 설정되면 추적 손절(sl_trail)로, 아니면 고정 손절로 반영.
     sl_stop = config.get("trailing_stop_pct") or config.get("stop_loss_pct")
     sl_trail = config.get("trailing_stop_pct") is not None
     tp_stop = config.get("take_profit_pct")
 
     pf = vbt.Portfolio.from_signals(
-        close, entries, exits, init_cash=cash, fees=effective_fees, freq="1D",
+        close, exec_entries, exec_exits, init_cash=cash, fees=effective_fees,
+        slippage=slippage, freq="1D",
         sl_stop=sl_stop, sl_trail=sl_trail, tp_stop=tp_stop,
     )
 
@@ -89,9 +120,9 @@ def run_backtest(data, config: dict) -> dict:
     ]
 
     markers = []
-    for ts in close.index[entries.values]:
+    for ts in close.index[exec_entries.values]:
         markers.append({"t": ts.isoformat(), "type": "buy", "price": _safe(close.loc[ts])})
-    for ts in close.index[exits.values]:
+    for ts in close.index[exec_exits.values]:
         markers.append({"t": ts.isoformat(), "type": "sell", "price": _safe(close.loc[ts])})
     markers.sort(key=lambda m: m["t"])
 
