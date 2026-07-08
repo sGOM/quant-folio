@@ -125,6 +125,14 @@ export interface BaseConfig {
   take_profit_pct?: number | null;
   /** 트레일링 스탑 비율 0~1. null/미설정이면 비활성. */
   trailing_stop_pct?: number | null;
+  /** 체결 시점: "next_close"=익일 종가(기본) / "same_close"=당일 종가. */
+  fill_mode?: "next_close" | "same_close";
+  /** 편도 슬리피지(bps, 0~200). 5=0.05%. */
+  slippage_bps?: number;
+  /** 변동성 비례 슬리피지 스케일(0~5, 0=고정 bps). */
+  slippage_vol_scale?: number;
+  /** 위험조정지표(Sharpe·Sortino)용 무위험수익률(연, 0~0.2). */
+  risk_free_rate?: number;
 }
 
 export interface SmaConfig extends BaseConfig {
@@ -366,6 +374,16 @@ export interface RebalanceConfig {
   fees: number;
   /** 증권거래세율(매도 시). */
   tax: number;
+  /** 체결 시점: "next_close"=익일 종가(기본) / "same_close"=당일 종가. */
+  fill_mode?: "next_close" | "same_close";
+  /** 편도 슬리피지(bps, 0~200). 매수 +slip·매도 −slip. */
+  slippage_bps?: number;
+  /** 변동성 비례 슬리피지 스케일(0~5, 0=고정 bps). */
+  slippage_vol_scale?: number;
+  /** 위험조정지표(Sharpe·Sortino)용 무위험수익률(연, 0~0.2). */
+  risk_free_rate?: number;
+  /** 벤치마크 상대성과(alpha·beta·IR) 산출용 지수. 기본 KOSPI200. */
+  benchmark_index?: "KOSPI200" | "KOSPI" | "KOSDAQ";
 }
 
 export type StrategyConfig =
@@ -475,8 +493,22 @@ export interface BacktestResult {
   total_return: number | null;
   mdd: number | null;
   sharpe: number | null;
+  /** 하방편차 기반 위험조정수익(무위험수익률 초과 기준). */
+  sortino?: number | null;
   /** 연평균 복리수익률(리밸런싱 백테스트에서 제공). */
   cagr?: number | null;
+  /** 벤치마크(KOSPI200) 대비 연율 초과수익(Jensen alpha). 리밸런싱 백테스트. */
+  alpha?: number | null;
+  /** 벤치마크 대비 민감도(시장 베타). 리밸런싱 백테스트. */
+  beta?: number | null;
+  /** 정보비율 = 초과수익 평균 / 추적오차. 리밸런싱 백테스트. */
+  information_ratio?: number | null;
+  /** 추적오차(초과수익의 연율 표준편차). 리밸런싱 백테스트. */
+  tracking_error?: number | null;
+  /** 벤치마크(KOSPI200) 구간 누적수익률. 리밸런싱 백테스트. */
+  benchmark_return?: number | null;
+  /** 벤치마크 대비 누적 초과수익률(total_return − benchmark_return). */
+  excess_return?: number | null;
   /** 종목단위 승률(리밸런싱 전략에는 없음 → null). */
   win_rate: number | null;
   num_trades: number;
