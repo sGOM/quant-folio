@@ -258,7 +258,17 @@ def _targets_at(
             for code, v in scored["score"].items()
             if v is not None and not (isinstance(v, float) and math.isnan(v))
         }
-        return compute_target_weights({}, config, scores=scores)
+        # weighting="inverse_vol" 용 변동성 — _score_factor_frame 이 이미 산출한 vol_ann
+        # (app.services.metrics._compute_vol_ann 과 동일 정의)을 재사용해 실거래(vols=None →
+        # price_history 로 재계산)와 동일 정의를 공유하면서 중복 계산을 피한다.
+        vols = None
+        if "vol_ann" in fac.columns:
+            vols = {
+                code: float(v)
+                for code, v in fac["vol_ann"].items()
+                if v is not None and not (isinstance(v, float) and math.isnan(v))
+            }
+        return compute_target_weights({}, config, scores=scores, vols=vols)
 
     price_history = {
         sym: hist[sym].dropna() for sym in universe if sym in hist.columns

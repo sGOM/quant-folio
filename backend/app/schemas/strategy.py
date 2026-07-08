@@ -419,10 +419,15 @@ class RebalanceConfig(BaseModel):
         " universe_rule.source 가 지수명이면 후보풀을 지수 구성종목에서 얻으므로 비워도 된다.",
     )
     selection: RebalanceSelection = Field(default_factory=RebalanceSelection)
-    weighting: Literal["equal", "score"] = Field(
+    weighting: Literal["equal", "score", "inverse_vol"] = Field(
         default="equal",
         description="선정 종목 비중 방식. 'score' 는 selection.method='score' 일 때만 허용"
-        "(순위 기반 선형 가중 — 1위가 가장 큰 비중, 음수 점수에도 안전).",
+        "(순위 기반 선형 가중 — 1위가 가장 큰 비중, 음수 점수에도 안전). 'inverse_vol'은"
+        " selection.method 무관(momentum/score/all/custom 모두)하게 적용 가능하며,"
+        " 선정 종목의 연율 변동성(vol_ann) 역수로 배분해(risk-parity 근사) 상하한 캡"
+        "(0.5%~15%, engine.rebalance.INVERSE_VOL_MIN/MAX_WEIGHT)을 적용한다. 저변동"
+        " 종목이 drift_band 미만 비중이 되면 영원히 미체결될 수 있으니 drift_band 를"
+        " 작게(예: 0.02) 설정할 것.",
     )
     cadence: Literal["daily", "weekly", "monthly", "quarterly"] = "monthly"
     # weekly: 0=월~4=금 / monthly·quarterly: 1~28(영업일 보정은 러너가 수행)
@@ -487,8 +492,10 @@ class RebalanceConfig(BaseModel):
         if self.selection.method == "custom":
             if self.selection.entry is None or self.selection.exit is None:
                 raise ValueError("selection.method='custom' 은 entry·exit 규칙이 모두 필요합니다.")
-            if self.weighting != "equal":
-                raise ValueError("selection.method='custom' 은 weighting='equal' 만 지원합니다.")
+            if self.weighting not in ("equal", "inverse_vol"):
+                raise ValueError(
+                    "selection.method='custom' 은 weighting='equal' 또는 'inverse_vol' 만 지원합니다."
+                )
             # 리밸런싱 백테스트/실거래는 종가 패널만 사용하므로 종가 기반 지표만 허용한다.
             ohlc = {"open", "high", "low", "volume"}
             for grp in (self.selection.entry, self.selection.exit):

@@ -1,19 +1,26 @@
 """리밸런싱 코어 순수함수 검증 — 목표비중·주문생성·발화시점."""
+import math
 from datetime import date, datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from app.services.backtest.portfolio import (
     _dynamic_universe,
     _regime_on_flags,
+    _score_factor_frame,
     _targets_at,
     run_rebalance_backtest,
 )
 from engine import rebalance, rebalance_runner
 from engine.rebalance import (
+    INVERSE_VOL_MAX_WEIGHT,
+    INVERSE_VOL_MIN_WEIGHT,
+    cap_normalize_weights,
     compute_rebalance_orders,
     compute_target_weights,
+    inverse_vol_weights,
     is_rebalance_due,
 )
 from engine.rebalance_runner import RebalanceRunner
@@ -113,6 +120,179 @@ def test_score_weighting_ignored_when_method_not_score():
     history = {s: _series([1, 2, 3]) for s in ["A", "B"]}
     weights = compute_target_weights(history, cfg)
     assert weights == {"A": pytest.approx(0.5), "B": pytest.approx(0.5)}
+
+
+# ───────────────────── weighting="inverse_vol"(인버스-변동성) ─────────────────────
+
+
+def _walk_series(seed: int, n: int, daily_std: float, drift: float = 0.0) -> pd.Series:
+    """일간 로그수익률 표준편차를 daily_std 로 통제한 결정론적 가격 시리즈를 만든다."""
+    rng = np.random.default_rng(seed)
+    log_rets = rng.normal(drift, daily_std, n)
+    prices = 100.0 * np.exp(np.cumsum(log_rets))
+    idx = pd.date_range("2023-01-02", periods=n, freq="B")
+    return pd.Series(prices, index=idx, dtype="float64")
+
+
+def test_cap_normalize_sums_to_one_and_respects_bounds():
+    # LOW 는 압도적으로 큰 raw 비중(캡 상한에 걸림), 나머지는 raw 비중이 거의 0(하한에 걸림).
+    raw = {"LOW": 1000.0, **{f"S{i}": 0.001 for i in range(9)}}
+    weights = cap_normalize_weights(raw, lo=0.005, hi=0.15)
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert weights["LOW"] == pytest.approx(INVERSE_VOL_MAX_WEIGHT)
+    for i in range(9):
+        assert weights[f"S{i}"] >= INVERSE_VOL_MIN_WEIGHT - 1e-9
+
+
+def test_cap_normalize_infeasible_caps_falls_back_to_equal():
+    # n=2, hi=0.15 이면 hi*n=0.3<1 → 캡을 지키며 합=1 을 만들 수 없어 균등비중 폴백.
+    weights = cap_normalize_weights({"A": 10.0, "B": 1.0}, lo=0.005, hi=0.15)
+    assert weights == {"A": pytest.approx(0.5), "B": pytest.approx(0.5)}
+
+
+def test_inverse_vol_weights_favors_low_volatility():
+    # LOW 는 변동성이 작아 1/vol 이 커야 하므로 다른 종목보다 더 큰 비중을 받는다.
+    vols = {"LOW": 0.10, "HIGH": 0.60, **{f"S{i}": 0.30 for i in range(8)}}
+    weights = inverse_vol_weights(vols, list(vols))
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert weights["LOW"] > weights["HIGH"]
+    assert weights["LOW"] > weights["S0"] > weights["HIGH"]
+    for w in weights.values():
+        assert INVERSE_VOL_MIN_WEIGHT - 1e-9 <= w <= INVERSE_VOL_MAX_WEIGHT + 1e-9
+
+
+def test_inverse_vol_weights_excludes_nan_zero_negative_vol():
+    # 유효 종목을 7개(A,E,F,G,H,I,J) 확보해 캡이 실현 가능하도록 한다(n<7 이면 hi*n<1
+    # 이 되어 균등비중 폴백으로 가려지므로, '낮은 변동성이 더 큰 비중'을 제대로 검증하려면
+    # 충분한 표본이 필요하다).
+    vols = {
+        "A": 0.2, "B": float("nan"), "C": 0.0, "D": -0.1, "E": 0.4,
+        "F": 0.25, "G": 0.3, "H": 0.35, "I": 0.45, "J": 0.5,
+    }
+    selected = list(vols)
+    weights = inverse_vol_weights(vols, selected)
+    # 무효 종목(B/C/D)은 비중 0(제외), 유효 종목만 배분하되 합은 여전히 1.0.
+    assert weights["B"] == 0.0
+    assert weights["C"] == 0.0
+    assert weights["D"] == 0.0
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert weights["A"] > weights["J"] > 0  # A(vol=0.2) < J(vol=0.5) → A 가 더 큰 비중
+
+
+def test_inverse_vol_weights_falls_back_to_equal_when_no_valid_vol():
+    weights = inverse_vol_weights({"A": None, "B": float("nan"), "C": 0.0}, ["A", "B", "C"])
+    assert weights == {"A": pytest.approx(1 / 3), "B": pytest.approx(1 / 3), "C": pytest.approx(1 / 3)}
+
+
+def test_inverse_vol_weights_empty_selection_returns_empty():
+    assert inverse_vol_weights({}, []) == {}
+
+
+def test_compute_target_weights_inverse_vol_from_price_history():
+    # 8종목(캡 실현 가능한 최소 규모) 중 LOW 가 가장 낮은 변동성 → 가장 큰 비중.
+    universe = ["LOW"] + [f"S{i}" for i in range(7)]
+    history = {"LOW": _walk_series(seed=0, n=300, daily_std=0.003)}
+    for i in range(7):
+        history[f"S{i}"] = _walk_series(seed=i + 1, n=300, daily_std=0.02)
+    cfg = {
+        "universe": universe,
+        "selection": {"method": "all"},
+        "weighting": "inverse_vol",
+    }
+    weights = compute_target_weights(history, cfg)
+    assert set(weights) == set(universe)
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert weights["LOW"] == max(weights.values())
+    for w in weights.values():
+        assert INVERSE_VOL_MIN_WEIGHT - 1e-9 <= w <= INVERSE_VOL_MAX_WEIGHT + 1e-9
+
+
+def test_compute_target_weights_inverse_vol_defends_nan_and_short_history():
+    # SHORT 는 vol_ann 계산에 필요한 최소 이력(20봉)에 못 미침 → NaN → 제외(비중 0).
+    universe = ["A", "SHORT"] + [f"S{i}" for i in range(6)]
+    history = {"A": _walk_series(seed=0, n=300, daily_std=0.01), "SHORT": _series([100, 101])}
+    for i in range(6):
+        history[f"S{i}"] = _walk_series(seed=i + 10, n=300, daily_std=0.01)
+    cfg = {
+        "universe": universe,
+        "selection": {"method": "all"},
+        "weighting": "inverse_vol",
+    }
+    weights = compute_target_weights(history, cfg)
+    assert weights["SHORT"] == 0.0
+    assert sum(weights.values()) == pytest.approx(1.0)
+
+
+def test_backtest_and_live_paths_agree_on_inverse_vol_weights():
+    """백테스트(method="score", _score_factor_frame.vol_ann 재사용)와 실거래
+    (method="all", price_history 직접 산출)가 동일 가격 이력에 동일 비중을 산출해야
+    한다(엔진 핵심 원칙 — 백테스트/실거래 정합성)."""
+    codes = ["A", "B", "C", "D", "E", "F", "G", "H"]
+    panel = pd.DataFrame({
+        c: _walk_series(seed=i, n=300, daily_std=0.005 + 0.003 * i)
+        for i, c in enumerate(codes)
+    })
+    d = panel.index[-1]
+
+    # 실거래 경로: method="all" 선정 + price_history 로부터 직접 변동성 산출(vols 미주입).
+    live_history = {c: panel[c].dropna() for c in codes}
+    live_cfg = {"universe": codes, "selection": {"method": "all"}, "weighting": "inverse_vol"}
+    live_weights = compute_target_weights(live_history, live_cfg)
+
+    # 백테스트 경로: method="score"(전 종목 동일점수로 top_n=전체 선정) +
+    # _score_factor_frame 이 산출한 vol_ann 을 재사용해 주입.
+    fac = _score_factor_frame(panel.loc[:d], codes)
+    bt_vols = {code: float(v) for code, v in fac["vol_ann"].items() if not math.isnan(v)}
+    bt_cfg = {
+        "universe": codes,
+        "selection": {"method": "score", "top_n": len(codes)},
+        "weighting": "inverse_vol",
+    }
+    bt_scores = {c: 1.0 for c in codes}
+    bt_weights = compute_target_weights({}, bt_cfg, scores=bt_scores, vols=bt_vols)
+
+    assert set(live_weights) == set(bt_weights) == set(codes)
+    for c in codes:
+        assert live_weights[c] == pytest.approx(bt_weights[c], abs=1e-9)
+    assert sum(live_weights.values()) == pytest.approx(1.0)
+    assert sum(bt_weights.values()) == pytest.approx(1.0)
+
+
+# ───────────────────── 스키마: weighting="inverse_vol" 허용 범위 ─────────────────────
+
+
+def test_schema_allows_inverse_vol_for_any_selection_method():
+    from app.schemas.strategy import RebalanceConfig
+
+    for method in ("momentum", "score", "all"):
+        v = RebalanceConfig.model_validate({
+            "type": "rebalance",
+            "universe": ["005930", "000660", "035420"],
+            "selection": {"method": method, "top_n": 2},
+            "weighting": "inverse_vol",
+        })
+        assert v.weighting == "inverse_vol"
+
+
+def test_schema_allows_inverse_vol_for_custom_but_not_score():
+    from app.schemas.strategy import RebalanceConfig
+
+    rules = _sma_cross_rules()
+    v = RebalanceConfig.model_validate({
+        "type": "rebalance",
+        "universe": ["005930", "000660"],
+        "selection": {"method": "custom", **rules},
+        "weighting": "inverse_vol",
+    })
+    assert v.weighting == "inverse_vol"
+
+    with pytest.raises(ValueError):
+        RebalanceConfig.model_validate({
+            "type": "rebalance",
+            "universe": ["005930", "000660"],
+            "selection": {"method": "custom", **rules},
+            "weighting": "score",
+        })
 
 
 # ───────────────────── 동적 유니버스(_dynamic_universe) ─────────────────────
