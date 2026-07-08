@@ -430,6 +430,14 @@ class RebalanceRunner:
                 self.strategy_id, source,
             )
             return fixed
+
+        # 유동성 필터: 시가총액(억 원) 하한 미만 종목 제외(PIT — as_of 시점 시총 기준).
+        min_cap = rule.get("min_market_cap")
+        if min_cap:
+            caps = await asyncio.to_thread(krx_index.market_caps, as_of)
+            if caps:  # 조회 성공 시에만 필터(실패 시 원본 유지)
+                min_cap_won = int(min_cap) * 10**8
+                members = [c for c in members if caps.get(c, 0) >= min_cap_won]
         return members
 
     async def _seed_history(

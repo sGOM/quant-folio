@@ -35,9 +35,11 @@ class _FakeSession:
 def _clear_cache(monkeypatch):
     krx_index._MEMBERS_CACHE.clear()
     krx_index._STOCKS_CACHE = None
+    krx_index._MKTCAP_CACHE.clear()
     yield
     krx_index._MEMBERS_CACHE.clear()
     krx_index._STOCKS_CACHE = None
+    krx_index._MKTCAP_CACHE.clear()
 
 
 def _rows(*codes):
@@ -172,3 +174,94 @@ def test_build_pit_pool_index_source_union_and_provider(monkeypatch):
     assert set(union) == {"005930", "000660", "035420"}   # 편출·편입 모두 포함
     assert provider(pd.Timestamp("2023-01-15")) == ["005930", "000660"]
     assert provider(pd.Timestamp("2023-02-15")) == ["005930", "035420"]
+
+
+# ───────────────────── 시가총액(market_caps) · 유동성 필터 ─────────────────────
+
+
+class _FakeCapSession:
+    """MDCSTAT01501(시가총액) 응답(OutBlock_1)을 mkt별로 돌려주는 목 세션."""
+
+    def __init__(self, by_market):
+        self.by_market = by_market  # {"STK": [(code, mktcap_won), ...], "KSQ": [...]}
+
+    def post(self, url, data=None, timeout=None):
+        mkt = data["mktId"]
+        rows = [
+            {"ISU_SRT_CD": c, "MKTCAP": f"{v:,}"}
+            for c, v in self.by_market.get(mkt, [])
+        ]
+        return _FakeResp({"OutBlock_1": rows})
+
+
+def test_market_caps_parses_and_merges_markets(monkeypatch):
+    fake = _FakeCapSession({
+        "STK": [("005930", 350_000_000_000_000), ("000660", 200_000_000_000_000)],
+        "KSQ": [("247540", 20_000_000_000_000)],
+    })
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+    caps = krx_index.market_caps(date(2025, 6, 30))
+    assert caps["005930"] == 350_000_000_000_000
+    assert caps["247540"] == 20_000_000_000_000  # 콤마 파싱 + KOSPI/KOSDAQ 병합
+
+
+def test_market_caps_unauthenticated_empty(monkeypatch):
+    monkeypatch.setattr(krx_index, "_session", lambda: None)
+    assert krx_index.market_caps(date(2025, 6, 30)) == {}
+
+
+def test_build_pit_pool_applies_min_market_cap(monkeypatch):
+    from app.api.routes import backtests as bt
+    import app.services.data.krx_index as ki
+
+    monkeypatch.setattr(ki, "index_members", lambda as_of, index="KOSPI200": ["005930", "000660", "007340"])
+    # 007340 만 5000억 미만 → 필터로 제외되어야 한다.
+    caps = {"005930": 350_000_000_000_000, "000660": 200_000_000_000_000, "007340": 100_000_000_000}
+    monkeypatch.setattr(ki, "market_caps", lambda as_of: caps)
+
+    cfg = {"universe": [], "selection": {"universe_rule": {"source": "KOSPI200", "min_market_cap": 5000}}}
+    union, provider = bt._build_pit_pool(cfg, date(2023, 1, 1), date(2023, 1, 31))
+    assert set(union) == {"005930", "000660"}  # 007340(1000억) 제외
+
+
+def test_build_pit_pool_min_cap_keeps_all_when_cap_lookup_fails(monkeypatch):
+    """시총 조회 실패 시 필터를 적용하지 않고 원본 멤버십을 유지(과도한 축소 방지)."""
+    from app.api.routes import backtests as bt
+    import app.services.data.krx_index as ki
+
+    monkeypatch.setattr(ki, "index_members", lambda as_of, index="KOSPI200": ["005930", "000660"])
+    monkeypatch.setattr(ki, "market_caps", lambda as_of: {})  # 조회 실패
+
+    cfg = {"universe": [], "selection": {"universe_rule": {"source": "KOSPI200", "min_market_cap": 5000}}}
+    union, _ = bt._build_pit_pool(cfg, date(2023, 1, 1), date(2023, 1, 31))
+    assert set(union) == {"005930", "000660"}
+
+
+# ───────────────────── 팩터 커버리지 경고(_factor_coverage_warnings) ─────────────────────
+
+
+def test_factor_warnings_when_opendart_coverage_low(monkeypatch):
+    from app.api.routes import backtests as bt
+    import app.services.data.opendart as od
+
+    # quality 가중치>0, 표본 5종목 중 커버리지 0 → 경고.
+    monkeypatch.setattr(od, "metrics_by_symbol", lambda codes, as_of: {})
+    cfg = {"selection": {"factor_weights": {"quality": 0.3, "value": 0.7}}}
+    warns = bt._factor_coverage_warnings(cfg, ["005930", "000660", "035420", "005380", "000270"], date(2025, 6, 30))
+    assert warns and "quality" in warns[0]
+
+
+def test_no_factor_warnings_when_coverage_ok(monkeypatch):
+    from app.api.routes import backtests as bt
+    import app.services.data.opendart as od
+
+    monkeypatch.setattr(od, "metrics_by_symbol", lambda codes, as_of: {c: {"roe": 0.1} for c in codes})
+    cfg = {"selection": {"factor_weights": {"quality": 0.3, "value": 0.7}}}
+    assert bt._factor_coverage_warnings(cfg, ["005930", "000660"], date(2025, 6, 30)) == []
+
+
+def test_no_factor_warnings_when_no_quality_growth_weight(monkeypatch):
+    from app.api.routes import backtests as bt
+    # quality/growth 가중치 0 → OpenDART 조회 자체를 안 함(경고 없음).
+    cfg = {"selection": {"factor_weights": {"value": 0.5, "momentum": 0.5}}}
+    assert bt._factor_coverage_warnings(cfg, ["005930"], date(2025, 6, 30)) == []

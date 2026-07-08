@@ -320,6 +320,8 @@ export interface UniverseRule {
   lookback?: number;
   /** 상대강도 상위 몇 종목을 후보로 남길지. */
   pick?: number;
+  /** 유동성 필터: 시가총액(억 원) 하한. 미만 종목을 후보풀에서 제외. 미설정이면 필터 없음. */
+  min_market_cap?: number | null;
 }
 
 /** 현금화 오버레이(레짐 필터): 기준지수가 이동평균 아래면 전량 청산·매수 중단. */

@@ -794,6 +794,17 @@ function RebalanceFields({
               />
             </div>
           )}
+          <NumField
+            label="최소 시가총액(억 원, 0=제한 없음)"
+            min={0}
+            step={1000}
+            value={uniRule.min_market_cap ?? 0}
+            onChange={(v) => patchUniverseRule({ min_market_cap: v > 0 ? v : null })}
+          />
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            소형주 슬리피지 과대평가를 막는 유동성 필터. 각 리밸런싱 시점 시총 기준으로
+            이 값 미만 종목을 후보풀에서 제외합니다(예: 5000 = 5000억 원).
+          </p>
         </div>
       )}
 

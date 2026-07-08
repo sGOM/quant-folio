@@ -295,6 +295,61 @@ def test_schema_allows_inverse_vol_for_custom_but_not_score():
         })
 
 
+# ───────────────────── 스키마: drift_band 미체결 가드 ─────────────────────
+
+
+def test_schema_rejects_oversized_drift_band_equal():
+    """equal 비중 20종목(각 5%)에 drift_band 0.10 이면 아무 것도 체결 안 됨 → 거부."""
+    from app.schemas.strategy import RebalanceConfig
+
+    with pytest.raises(ValueError):
+        RebalanceConfig.model_validate({
+            "type": "rebalance",
+            "selection": {"method": "score", "top_n": 20,
+                          "universe_rule": {"source": "KOSPI200", "pick": 40}},
+            "weighting": "equal",
+            "drift_band_pct": 0.10,  # >= 1/20 = 0.05
+        })
+
+
+def test_schema_accepts_small_drift_band_equal():
+    """equal 20종목 + drift_band 0.02(<0.05)는 허용(id=24 형)."""
+    from app.schemas.strategy import RebalanceConfig
+
+    v = RebalanceConfig.model_validate({
+        "type": "rebalance",
+        "selection": {"method": "score", "top_n": 20,
+                      "universe_rule": {"source": "KOSPI200", "pick": 40}},
+        "weighting": "equal",
+        "drift_band_pct": 0.02,
+    })
+    assert v.drift_band_pct == 0.02
+
+
+def test_schema_score_rank_allows_moderate_drift_band():
+    """순위가중은 상위 집중 의도 — top_n 20 에서 floor=2/21≈0.095, id=23 의 0.05 허용."""
+    from app.schemas.strategy import RebalanceConfig
+
+    v = RebalanceConfig.model_validate({
+        "type": "rebalance",
+        "selection": {"method": "score", "top_n": 20,
+                      "universe_rule": {"source": "KOSPI200", "pick": 40}},
+        "weighting": "score",
+        "drift_band_pct": 0.05,
+    })
+    assert v.drift_band_pct == 0.05
+
+    # 그러나 0.10 (>2/21) 이면 최상위 종목도 못 사므로 거부.
+    with pytest.raises(ValueError):
+        RebalanceConfig.model_validate({
+            "type": "rebalance",
+            "selection": {"method": "score", "top_n": 20,
+                          "universe_rule": {"source": "KOSPI200", "pick": 40}},
+            "weighting": "score",
+            "drift_band_pct": 0.10,
+        })
+
+
 # ───────────────────── 동적 유니버스(_dynamic_universe) ─────────────────────
 
 
