@@ -23,6 +23,25 @@ class _BaseConfig(BaseModel):
     stop_loss_pct: float | None = Field(default=None, gt=0, le=1)
     take_profit_pct: float | None = Field(default=None, gt=0, le=1)
     trailing_stop_pct: float | None = Field(default=None, gt=0, le=1)
+    # 체결 현실성 모델(P0-1). 신호는 종가(t) 확정 후 산출하되:
+    #   next_close(기본): 익일 종가(t+1)에 체결 — 당일 종가 미래참조(look-ahead) 제거.
+    #   same_close: 당일 종가(t) 즉시 체결(구 동작, 민감도 분석용 opt-in).
+    fill_mode: Literal["next_close", "same_close"] = Field(
+        default="next_close", description="체결 시점: 익일 종가(기본) 또는 당일 종가"
+    )
+    # 슬리피지(체결 미끄러짐, bps=0.01%). 매수는 +slip, 매도는 -slip 로 체결가에 가산한다.
+    slippage_bps: float = Field(
+        default=5.0, ge=0, le=200, description="편도 슬리피지(bps). 5=0.05%"
+    )
+    # 변동성 비례 스케일(0=고정 bps). >0 이면 최근 변동성/중앙값 비로 종목별 슬리피지를
+    # 조정한다: slip = base×(1 + scale×(vol/median − 1)), 하한 0.
+    slippage_vol_scale: float = Field(
+        default=0.0, ge=0, le=5, description="변동성 비례 슬리피지 스케일(0=고정)"
+    )
+    # 위험조정지표(Sharpe·Sortino)의 무위험수익률(연). 0=구 동작(rf 미반영).
+    risk_free_rate: float = Field(
+        default=0.0, ge=0, le=0.2, description="위험조정지표용 무위험수익률(연)"
+    )
 
 
 class _MaCrossMixin(_BaseConfig):
@@ -453,6 +472,25 @@ class RebalanceConfig(BaseModel):
     capital: float = Field(default=10_000_000, gt=0, description="이 전략이 운용할 배정 자본")
     fees: float = Field(default=0.00015, ge=0, le=0.01, description="위탁수수료율")
     tax: float = Field(default=0.0020, ge=0, le=0.01, description="증권거래세율(매도 시)")
+    # 체결 현실성 모델(P0-1) — _BaseConfig 와 동일 규약.
+    #   next_close(기본): 리밸런싱일 t 의 선정은 t 종가까지의 데이터로 하되 체결은 t+1 종가.
+    #   same_close: 당일 종가 즉시 체결(구 동작, opt-in).
+    fill_mode: Literal["next_close", "same_close"] = Field(
+        default="next_close", description="체결 시점: 익일 종가(기본) 또는 당일 종가"
+    )
+    slippage_bps: float = Field(
+        default=5.0, ge=0, le=200, description="편도 슬리피지(bps). 매수 +slip·매도 −slip"
+    )
+    slippage_vol_scale: float = Field(
+        default=0.0, ge=0, le=5, description="변동성 비례 슬리피지 스케일(0=고정 bps)"
+    )
+    # 벤치마크 상대성과(alpha·beta·IR)용 지수. 위험조정지표 무위험수익률(연).
+    benchmark_index: Literal["KOSPI200", "KOSPI", "KOSDAQ"] = Field(
+        default="KOSPI200", description="벤치마크 상대성과 산출용 지수"
+    )
+    risk_free_rate: float = Field(
+        default=0.0, ge=0, le=0.2, description="위험조정지표용 무위험수익률(연)"
+    )
 
     @field_validator("universe")
     @classmethod

@@ -58,12 +58,16 @@ export function StrategyForm({
   const [name, setName] = useState(initialName);
   const [description, setDescription] = useState(initialDescription);
   const [config, setConfig] = useState<StrategyConfig>(
-    // 편집 시 거래비용 필드(fees/tax)가 없는 레거시 설정은 기본값으로 채운다(없는 키만 보강).
+    // 편집 시 거래비용·체결 필드가 없는 레거시 설정은 기본값으로 채운다(없는 키만 보강).
     initialConfig
       ? ({
           ...initialConfig,
           fees: initialConfig.fees ?? 0.00015,
           tax: initialConfig.tax ?? 0.002,
+          fill_mode: initialConfig.fill_mode ?? "next_close",
+          slippage_bps: initialConfig.slippage_bps ?? 5,
+          slippage_vol_scale: initialConfig.slippage_vol_scale ?? 0,
+          risk_free_rate: initialConfig.risk_free_rate ?? 0,
         } as StrategyConfig)
       : defaultConfig("sma_crossover"),
   );
@@ -76,8 +80,10 @@ export function StrategyForm({
       setConfig(defaultConfig(type));
       return;
     }
-    const { symbol, cash, fees, tax, stop_loss_pct, take_profit_pct, trailing_stop_pct } =
-      config;
+    const {
+      symbol, cash, fees, tax, stop_loss_pct, take_profit_pct, trailing_stop_pct,
+      fill_mode, slippage_bps, slippage_vol_scale, risk_free_rate,
+    } = config;
     setConfig(
       defaultConfig(type, {
         symbol,
@@ -87,6 +93,10 @@ export function StrategyForm({
         stop_loss_pct,
         take_profit_pct,
         trailing_stop_pct,
+        fill_mode: fill_mode ?? "next_close",
+        slippage_bps: slippage_bps ?? 5,
+        slippage_vol_scale: slippage_vol_scale ?? 0,
+        risk_free_rate: risk_free_rate ?? 0,
       }),
     );
   }
@@ -476,6 +486,80 @@ export function StrategyForm({
           코스피·코스닥 모두 <b className="text-muted-foreground">0.20%</b>입니다(1회 왕복 약
           0.23%). 회전율이 높은 전략일수록 비용 영향이 커지므로 실제 값을 반영해야 백테스트가
           과대평가되지 않습니다.
+        </p>
+      </fieldset>
+
+      <fieldset className="rounded-md border border-border p-3">
+        <legend className="px-1 text-xs text-muted-foreground">체결·현실성</legend>
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <Field label="체결 시점">
+            <select
+              value={(config as { fill_mode?: string }).fill_mode ?? "next_close"}
+              onChange={(e) =>
+                patch({ fill_mode: e.target.value } as Partial<StrategyConfig>)
+              }
+              className={INPUT}
+            >
+              <option value="next_close">익일 종가(권장)</option>
+              <option value="same_close">당일 종가</option>
+            </select>
+          </Field>
+          <NumField
+            label="슬리피지 (bps · 편도)"
+            value={num("slippage_bps")}
+            onChange={(v) => patch({ slippage_bps: v } as Partial<StrategyConfig>)}
+            min={0}
+            max={200}
+            step={0.5}
+          />
+          <NumField
+            label="변동성 스케일 (0=고정)"
+            value={num("slippage_vol_scale")}
+            onChange={(v) =>
+              patch({ slippage_vol_scale: v } as Partial<StrategyConfig>)
+            }
+            min={0}
+            max={5}
+            step={0.1}
+          />
+          <NumField
+            label="무위험수익률 % (연)"
+            value={Number(((num("risk_free_rate") || 0) * 100).toFixed(4))}
+            onChange={(v) =>
+              patch({
+                risk_free_rate: Number.isFinite(v) ? v / 100 : 0,
+              } as Partial<StrategyConfig>)
+            }
+            min={0}
+            max={20}
+            step={0.1}
+          />
+          {config.type === "rebalance" && (
+            <Field label="벤치마크 지수">
+              <select
+                value={(config as RebalanceConfig).benchmark_index ?? "KOSPI200"}
+                onChange={(e) =>
+                  patch({
+                    benchmark_index: e.target.value,
+                  } as Partial<StrategyConfig>)
+                }
+                className={INPUT}
+              >
+                <option value="KOSPI200">KOSPI200</option>
+                <option value="KOSPI">KOSPI</option>
+                <option value="KOSDAQ">KOSDAQ</option>
+              </select>
+            </Field>
+          )}
+        </div>
+        <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+          <b className="text-muted-foreground">익일 종가 체결</b>은 신호 다음 거래일 종가로
+          체결해 당일 미래참조(look-ahead)를 제거합니다(권장). <b className="text-muted-foreground">
+          슬리피지</b>는 편도 체결 미끄러짐(5bp=0.05%)이며, 변동성 스케일&gt;0이면 종목 변동성에
+          비례해 조정합니다. <b className="text-muted-foreground">무위험수익률</b>은 샤프·소르티노의
+          기준 수익률(연율)입니다.
+          {config.type === "rebalance" &&
+            " 벤치마크는 알파·베타·정보비율(IR) 산출 기준 지수입니다."}
         </p>
       </fieldset>
 

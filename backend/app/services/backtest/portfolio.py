@@ -8,10 +8,15 @@
 - **실거래와 동일 로직 재사용**: 종목 선정·목표비중은 실거래 러너가 쓰는
   engine.rebalance.compute_target_weights 를, 종합점수는 metrics._compute_stock_scores 를
   그대로 재사용해 백테스트/실거래 정합성을 보장한다.
-- **미래참조(look-ahead) 방지**: 리밸런싱일 t 의 선정은 t 종가까지의 데이터만 사용하고
-  체결도 t 종가로 한다(signals.py 전반의 '당일 종가 확정 후 산출·당일 종가 체결' 규약과 동일).
-- **거래비용**: 매수 레그는 위탁수수료(fees), 매도 레그는 위탁수수료+증권거래세(fees+tax)를
-  거래대금에 비례해 차감한다. 드리프트 밴드 내 종목은 매매하지 않아 회전율·비용을 줄인다.
+- **미래참조(look-ahead) 방지·체결 현실성(P0-1)**: 리밸런싱일 t 의 선정은 t 종가까지의
+  데이터만 사용한다. 체결 시점은 fill_mode 로 정한다 —
+    · next_close(기본): 익일 종가(t+1)에 체결해 당일 종가 미래참조를 제거한다(신호↔체결 분리).
+    · same_close: 당일 종가(t) 즉시 체결(구 동작, 민감도 분석용 opt-in).
+  레짐 청산·재진입 결정도 동일 규약으로 지연 체결된다.
+- **거래비용·슬리피지**: 매수 레그는 위탁수수료(fees)+슬리피지, 매도 레그는 위탁수수료+
+  증권거래세(fees+tax)+슬리피지를 거래대금에 비례해 차감한다. 슬리피지(slippage_bps)는
+  편도 기준이며, slippage_vol_scale>0 이면 종목별 최근 변동성/중앙값 비로 조정한다. 드리프트
+  밴드 내 종목은 매매하지 않아 회전율·비용을 줄인다.
 - **현금화 오버레이(레짐 필터)**: regime_filter 가 켜져 있으면 기준지수가 이동평균 아래로
   내려간 국면(risk-off)에서는 즉시 보유를 청산해 현금화하고 신규 매수를 중단한다. 지수가
   이동평균 위로 회복(risk-off→risk-on 전환)하면 현금 상태에서 그날 즉시 신규 선정·매수로
@@ -26,7 +31,8 @@
   괴리가 있을 수 있다.
 - 목표비중은 '현재 포트폴리오 평가액'(복리) 기준으로 산정한다(실거래는 배정 capital 고정).
   백테스트는 복리 성장을 반영하는 것이 성과추정에 더 적절하다.
-- 슬리피지·부분체결·상하한가·호가단위는 반영하지 않는다(보수적으로 비용을 별도 가산해 해석할 것).
+- 슬리피지는 slippage_bps(변동성 스케일 옵션)로 반영한다. 부분체결·상하한가·호가단위는
+  아직 반영하지 않는다(보수적으로 비용을 별도 가산해 해석할 것).
 - 생존편향: 가격 패널이 '현재 상장 종목' 기준이면 과거 성과가 상방 편향될 수 있다.
 - 레짐 필터는 일별로 판정한다. 청산은 risk-off 즉시, 재진입은 risk-on 회복 즉시 이뤄진다
   (실거래 러너와 동일 규약). 왕복 매매비용(fees+tax)은 _apply_rebalance 에서 그대로 차감된다.
@@ -322,6 +328,8 @@ def _apply_rebalance(
     *,
     liquidate: bool = False,
     reason: str = "rebalance",
+    slip_base: float = 0.0,
+    slip_map: dict[str, float] | None = None,
 ) -> tuple[float, float]:
     """목표비중으로 리밸런싱하며 비용을 차감하고 거래 로그를 남긴다(매도 먼저 → 매수).
 
@@ -330,10 +338,17 @@ def _apply_rebalance(
     :param equity: 리밸런싱 직전 총자산(cash+보유평가액).
     :param liquidate: True 면 드리프트 밴드를 무시하고 보유 전량을 청산한다(레짐 현금화).
     :param reason: 거래 로그의 사유 태그.
+    :param slip_base: 편도 슬리피지(분수). 매수는 +slip, 매도는 −slip 로 체결가에 가산.
+    :param slip_map: 종목별 슬리피지(분수) 오버라이드. 없으면 slip_base 를 쓴다(변동성 스케일용).
     :return: (리밸런싱 후 cash, 회전율 turnover=Σ|Δw|).
     """
     if equity <= 0:
         return 0.0, 0.0
+
+    def _slip(sym: str) -> float:
+        if slip_map and sym in slip_map:
+            return slip_map[sym]
+        return slip_base
 
     port_return = equity - 1.0  # 시작 자산 1.0 앵커 기준 누적수익률
 
@@ -367,7 +382,7 @@ def _apply_rebalance(
         amt = min(amt, cur_val)
         if amt <= 1e-12:
             continue
-        proceeds = amt * (1.0 - fees - tax)
+        proceeds = amt * (1.0 - fees - tax - _slip(sym))
         cash += proceeds
         frac = amt / cur_val if cur_val > 0 else 0.0
         cost_portion = cost.get(sym, 0.0) * frac
@@ -382,7 +397,7 @@ def _apply_rebalance(
         )
 
     # 매수: 현금 부족 시 비례 축소(음수 현금 방지)
-    total_buy_cost = sum(amt * (1.0 + fees) for _, amt in buys)
+    total_buy_cost = sum(amt * (1.0 + fees + _slip(sym)) for sym, amt in buys)
     scale = 1.0
     if total_buy_cost > cash and total_buy_cost > 0:
         scale = cash / total_buy_cost
@@ -390,7 +405,7 @@ def _apply_rebalance(
         amt *= scale
         if amt <= 1e-12:
             continue
-        buy_cost = amt * (1.0 + fees)
+        buy_cost = amt * (1.0 + fees + _slip(sym))
         cash -= buy_cost
         val[sym] = val.get(sym, 0.0) + amt
         cost[sym] = cost.get(sym, 0.0) + amt  # 원가는 수수료 제외 매수액으로 적립
@@ -399,6 +414,37 @@ def _apply_rebalance(
         )
 
     return cash, turnover
+
+
+def _vol_slippage_map(
+    hist: pd.DataFrame, symbols: list[str], base_frac: float, vol_scale: float
+) -> dict[str, float]:
+    """종목별 슬리피지(분수) 맵. 최근 20봉 수익률 표준편차/중앙값 비로 base 를 조정한다.
+
+    slip = max(0, base × (1 + vol_scale × (vol/median − 1))). base 나 vol_scale 이 0 이면
+    빈 맵을 돌려 호출부가 일괄 base_frac(고정 bps)을 쓰게 한다. 미래참조 방지를 위해
+    hist(=panel.loc[:체결일]) 만 사용한다.
+    """
+    if base_frac <= 0 or vol_scale <= 0:
+        return {}
+    vols: dict[str, float] = {}
+    for s in symbols:
+        if s not in hist.columns:
+            continue
+        r = hist[s].dropna().pct_change().tail(20)
+        if len(r) >= 10:
+            sd = float(r.std())
+            if sd == sd and sd > 0:  # NaN 이 아니고 양수
+                vols[s] = sd
+    if not vols:
+        return {}
+    med = float(np.median(list(vols.values())))
+    if not (med > 0):
+        return {}
+    return {
+        s: max(0.0, base_frac * (1.0 + vol_scale * (v / med - 1.0)))
+        for s, v in vols.items()
+    }
 
 
 def _safe(x) -> float | None:
@@ -410,6 +456,56 @@ def _safe(x) -> float | None:
     return None if (math.isnan(f) or math.isinf(f)) else f
 
 
+def _risk_adjusted_metrics(
+    rets: np.ndarray, bench_rets: np.ndarray | None, rf_annual: float
+) -> dict[str, float | None]:
+    """일간 수익률로 위험조정·벤치마크 상대 지표를 산출한다(연율화 √252).
+
+    - Sharpe/Sortino: 무위험수익률(rf_annual, 연) 초과분 기준. Sortino 는 하방편차만 쓴다.
+    - beta/alpha: 포트 일간수익을 벤치마크 일간수익에 회귀(OLS 기울기=beta, Jensen alpha 연율).
+    - information_ratio/tracking_error: 초과수익(포트−벤치) 기준.
+    - benchmark_return/excess_return: 구간 누적 벤치마크 수익률·초과.
+
+    NaN 인 벤치마크 일자는 짝지어 제거한다. 벤치마크가 없으면 관련 키는 None.
+    """
+    out: dict[str, float | None] = {
+        "sharpe": None, "sortino": None, "beta": None, "alpha": None,
+        "information_ratio": None, "tracking_error": None,
+        "benchmark_return": None, "excess_return": None,
+    }
+    rf_daily = (1.0 + rf_annual) ** (1.0 / 252.0) - 1.0
+    ann = math.sqrt(252.0)
+
+    if len(rets) > 1:
+        std = rets.std(ddof=1)
+        if std > 0:
+            out["sharpe"] = _safe((rets.mean() - rf_daily) / std * ann)
+        downside = np.minimum(rets - rf_daily, 0.0)
+        dstd = math.sqrt(float((downside ** 2).mean()))  # 하방편차(목표수익 rf 기준)
+        if dstd > 0:
+            out["sortino"] = _safe((rets.mean() - rf_daily) / dstd * ann)
+
+    if bench_rets is None:
+        return out
+
+    mask = ~np.isnan(bench_rets)
+    p = rets[mask]
+    b = bench_rets[mask]
+    if len(b) > 1:
+        out["benchmark_return"] = _safe(float(np.prod(1.0 + b) - 1.0))
+        bvar = b.var(ddof=1)
+        if bvar > 0:
+            beta = float(np.cov(p, b, ddof=1)[0, 1] / bvar)
+            out["beta"] = _safe(beta)
+            out["alpha"] = _safe(((p.mean() - rf_daily) - beta * (b.mean() - rf_daily)) * 252.0)
+        active = p - b
+        astd = active.std(ddof=1)
+        if astd > 0:
+            out["tracking_error"] = _safe(astd * ann)
+            out["information_ratio"] = _safe(active.mean() / astd * ann)
+    return out
+
+
 def run_rebalance_backtest(
     close_panel: pd.DataFrame,
     config: dict,
@@ -418,6 +514,7 @@ def run_rebalance_backtest(
     fundamentals_provider=None,
     regime_series: pd.Series | None = None,
     pool_provider=None,
+    benchmark_series: pd.Series | None = None,
 ) -> dict:
     """리밸런싱 전략을 일별 시뮬레이션한다.
 
@@ -433,8 +530,13 @@ def run_rebalance_backtest(
         공급한다. 시점별 지수 구성종목(KOSPI200 멤버십 등)을 넣으면 생존편향이 제거된다.
         None 이면 config.universe(고정 후보풀)를 쓴다. universe_rule 과 함께 쓰면
         (그 시점 멤버십 → 상대강도 상위 pick → 최종 top_n) 순으로 적용된다.
-    :return: {total_return, mdd, sharpe, cagr, win_rate, num_trades, num_rebalances,
-        avg_turnover, equity_curve, markers, holdings, trades} — Backtest.result 로 저장 가능한 JSON.
+    :param benchmark_series: 벤치마크(예: KOSPI200) 종가 Series(워밍업 포함). 주면 벤치마크
+        상대 지표(alpha·beta·IR·tracking_error·benchmark_return·excess_return)를 산출한다.
+        None 이면 해당 지표는 None 으로 반환된다. Sharpe·Sortino 는 config.risk_free_rate(연)
+        초과 기준으로 산출한다(기본 rf=0).
+    :return: {total_return, mdd, sharpe, sortino, cagr, alpha, beta, information_ratio,
+        tracking_error, benchmark_return, excess_return, win_rate, num_trades,
+        num_rebalances, avg_turnover, equity_curve, markers, holdings, trades} — JSON.
     """
     panel = _normalize_index(close_panel).ffill()
     if panel.empty:
@@ -451,6 +553,12 @@ def run_rebalance_backtest(
     tax = float(config.get("tax", 0.0020))
     drift_band = float(config.get("drift_band_pct", 0.05))
     rebal_dates = _rebalance_dates(sim_dates, config)
+
+    # 체결 현실성(P0-1): 체결 시점(fill_mode)·슬리피지.
+    defer = str(config.get("fill_mode", "next_close")) == "next_close"
+    slip_base = max(0.0, float(config.get("slippage_bps", 5.0) or 0.0) / 10_000.0)
+    slip_vol_scale = max(0.0, float(config.get("slippage_vol_scale", 0.0) or 0.0))
+    rf_annual = float(config.get("risk_free_rate", 0.0) or 0.0)  # 위험조정지표용 무위험수익률(연)
 
     # 현금화 오버레이(레짐 필터) 준비
     rf = config.get("regime_filter") or {}
@@ -478,6 +586,51 @@ def run_rebalance_backtest(
     turnovers: list[float] = []
     trades: list[dict] = []
 
+    # 결정(선정·청산)과 체결을 분리한다. next_close 면 어떤 날 d 에 내린 결정을 다음
+    # 거래일 종가에 체결(pending 큐)하고, same_close 면 그날 종가에 즉시 체결한다.
+    # 결정 근거는 언제나 결정일 d 까지의 데이터만 쓰므로 미래참조가 없다.
+    pending: dict | None = None
+
+    def _run_decision(decision: dict, prices: pd.Series, d: pd.Timestamp, cash: float) -> float:
+        """decision(청산/리밸런싱)을 d 종가로 체결한다(val/cost/trades 등 제자리 수정)."""
+        equity = cash + sum(val.values())
+        if decision["kind"] == "liquidate":
+            if not val:
+                return cash
+            slip_map = _vol_slippage_map(panel.loc[:d], list(val), slip_base, slip_vol_scale)
+            cash, turnover = _apply_rebalance(
+                val, cost, {}, equity, prices, d, capital,
+                drift_band, fees, tax, trades,
+                liquidate=True, reason=decision["reason"],
+                slip_base=slip_base, slip_map=slip_map,
+            )
+            if turnover > 0:
+                turnovers.append(turnover)
+                markers.append({"t": d.isoformat(), "type": "regime_exit"})
+        else:  # rebalance
+            # 체결일 가격이 없는 종목은 제외(매매 불가). next_close 면 체결일 = d.
+            targets = {
+                s: w for s, w in decision["targets"].items()
+                if pd.notna(prices.get(s)) and float(prices.get(s) or 0) > 0
+            }
+            if targets:
+                slip_map = _vol_slippage_map(
+                    panel.loc[:d], list(set(targets) | set(val)), slip_base, slip_vol_scale
+                )
+                cash, turnover = _apply_rebalance(
+                    val, cost, targets, equity, prices, d, capital,
+                    drift_band, fees, tax, trades, reason=decision["reason"],
+                    slip_base=slip_base, slip_map=slip_map,
+                )
+                if turnover > 0:
+                    turnovers.append(turnover)
+                    markers.append({
+                        "t": d.isoformat(),
+                        "type": "rebalance",
+                        "holdings": len(val),
+                    })
+        return cash
+
     for d in sim_dates:
         prices = panel.loc[d]
         # 1) 당일 수익률 반영(보유 종목 평가액 갱신)
@@ -489,48 +642,29 @@ def run_rebalance_backtest(
                     val[sym] *= float(p1) / float(p0)
         prev_prices = prices
 
-        # 2) 레짐 판정(당일). risk-off 이면 즉시 청산·현금화하고 매수 중단.
-        risk_off = bool(regime_on is not None and not bool(regime_on.get(d, True)))
-        if risk_off and val:
-            equity = cash + sum(val.values())
-            cash, turnover = _apply_rebalance(
-                val, cost, {}, equity, prices, d, capital,
-                drift_band, fees, tax, trades,
-                liquidate=True, reason="regime_exit",
-            )
-            if turnover > 0:
-                turnovers.append(turnover)
-                markers.append({"t": d.isoformat(), "type": "regime_exit"})
+        # 2) 전일 결정의 지연 체결(next_close). same_close 면 pending 이 항상 비어 있다.
+        if pending is not None:
+            cash = _run_decision(pending, prices, d, cash)
+            pending = None
 
-        # 3) 리밸런싱: 정기 리밸런싱일이거나, 레짐이 risk-off→risk-on 으로 회복돼
-        #    현금 상태에서 재진입해야 하는 날(cadence 를 기다리지 않고 회복 즉시 신규
-        #    선정·매수). 재진입 게이팅 = (d in rebal_dates) 또는 (risk-on 전환 & 현금).
-        #    미래참조 방지: 재진입일 d 의 선정·목표비중도 기존과 동일하게 d 까지의
-        #    데이터(_targets_at 의 panel.loc[:d])만 사용한다.
-        regime_reentry = bool(
-            regime_on is not None and not risk_off and prev_risk_off and not val
-        )
-        if not risk_off and (d in rebal_dates or regime_reentry):
-            equity = cash + sum(val.values())
-            targets = _targets_at(d, panel, config, fundamentals_provider, pool_provider)
-            # 목표 종목 중 당일 가격이 없는 종목은 제외(매매 불가)
-            targets = {
-                s: w for s, w in targets.items()
-                if pd.notna(prices.get(s)) and float(prices.get(s) or 0) > 0
-            }
-            if targets:
-                cash, turnover = _apply_rebalance(
-                    val, cost, targets, equity, prices, d, capital,
-                    drift_band, fees, tax, trades,
-                    reason="rebalance",
-                )
-                if turnover > 0:
-                    turnovers.append(turnover)
-                    markers.append({
-                        "t": d.isoformat(),
-                        "type": "rebalance",
-                        "holdings": len(val),
-                    })
+        # 3) 당일 결정. risk-off 면 청산·현금화, 아니면 정기 리밸런싱/레짐 재진입.
+        #    재진입 게이팅 = (d in rebal_dates) 또는 (risk-on 전환 & 현금). 미래참조 방지:
+        #    선정·목표비중은 d 까지의 데이터(_targets_at 의 panel.loc[:d])만 사용한다.
+        risk_off = bool(regime_on is not None and not bool(regime_on.get(d, True)))
+        decision: dict | None = None
+        if risk_off and val:
+            decision = {"kind": "liquidate", "reason": "regime_exit"}
+        elif not risk_off:
+            regime_reentry = bool(regime_on is not None and prev_risk_off and not val)
+            if d in rebal_dates or regime_reentry:
+                targets = _targets_at(d, panel, config, fundamentals_provider, pool_provider)
+                decision = {"kind": "rebalance", "targets": targets, "reason": "rebalance"}
+
+        if decision is not None:
+            if defer:
+                pending = decision      # 익일 종가 체결로 이월
+            else:
+                cash = _run_decision(decision, prices, d, cash)
 
         equity_now = cash + sum(val.values())
         equities_norm.append(equity_now)
@@ -547,10 +681,20 @@ def run_rebalance_backtest(
     drawdown = series / running_max - 1.0
     mdd = _safe(drawdown.min())
 
-    # Sharpe(무위험 0, 일간→연율 √252)
-    sharpe = None
-    if len(rets) > 1 and rets.std(ddof=1) > 0:
-        sharpe = _safe(rets.mean() / rets.std(ddof=1) * math.sqrt(252))
+    # 위험조정·벤치마크 상대 지표. 벤치마크 일간수익을 패널 인덱스에서 산출해 sim_dates 로
+    # 정렬(각 sim 일자의 '직전 거래일 대비' 수익). 포트 rets 와 길이·순서가 일치한다.
+    bench_rets = None
+    if benchmark_series is not None and not benchmark_series.empty:
+        bs = benchmark_series.copy()
+        bidx = bs.index
+        if isinstance(bidx, pd.DatetimeIndex) and bidx.tz is not None:
+            bidx = bidx.tz_localize(None)
+        bs.index = pd.DatetimeIndex(bidx).normalize()
+        bs = bs[~bs.index.duplicated(keep="last")].sort_index()
+        bs = bs.reindex(panel.index).ffill()
+        bench_rets = bs.pct_change().reindex(sim_dates).to_numpy(dtype=float)
+    radj = _risk_adjusted_metrics(rets, bench_rets, rf_annual)
+    sharpe = radj["sharpe"]
 
     # CAGR
     n_days = len(rets)
@@ -573,6 +717,17 @@ def run_rebalance_backtest(
         "total_return": total_return,
         "mdd": mdd,
         "sharpe": sharpe,
+        "sortino": radj["sortino"],
+        "alpha": radj["alpha"],
+        "beta": radj["beta"],
+        "information_ratio": radj["information_ratio"],
+        "tracking_error": radj["tracking_error"],
+        "benchmark_return": radj["benchmark_return"],
+        "excess_return": _safe(
+            total_return - radj["benchmark_return"]
+            if total_return is not None and radj["benchmark_return"] is not None
+            else None
+        ),
         "cagr": cagr,
         "win_rate": None,  # 포트폴리오 전략에는 종목단위 승률 개념이 맞지 않음
         "num_trades": len(trades),

@@ -78,6 +78,8 @@ async def _run_single_symbol_backtest(
 
 # pykrx 종합지수 티커(레짐 필터 기준지수).
 _REGIME_INDEX_TICKER = {"KOSPI": "1001", "KOSDAQ": "2001"}
+# 벤치마크 상대성과용 지수(pykrx 지수코드). 대형주 전략 기본은 KOSPI200.
+_BENCHMARK_TICKER = {"KOSPI200": "1028", "KOSPI": "1001", "KOSDAQ": "2001"}
 
 
 def _load_regime_series(start_d, end_d, ticker: str):
@@ -234,6 +236,16 @@ async def _run_rebalance_backtest(
         except Exception as e:  # noqa: BLE001
             logger.warning("레짐 필터 기준지수 적재 실패(오버레이 미적용): %s", e)
 
+    # 벤치마크 상대성과: 항상 지수 종가를 적재해 alpha/beta/IR 등을 산출한다(실패 시 None).
+    benchmark_series = None
+    bench_ticker = _BENCHMARK_TICKER.get(config.get("benchmark_index", "KOSPI200"), "1028")
+    try:
+        benchmark_series = await run_in_threadpool(
+            _load_regime_series, warmup_start, req.period_end, bench_ticker
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("벤치마크 지수 적재 실패(상대지표 미산출): %s", e)
+
     try:
         result = await run_in_threadpool(
             run_rebalance_backtest,
@@ -244,6 +256,7 @@ async def _run_rebalance_backtest(
             provider,
             regime_series,
             pool_provider,
+            benchmark_series,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))

@@ -21,6 +21,16 @@ function pct(x: number | null | undefined): string {
   return `${(x * 100).toFixed(2)}%`;
 }
 
+/**
+ * 배수/비율 지표(베타·정보비율 등)를 소수 문자열로 변환한다.
+ * @param x 값(null/undefined 면 "-")
+ * @param digits 소수 자릿수(기본 2)
+ */
+function num(x: number | null | undefined, digits = 2): string {
+  if (x === null || x === undefined) return "-";
+  return x.toFixed(digits);
+}
+
 /** 전략 상세 라우트. 동적 params 를 풀어 인증 게이트로 감싼 콘텐츠에 전달한다. */
 export default function StrategyDetailPage({
   params,
@@ -280,7 +290,44 @@ function StrategyDetailContent({ sid }: { sid: number }) {
                   value={`${pct(latest.result.win_rate)} / ${latest.result.num_trades}`}
                 />
               )}
+              <Metric label="소르티노" value={num(latest.result.sortino)} />
             </div>
+
+            {isRebalance &&
+              latest.result.benchmark_return !== null &&
+              latest.result.benchmark_return !== undefined && (
+                <div className="rounded-lg border border-border bg-card p-4">
+                  <h2 className="mb-3 text-sm text-muted-foreground">
+                    벤치마크 상대성과 (KOSPI200)
+                  </h2>
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+                    <Metric
+                      label="벤치마크 수익"
+                      value={pct(latest.result.benchmark_return)}
+                    />
+                    <Metric
+                      label="초과수익"
+                      value={pct(latest.result.excess_return)}
+                      accent
+                    />
+                    <Metric label="알파(연)" value={pct(latest.result.alpha)} />
+                    <Metric label="베타" value={num(latest.result.beta)} />
+                    <Metric
+                      label="정보비율(IR)"
+                      value={num(latest.result.information_ratio)}
+                    />
+                    <Metric
+                      label="추적오차"
+                      value={pct(latest.result.tracking_error)}
+                    />
+                  </div>
+                  <p className="mt-3 text-xs text-muted-foreground">
+                    알파·베타는 KOSPI200 대비 일간수익 회귀 기준. 알파&gt;0·베타&lt;1 이면
+                    저위험 초과수익. 정보비율은 초과수익의 일관성(≥0.5 양호, ≥1 우수).
+                    샤프·소르티노는 무위험수익률 초과 기준(전략 config의 risk_free_rate).
+                  </p>
+                </div>
+              )}
 
             <div className="rounded-lg border border-border bg-card p-4">
               <h2 className="mb-2 text-sm text-muted-foreground">자산 곡선 (Equity Curve)</h2>

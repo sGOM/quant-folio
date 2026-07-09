@@ -72,6 +72,10 @@ const COMMON_DEFAULTS = {
   stop_loss_pct: null,
   take_profit_pct: null,
   trailing_stop_pct: null,
+  fill_mode: "next_close" as const, // 익일 종가 체결(당일 미래참조 제거)
+  slippage_bps: 5, // 편도 슬리피지 0.05%
+  slippage_vol_scale: 0, // 변동성 비례 스케일 off(고정 bps)
+  risk_free_rate: 0, // 위험조정지표용 무위험수익률(연)
 };
 
 /**
@@ -99,6 +103,11 @@ export function defaultConfig(
       capital: 10_000_000,
       fees: COMMON_DEFAULTS.fees,
       tax: COMMON_DEFAULTS.tax,
+      fill_mode: COMMON_DEFAULTS.fill_mode,
+      slippage_bps: COMMON_DEFAULTS.slippage_bps,
+      slippage_vol_scale: COMMON_DEFAULTS.slippage_vol_scale,
+      risk_free_rate: COMMON_DEFAULTS.risk_free_rate,
+      benchmark_index: "KOSPI200",
     };
   }
   const base = { ...COMMON_DEFAULTS, ...common };
