@@ -366,6 +366,16 @@ class RebalanceSelection(BaseModel):
     factor_weights: FactorWeights = Field(
         default_factory=FactorWeights, description="종합점수 카테고리 가중치(method=score)"
     )
+    # 팩터 중립화(P1-3, method="score" 전용). 각 카테고리 z-score 를 지정 축에 대해
+    # 직교화(residualize)해 의도치 않은 스타일 베팅을 제거한다.
+    #   none(기본): 중립화 없음(기존 동작).
+    #   size: 시가총액(로그) 축에 대해 각 팩터를 중립화 → 팩터가 대형/소형주 베팅으로
+    #         변질되는 것을 막는다(순수 팩터 노출). 시가총액(PIT)이 필요하다.
+    # 섹터 중립화는 신뢰할 종목→섹터 매핑 소스 확보 시 추가한다(현재 미지원).
+    neutralize: Literal["none", "size"] = Field(
+        default="none",
+        description="팩터 중립화 축(method=score). size=시가총액 중립화(순수 팩터 노출).",
+    )
     universe_rule: UniverseRule | None = Field(
         default=None,
         description="동적 유니버스 규칙(method=momentum/score). 지정 시 universe 는 후보풀로 해석된다.",

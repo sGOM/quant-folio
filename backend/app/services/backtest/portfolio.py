@@ -258,11 +258,12 @@ def _targets_at(
                 # 밸류(PER/PBR/DIV) + 퀄리티(roe/debt_ratio/fcf) 컬럼을 스코어링
                 # 프레임에 합류한다. 존재하지 않는 컬럼은 건너뛰어 중립 처리되게 한다.
                 for col in ("PER", "PBR", "DIV", "roe", "debt_ratio", "fcf", "f_score",
-                            "op_growth", "net_growth", "turnaround"):
+                            "op_growth", "net_growth", "turnaround", "market_cap"):
                     if col in fdf.columns:
                         fac[col] = fdf[col].reindex(fac.index)
         weights = config.get("selection", {}).get("factor_weights")
-        scored = _compute_stock_scores(fac, weights=weights)
+        neutralize = config.get("selection", {}).get("neutralize", "none")
+        scored = _compute_stock_scores(fac, weights=weights, neutralize=neutralize)
         if score_out is not None:
             # 팩터 IC/IR·성과귀속(P1-1)용 스냅샷 — 팩터별 점수 컬럼만 보관(후보풀 전체 크로스섹션).
             cols = [c for c in _FACTOR_SCORE_COLS if c in scored.columns]

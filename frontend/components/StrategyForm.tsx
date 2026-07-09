@@ -1036,6 +1036,25 @@ function RebalanceFields({
             선정합니다. 가중치 합은 <b className="text-muted-foreground">1.00</b>이어야 저장됩니다.
             퀄리티는 OpenDART 재무데이터가 필요하며, 키가 없으면 중립 처리됩니다.
           </p>
+          <Field label="팩터 중립화">
+            <select
+              value={config.selection.neutralize ?? "none"}
+              onChange={(e) =>
+                patchSelection({
+                  neutralize: e.target.value as "none" | "size",
+                })
+              }
+              className={INPUT}
+            >
+              <option value="none">없음</option>
+              <option value="size">시가총액 중립화</option>
+            </select>
+          </Field>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            <b className="text-muted-foreground">시가총액 중립화</b>는 각 팩터 점수를 로그
+            시가총액 축에 직교화해, 팩터가 의도치 않게 대형/소형주 베팅으로 변질되는 것을
+            막습니다(순수 팩터 노출). 시가총액(PIT)이 필요하며, 조회 실패 시 중립화는 생략됩니다.
+          </p>
           <div className="space-y-2.5">
             {FACTOR_META.map((f) => {
               const w = (config.selection.factor_weights ?? DEFAULT_FACTOR_WEIGHTS)[f.key];

@@ -246,8 +246,9 @@ class RebalanceRunner:
             # 종합점수는 확정 영업일(직전 거래일 종가) 기준으로만 산정해 미래참조를 방지한다
             # (rebalance_time 은 통상 장중이라 당일 종가는 아직 미확정).
             factor_weights = selection.get("factor_weights")
+            neutralize = selection.get("neutralize", "none")
             scores = await asyncio.to_thread(
-                compute_universe_scores, universe, as_of, factor_weights
+                compute_universe_scores, universe, as_of, factor_weights, neutralize
             )
         targets = compute_target_weights(history, cfg, scores=scores)
         # 리스크 레이어(P1-2): 종목 집중 한도·변동성 타겟팅을 목표비중에 적용(백테스트
