@@ -4,7 +4,7 @@ import { use, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, Backtest, StrategyConfig } from "@/lib/api";
+import { api, Backtest, FactorIC, StrategyConfig } from "@/lib/api";
 import { Nav } from "@/components/Nav";
 import { LineChart } from "@/components/LineChart";
 import { RequireAuth } from "@/components/RequireAuth";
@@ -329,6 +329,12 @@ function StrategyDetailContent({ sid }: { sid: number }) {
                 </div>
               )}
 
+            {isRebalance &&
+              latest.result.factor_ic &&
+              Object.keys(latest.result.factor_ic).length > 0 && (
+                <FactorICCard factorIc={latest.result.factor_ic} />
+              )}
+
             <div className="rounded-lg border border-border bg-card p-4">
               <h2 className="mb-2 text-sm text-muted-foreground">자산 곡선 (Equity Curve)</h2>
               <LineChart data={latest.result.equity_curve} />
@@ -570,6 +576,98 @@ function Metric({
       <p className={`mt-1 text-lg font-semibold ${accent ? "text-primary" : ""}`}>
         {value}
       </p>
+    </div>
+  );
+}
+
+/** 팩터 점수 컬럼 → 표시명. score(종합)는 별도 강조 행으로 렌더한다. */
+const FACTOR_IC_LABELS: Record<string, string> = {
+  score_momentum: "모멘텀",
+  score_value: "밸류",
+  score_lowvol: "저변동",
+  score_quality: "퀄리티",
+  score_growth: "성장",
+  score: "종합 점수",
+};
+/** factor_ic 표시 순서(종합은 마지막). */
+const FACTOR_IC_ORDER = [
+  "score_momentum",
+  "score_value",
+  "score_lowvol",
+  "score_quality",
+  "score_growth",
+  "score",
+];
+
+/** IR 값에 따른 색상(≥1 우수 초록, >0 양호, ≤0 빨강). */
+function irColor(ir: number | null | undefined): string {
+  if (ir === null || ir === undefined) return "text-muted-foreground";
+  if (ir >= 1) return "text-emerald-600 dark:text-emerald-400";
+  if (ir > 0) return "text-foreground";
+  return "text-red-500";
+}
+
+/**
+ * 팩터 성과귀속·IC/IR 카드(P1-1). 각 팩터 점수의 예측력(IC)·일관성(IR)·방향 적중률·
+ * 롱숏 누적수익을 표로 보여준다. method="score" 전략에서만 factor_ic 가 채워진다.
+ */
+function FactorICCard({ factorIc }: { factorIc: Record<string, FactorIC> }) {
+  const rows = FACTOR_IC_ORDER.filter((k) => factorIc[k]);
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <h2 className="mb-1 text-sm text-muted-foreground">팩터 성과귀속 · IC/IR</h2>
+      <p className="mb-3 text-xs text-muted-foreground">
+        각 팩터 점수와 다음 리밸런싱 구간 수익률의 관계. <b>IC</b>=예측력(순위상관),{" "}
+        <b>IR</b>=예측 일관성(≥1 우수·&gt;0 양호), <b>적중</b>=방향 적중률,{" "}
+        <b>롱숏</b>=상위⅓−하위⅓ 누적수익(이 구간 기여).
+      </p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-border text-xs text-muted-foreground">
+              <th className="py-1 text-left font-normal">팩터</th>
+              <th className="py-1 text-right font-normal">IC</th>
+              <th className="py-1 text-right font-normal">IR</th>
+              <th className="py-1 text-right font-normal">적중</th>
+              <th className="py-1 text-right font-normal">롱숏수익</th>
+              <th className="py-1 text-right font-normal">n</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((k) => {
+              const v = factorIc[k];
+              const isTotal = k === "score";
+              return (
+                <tr
+                  key={k}
+                  className={`border-b border-border/50 ${isTotal ? "font-semibold" : ""}`}
+                >
+                  <td className="py-1 text-left">{FACTOR_IC_LABELS[k] ?? k}</td>
+                  <td className="py-1 text-right tabular-nums">{num(v.ic_mean, 3)}</td>
+                  <td className={`py-1 text-right tabular-nums ${irColor(v.ic_ir)}`}>
+                    {num(v.ic_ir)}
+                  </td>
+                  <td className="py-1 text-right tabular-nums">{pct(v.ic_hit)}</td>
+                  <td
+                    className={`py-1 text-right tabular-nums ${
+                      (v.ls_return ?? 0) > 0
+                        ? "text-red-500"
+                        : (v.ls_return ?? 0) < 0
+                          ? "text-blue-500"
+                          : ""
+                    }`}
+                  >
+                    {pct(v.ls_return)}
+                  </td>
+                  <td className="py-1 text-right tabular-nums text-muted-foreground">
+                    {v.n}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

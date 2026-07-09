@@ -10,6 +10,7 @@ from app.services.backtest.portfolio import (
     _apply_risk_caps,
     _cap_position_weights,
     _dynamic_universe,
+    _factor_attribution,
     _portfolio_vol_ann,
     _regime_on_flags,
     _score_factor_frame,
@@ -1194,3 +1195,73 @@ def test_max_position_pct_must_exceed_drift_band():
             drift_band_pct=0.05,
             risk_layer={"max_position_pct": 0.05},
         )
+
+
+# ───────────────────── 성과귀속·팩터 IC/IR(P1-1) ─────────────────────
+
+
+def _attr_snapshots(alpha, n_rebal=12, gap=21, noise_score=0.3, seed=0):
+    """팩터점수가 종목 alpha 를 반영하고, 가격도 alpha 방향으로 흐르는 합성 스냅샷·패널."""
+    rng = np.random.default_rng(seed)
+    syms = [f"S{i:02d}" for i in range(len(alpha))]
+    dates = pd.bdate_range("2022-01-03", periods=n_rebal * gap + 5)
+    prices = {s: [100.0] for s in syms}
+    for _di in range(1, len(dates)):
+        for j, s in enumerate(syms):
+            prices[s].append(prices[s][-1] * (1 + alpha[j] * 0.002 + rng.normal(0, 0.01)))
+    panel = pd.DataFrame(prices, index=dates)
+    snaps = []
+    for k in [i * gap for i in range(n_rebal)]:
+        sc = pd.Series(alpha + rng.normal(0, noise_score, len(alpha)), index=syms)
+        snaps.append((dates[k], pd.DataFrame({"score_momentum": sc, "score": sc})))
+    return snaps, panel
+
+
+def test_factor_attribution_detects_predictive_factor():
+    """가격을 예측하는 팩터는 IC>0·IR>0·롱숏수익>0·적중률>0.5."""
+    rng = np.random.default_rng(0)
+    snaps, panel = _attr_snapshots(rng.normal(0, 1, 30))
+    attr = _factor_attribution(snaps, panel)
+    m = attr["score_momentum"]
+    assert m["ic_mean"] > 0.1 and m["ic_ir"] > 0
+    assert m["ls_return"] > 0 and m["ic_hit"] > 0.5
+
+
+def test_factor_attribution_noise_factor_near_zero():
+    """가격과 무관한 팩터는 IC≈0."""
+    rng = np.random.default_rng(1)
+    syms = [f"S{i:02d}" for i in range(30)]
+    dates = pd.bdate_range("2022-01-03", periods=12 * 21 + 5)
+    panel = pd.DataFrame(
+        {s: 100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(dates)))) for s in syms}, index=dates)
+    snaps = [(dates[i * 21], pd.DataFrame({"score": pd.Series(rng.normal(0, 1, 30), index=syms)}))
+             for i in range(12)]
+    attr = _factor_attribution(snaps, panel)
+    assert abs(attr["score"]["ic_mean"]) < 0.2
+
+
+def test_factor_attribution_needs_min_intervals():
+    """스냅샷이 3구간 미만이면 빈 결과(IR 불안정 방지)."""
+    rng = np.random.default_rng(0)
+    snaps, panel = _attr_snapshots(rng.normal(0, 1, 30), n_rebal=2)
+    assert _factor_attribution(snaps, panel) == {}
+
+
+def test_rebalance_backtest_exposes_factor_ic_for_score_method():
+    """score 전략 백테스트는 factor_ic 를 노출하고, momentum 전략은 빈 dict."""
+    dates = pd.bdate_range("2022-01-03", periods=400)
+    rng = np.random.default_rng(3)
+    panel = pd.DataFrame(
+        {f"S{i:02d}": 100 * np.exp(np.cumsum(rng.normal(0.0002, 0.015, len(dates)))) for i in range(12)},
+        index=dates)
+    score_cfg = {
+        "universe": list(panel.columns),
+        "selection": {"method": "score", "top_n": 4},
+        "weighting": "equal", "cadence": "monthly", "rebalance_dom": 1,
+        "drift_band_pct": 0.02, "fill_mode": "same_close",
+    }
+    res = run_rebalance_backtest(panel, score_cfg, dates[0], dates[-1])
+    assert "factor_ic" in res and isinstance(res["factor_ic"], dict) and res["factor_ic"]
+    mom_cfg = {**score_cfg, "selection": {"method": "momentum", "top_n": 4, "lookback": 60}}
+    res2 = run_rebalance_backtest(panel, mom_cfg, dates[0], dates[-1])
+    assert res2["factor_ic"] == {}

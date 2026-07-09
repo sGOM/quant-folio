@@ -510,6 +510,20 @@ export interface BacktestTrade {
   reason: string;
 }
 
+/** 팩터 1개의 성과귀속 지표(P1-1). */
+export interface FactorIC {
+  /** 평균 IC(팩터 점수 vs 다음 구간 수익률의 순위상관). 예측력의 부호·강도. */
+  ic_mean: number | null;
+  /** IC IR = mean(IC)/std(IC) × √(연 리밸런싱 횟수). 예측의 일관성. */
+  ic_ir: number | null;
+  /** IC>0 비율(방향 적중률). */
+  ic_hit: number | null;
+  /** 팩터 상위 1/3 − 하위 1/3 롱숏 포트폴리오의 누적수익(이 구간 기여). */
+  ls_return: number | null;
+  /** 유효 구간(리밸런싱 인접쌍) 수. */
+  n: number;
+}
+
 export interface BacktestResult {
   total_return: number | null;
   mdd: number | null;
@@ -537,6 +551,11 @@ export interface BacktestResult {
   num_rebalances?: number;
   /** MDD 킬스위치(risk_layer) 발동 횟수(리밸런싱 백테스트). */
   num_kills?: number;
+  /**
+   * 팩터별 성과귀속·IC/IR(P1-1, method="score" 전략만; 그 외 {} 또는 미포함).
+   * 키: score_momentum/value/lowvol/quality/growth + 종합 score.
+   */
+  factor_ic?: Record<string, FactorIC>;
   /** 평균 회전율 Σ|Δw|(리밸런싱 백테스트). */
   avg_turnover?: number | null;
   equity_curve: { t: string; v: number }[];

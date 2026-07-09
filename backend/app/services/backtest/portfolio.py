@@ -217,12 +217,16 @@ def _targets_at(
     config: dict,
     fundamentals_provider,
     pool_provider=None,
+    *,
+    score_out: list | None = None,
 ) -> dict[str, float]:
     """리밸런싱일 d 의 목표비중을 산정한다(d 종가까지의 데이터만 사용).
 
     :param pool_provider: 지정 시 (d)->list[code] 로 그 시점의 후보풀을 공급한다.
         시점별 지수 구성종목(예: KOSPI200 멤버십)을 넣으면 생존편향이 제거된다.
         None 이면 config.universe(고정)를 후보풀로 쓴다.
+    :param score_out: method="score" 일 때, (d, 팩터점수 DataFrame)을 append 한다.
+        성과귀속·팩터 IC/IR(P1-1) 산출용 스냅샷. None 이면 수집하지 않는다.
     """
     from app.services.metrics import _compute_stock_scores  # 지연(순환 회피)
 
@@ -259,6 +263,10 @@ def _targets_at(
                         fac[col] = fdf[col].reindex(fac.index)
         weights = config.get("selection", {}).get("factor_weights")
         scored = _compute_stock_scores(fac, weights=weights)
+        if score_out is not None:
+            # 팩터 IC/IR·성과귀속(P1-1)용 스냅샷 — 팩터별 점수 컬럼만 보관(후보풀 전체 크로스섹션).
+            cols = [c for c in _FACTOR_SCORE_COLS if c in scored.columns]
+            score_out.append((d, scored[cols].copy()))
         scores = {
             code: float(v)
             for code, v in scored["score"].items()
@@ -449,6 +457,102 @@ def _vol_slippage_map(
     }
 
 
+# 팩터 IC/IR·성과귀속(P1-1)에서 다루는 팩터 점수 컬럼(개별 5팩터 + 종합).
+_FACTOR_SCORE_COLS = (
+    "score_momentum", "score_value", "score_lowvol",
+    "score_quality", "score_growth", "score",
+)
+
+
+def _factor_attribution(
+    snapshots: list[tuple[pd.Timestamp, pd.DataFrame]], panel: pd.DataFrame
+) -> dict[str, dict[str, float | int | None]]:
+    """리밸런싱 스냅샷(팩터 점수)과 다음 구간 순수 수익률로 팩터별 IC·IR·롱숏수익을 산출한다.
+
+    각 인접 스냅샷 구간 [d_i, d_{i+1}] 에서 후보풀 종목의 forward return(종가 기준)을 구하고,
+    팩터별로:
+      - IC_i: 팩터 점수와 forward return 의 순위상관(Spearman). 예측력의 부호·강도.
+      - LS_i: 팩터 상위 1/3 평균수익 − 하위 1/3 평균수익(팩터 모방 롱숏 포트 수익).
+    을 계산한 뒤 구간에 걸쳐 집계한다:
+      - ic_mean: 평균 IC(예측력)
+      - ic_ir: IC IR = mean(IC)/std(IC) × √(연간 리밸런싱 횟수). 예측의 일관성.
+      - ic_hit: IC>0 비율(방향 적중률)
+      - ls_return: 롱숏 누적수익(∏(1+LS_i)−1) — 이 구간 팩터가 실제로 값을 했는지(귀속).
+      - n: 유효 구간 수.
+
+    미래참조 없음: 각 IC 는 d_i 시점 점수 vs d_i→d_{i+1} 실현수익으로, 결정 시점 정보만 쓴다.
+    """
+    out: dict[str, dict[str, float | int | None]] = {}
+    if len(snapshots) < 3:
+        return out  # IR 안정성 위해 최소 3구간(스냅샷 4개) 필요
+
+    idx = panel.index
+    # 연율화 계수: 스냅샷 간 평균 거래일 간격 → 연 리밸런싱 횟수(√ 적용).
+    pos = []
+    for d, _ in snapshots:
+        loc = idx.searchsorted(d)
+        pos.append(int(loc))
+    gaps = [pos[i + 1] - pos[i] for i in range(len(pos) - 1) if pos[i + 1] > pos[i]]
+    avg_gap = float(np.mean(gaps)) if gaps else 21.0
+    periods_per_year = 252.0 / avg_gap if avg_gap > 0 else 12.0
+    ann = math.sqrt(periods_per_year)
+
+    per_factor_ic: dict[str, list[float]] = {c: [] for c in _FACTOR_SCORE_COLS}
+    per_factor_ls: dict[str, list[float]] = {c: [] for c in _FACTOR_SCORE_COLS}
+
+    for i in range(len(snapshots) - 1):
+        d0, frame = snapshots[i]
+        d1, _ = snapshots[i + 1]
+        if d0 not in panel.index or d1 not in panel.index:
+            continue
+        p0 = panel.loc[d0]
+        p1 = panel.loc[d1]
+        syms = [s for s in frame.index if s in panel.columns]
+        if len(syms) < 5:
+            continue
+        base = p0.reindex(syms).astype(float)
+        fwd = (p1.reindex(syms).astype(float) / base) - 1.0
+        fwd = fwd.replace([np.inf, -np.inf], np.nan)
+        valid = fwd.notna() & (base > 0)
+        fwd = fwd[valid]
+        if len(fwd) < 5:
+            continue
+        for col in _FACTOR_SCORE_COLS:
+            if col not in frame.columns:
+                continue
+            sc = frame[col].reindex(fwd.index).astype(float)
+            pair = pd.concat([sc, fwd], axis=1).dropna()
+            if len(pair) < 5 or pair.iloc[:, 0].nunique() < 3:
+                continue
+            ic = pair.iloc[:, 0].corr(pair.iloc[:, 1], method="spearman")
+            if ic == ic:  # NaN 아님
+                per_factor_ic[col].append(float(ic))
+            # 롱숏(터셔일): 팩터 상위 1/3 − 하위 1/3 평균 forward return.
+            k = len(pair) // 3
+            if k >= 1:
+                ranked = pair.sort_values(pair.columns[0], ascending=False)
+                top = ranked.iloc[:k, 1].mean()
+                bot = ranked.iloc[-k:, 1].mean()
+                if top == top and bot == bot:
+                    per_factor_ls[col].append(float(top - bot))
+
+    for col in _FACTOR_SCORE_COLS:
+        ics = per_factor_ic[col]
+        lss = per_factor_ls[col]
+        if len(ics) < 3:
+            continue
+        arr = np.array(ics, dtype=float)
+        sd = float(arr.std(ddof=1))
+        out[col] = {
+            "ic_mean": _safe(float(arr.mean())),
+            "ic_ir": _safe(float(arr.mean()) / sd * ann) if sd > 0 else None,
+            "ic_hit": _safe(float((arr > 0).mean())),
+            "ls_return": _safe(float(np.prod([1.0 + x for x in lss]) - 1.0)) if lss else None,
+            "n": len(ics),
+        }
+    return out
+
+
 def _cap_position_weights(targets: dict[str, float], cap: float) -> dict[str, float]:
     """단일 종목 목표비중을 cap 으로 제한하고 초과분을 상한 미만 종목에 비례 재분배한다.
 
@@ -610,9 +714,11 @@ def run_rebalance_backtest(
         초과 기준으로 산출한다(기본 rf=0).
     :return: {total_return, mdd, sharpe, sortino, cagr, alpha, beta, information_ratio,
         tracking_error, benchmark_return, excess_return, win_rate, num_trades,
-        num_rebalances, num_kills, avg_turnover, equity_curve, markers, holdings, trades}
-        — JSON. num_kills 는 MDD 킬스위치(risk_layer) 발동 횟수. 리스크 레이어(집중 한도·
-        변동성 타겟팅)는 목표비중에 반영되며 markers 에 'mdd_exit' 로 킬스위치 청산이 남는다.
+        num_rebalances, num_kills, factor_ic, avg_turnover, equity_curve, markers,
+        holdings, trades} — JSON. num_kills 는 MDD 킬스위치(risk_layer) 발동 횟수. 리스크
+        레이어(집중 한도·변동성 타겟팅)는 목표비중에 반영되며 markers 에 'mdd_exit' 로
+        킬스위치 청산이 남는다. factor_ic 는 method="score" 전략의 팩터별 IC·IR·롱숏수익
+        (성과귀속, P1-1)이며 그 외 방식에선 {} 이다.
     """
     panel = _normalize_index(close_panel).ffill()
     if panel.empty:
@@ -629,6 +735,10 @@ def run_rebalance_backtest(
     tax = float(config.get("tax", 0.0020))
     drift_band = float(config.get("drift_band_pct", 0.05))
     rebal_dates = _rebalance_dates(sim_dates, config)
+
+    # 성과귀속·팩터 IC/IR(P1-1): method="score" 전략만 팩터별 점수 스냅샷을 수집한다.
+    attribution = str(config.get("selection", {}).get("method")) == "score"
+    score_snapshots: list | None = [] if attribution else None
 
     # 체결 현실성(P0-1): 체결 시점(fill_mode)·슬리피지.
     defer = str(config.get("fill_mode", "next_close")) == "next_close"
@@ -768,7 +878,10 @@ def run_rebalance_backtest(
             # 정기 리밸런싱일이거나, 레짐 회복 재진입이거나, 킬스위치 재가동 직후(현금)면 진입.
             regime_reentry = bool(regime_on is not None and prev_risk_off and not val)
             if d in rebal_dates or regime_reentry or (just_rearmed and not val):
-                targets = _targets_at(d, panel, config, fundamentals_provider, pool_provider)
+                targets = _targets_at(
+                    d, panel, config, fundamentals_provider, pool_provider,
+                    score_out=score_snapshots,
+                )
                 decision = {"kind": "rebalance", "targets": targets, "reason": "rebalance"}
 
         if decision is not None:
@@ -818,6 +931,9 @@ def run_rebalance_backtest(
         for sym, v in sorted(val.items(), key=lambda kv: kv[1], reverse=True)
     }
 
+    # 성과귀속·팩터 IC/IR(P1-1) — score 전략이면 팩터별 예측력·롱숏수익을 집계한다.
+    factor_ic = _factor_attribution(score_snapshots, panel) if score_snapshots else {}
+
     logger.info(
         "리밸런싱 백테스트 완료 — 리밸런싱 %d회, 거래 %d건, 총수익률 %.4f, MDD %.4f%s",
         len(turnovers), len(trades), total_return or 0.0, mdd or 0.0,
@@ -844,6 +960,7 @@ def run_rebalance_backtest(
         "num_trades": len(trades),
         "num_rebalances": len(turnovers),
         "num_kills": num_kills,  # MDD 킬스위치 발동 횟수(P1-2)
+        "factor_ic": factor_ic,  # 팩터별 IC·IR·롱숏수익(P1-1, score 전략만; 그 외 {})
         "avg_turnover": _safe(np.mean(turnovers)) if turnovers else 0.0,
         "equity_curve": equity_curve,
         "markers": markers,
