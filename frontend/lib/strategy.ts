@@ -98,6 +98,7 @@ export function defaultConfig(
       rebalance_weekday: null,
       rebalance_dom: 1,
       rebalance_time: "14:30",
+      initial_fill_immediate: false,
       drift_band_pct: 0.05,
       regime_filter: null,
       capital: 10_000_000,
