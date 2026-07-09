@@ -742,16 +742,22 @@ class _FakeRedis:
         self.store[k] = v
 
 
-async def _make_runner(monkeypatch, *, risk_off, prev_regime, holdings, due):
+async def _make_runner(
+    monkeypatch, *, risk_off, prev_regime, holdings, due,
+    initial_fill=False, last_ran=False,
+):
     """레짐 결정 로직만 검증하기 위해 I/O 를 모두 대체한 러너를 만든다."""
     redis = _FakeRedis()
     if prev_regime is not None:
         redis.store["rebalance:regime:1"] = "1" if prev_regime else "0"
+    if last_ran:  # 마지막 실행일 기록 존재(=첫 실행 아님) → 부트스트랩 차단
+        redis.store["rebalance:last:1"] = "2024-01-01T14:30:00+09:00"
     r = RebalanceRunner(strategy_id=1, redis=redis)
     r._cfg = {
         "universe": ["A", "B"],
         "regime_filter": {"enabled": True},
         "cadence": "monthly",
+        "initial_fill_immediate": initial_fill,
     }
 
     calls: list[dict] = []
@@ -813,6 +819,56 @@ async def test_runner_regular_cadence_consumes_schedule(monkeypatch):
     )
     assert calls == [{"risk_off": False, "bar_tag": "rebal"}]
     assert len(set_last) == 1  # 정기 발화만 마지막 실행일을 소비
+
+
+async def test_runner_bootstrap_fills_immediately_on_cold_start(monkeypatch):
+    # initial_fill_immediate=true, 첫 실행(last 없음)·보유 없음·발화일 미도래 → 즉시 발화.
+    calls, set_last, _ = await _make_runner(
+        monkeypatch, risk_off=False, prev_regime=None, holdings=False, due=False,
+        initial_fill=True,
+    )
+    assert calls == [{"risk_off": False, "bar_tag": "rebal"}]
+    assert len(set_last) == 1  # 부트스트랩은 이번 주기 정규 리밸런싱을 대체(스케줄 소비)
+
+
+async def test_runner_bootstrap_disabled_by_default(monkeypatch):
+    # 옵션 미설정이면 발화일 미도래 시 아무 것도 하지 않음(기존 동작 보존).
+    calls, set_last, _ = await _make_runner(
+        monkeypatch, risk_off=False, prev_regime=None, holdings=False, due=False,
+        initial_fill=False,
+    )
+    assert calls == []
+    assert set_last == []
+
+
+async def test_runner_bootstrap_skips_when_holdings_exist(monkeypatch):
+    # 이미 보유가 있으면 첫 실행이 아니라고 보고 부트스트랩하지 않는다.
+    calls, set_last, _ = await _make_runner(
+        monkeypatch, risk_off=False, prev_regime=None, holdings=True, due=False,
+        initial_fill=True,
+    )
+    assert calls == []
+    assert set_last == []
+
+
+async def test_runner_bootstrap_skips_when_already_ran(monkeypatch):
+    # 마지막 실행일 기록이 있으면(재기동 등) 부트스트랩하지 않는다.
+    calls, set_last, _ = await _make_runner(
+        monkeypatch, risk_off=False, prev_regime=None, holdings=False, due=False,
+        initial_fill=True, last_ran=True,
+    )
+    assert calls == []
+    assert set_last == []
+
+
+async def test_runner_bootstrap_yields_to_risk_off(monkeypatch):
+    # 콜드 스타트라도 레짐 위험회피면 매수하지 않고 청산 경로만 탄다(현금 유지).
+    calls, set_last, _ = await _make_runner(
+        monkeypatch, risk_off=True, prev_regime=None, holdings=False, due=False,
+        initial_fill=True,
+    )
+    assert calls == [{"risk_off": True, "bar_tag": "regime"}]
+    assert set_last == []
 
 
 # ───────── 레짐 히스테리시스(비대칭 밴드) — 백테스트 _regime_on_flags ─────────

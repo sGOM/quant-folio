@@ -137,15 +137,32 @@ class RebalanceRunner:
 
         last = await self._get_last()
         due = is_rebalance_due(self._cfg, last, now)
-        if not (due or reentry):
+
+        # 콜드 스타트 즉시 발화: initial_fill_immediate=true 이고 아직 한 번도 실행한 적이
+        # 없으며(last 미기록 & 보유 없음) 장중이면, cadence 발화일/시각을 기다리지 않고 즉시
+        # 1회 매수한다. 정규 스케줄을 소비(_set_last)해 이번 주기의 정기 리밸런싱을 대체하고
+        # 중복 발화를 막는다. due 가 이미 True 면(발화일 도래) 굳이 부트스트랩할 필요 없다.
+        bootstrap = (
+            not due
+            and bool(self._cfg.get("initial_fill_immediate"))
+            and last is None
+            and is_market_open(now)
+            and not await self._has_holdings()
+        )
+
+        if not (due or reentry or bootstrap):
             return
 
-        logger.info(
-            "리밸런싱 전략 %d %s (%s)",
-            self.strategy_id, "정기 발화" if due else "레짐 재진입", now.isoformat(),
+        if due or bootstrap:
+            kind = "정기 발화" if due else "콜드스타트 즉시 발화"
+        else:
+            kind = "레짐 재진입"
+        logger.info("리밸런싱 전략 %d %s (%s)", self.strategy_id, kind, now.isoformat())
+        # 부트스트랩은 정규 리밸런싱을 대체하므로 "rebal" 태그(재진입만 "regime").
+        await self._rebalance_once(
+            now, risk_off=False, bar_tag="rebal" if (due or bootstrap) else "regime"
         )
-        await self._rebalance_once(now, risk_off=False, bar_tag="rebal" if due else "regime")
-        if due:  # 재진입은 월간 cadence 스케줄을 소비하지 않는다
+        if due or bootstrap:  # 재진입은 월간 cadence 스케줄을 소비하지 않는다
             await self._set_last(now)
 
     # ───────────────────── 마지막 실행일 상태 ─────────────────────
