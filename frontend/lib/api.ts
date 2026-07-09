@@ -388,6 +388,8 @@ export interface RebalanceConfig {
   rebalance_dom?: number | null;
   /** 실행 시각 "HH:MM" (KST). */
   rebalance_time: string;
+  /** 콜드 스타트 즉시 발화. true 면 첫 실행(보유 없음)에 한해 발화일/시각을 기다리지 않고 장중 즉시 1회 매수. */
+  initial_fill_immediate?: boolean;
   /** 목표 대비 비중 편차 임계(0~1). 초과 종목만 매매. */
   drift_band_pct: number;
   /** 현금화 오버레이(레짐 필터). null/미설정이면 미적용(항상 100% 투자). */

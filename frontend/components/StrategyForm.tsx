@@ -1160,6 +1160,26 @@ function RebalanceFields({
         )}
       </div>
 
+      <div className="rounded-md border p-3 space-y-2">
+        <label className="flex items-center gap-2 text-sm font-medium">
+          <input
+            type="checkbox"
+            checked={!!config.initial_fill_immediate}
+            onChange={(e) =>
+              patch({
+                initial_fill_immediate: e.target.checked,
+              } as Partial<StrategyConfig>)
+            }
+          />
+          최초 실행 시 즉시 매수(콜드 스타트)
+        </label>
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          전략을 처음 실시간 실행할 때 다음 리밸런싱 발화일·시각을 기다리지 않고, 장중이면
+          즉시 1회 초기 매수합니다. 첫 실행(보유 없음)에만 적용되며 이후 주기는 위 설정을
+          따릅니다. 레짐 위험회피 국면이면 매수하지 않고 현금을 유지합니다.
+        </p>
+      </div>
+
       <div className="rounded-md border p-3 space-y-3">
         <label className="flex items-center gap-2 text-sm font-medium">
           <input
