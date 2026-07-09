@@ -179,6 +179,9 @@ export function StrategyForm({
       }
       if (config.weighting === "score" && config.selection.method !== "score")
         return "'점수 순위 가중'은 선정 방식이 멀티팩터일 때만 사용할 수 있습니다.";
+      const rl = config.risk_layer;
+      if (rl?.max_position_pct != null && rl.max_position_pct <= config.drift_band_pct)
+        return "종목 집중 한도는 드리프트 밴드보다 커야 합니다(작으면 진입이 발생하지 않습니다).";
       if (!Number.isFinite(config.capital) || config.capital <= 0)
         return "배정 자본은 0보다 커야 합니다.";
       if (!/^\d{1,2}:\d{2}$/.test(config.rebalance_time))
@@ -824,6 +827,31 @@ function RebalanceFields({
     if (!regime) return;
     patch({ regime_filter: { ...regime, ...p } } as Partial<StrategyConfig>);
   }
+  // 리스크 레이어(P1-2): 집중 한도·변동성 타겟팅·MDD 킬스위치. null=미적용.
+  const risk = config.risk_layer ?? null;
+  function toggleRisk(on: boolean) {
+    patch({
+      risk_layer: on ? { vol_lookback: 20, max_leverage: 1.0, mdd_rearm_days: 20 } : null,
+    } as Partial<StrategyConfig>);
+  }
+  function patchRisk(p: Partial<NonNullable<RebalanceConfig["risk_layer"]>>) {
+    if (!risk) return;
+    patch({ risk_layer: { ...risk, ...p } } as Partial<StrategyConfig>);
+  }
+  /** 리스크 레이어의 optional 비율(0~1) 필드를 퍼센트 문자열로. 미설정이면 "". */
+  function riskPct(key: "max_position_pct" | "target_vol" | "mdd_kill_pct"): string {
+    const v = risk?.[key];
+    return v === null || v === undefined ? "" : String(Number((v * 100).toFixed(4)));
+  }
+  /** 퍼센트 입력 → 비율(0~1) 저장. 빈 값이면 null(해당 통제 비활성). */
+  function setRiskPct(key: "max_position_pct" | "target_vol" | "mdd_kill_pct", raw: string) {
+    if (raw.trim() === "") {
+      patchRisk({ [key]: null } as Partial<NonNullable<RebalanceConfig["risk_layer"]>>);
+      return;
+    }
+    const n = Number(raw);
+    patchRisk({ [key]: Number.isFinite(n) ? n / 100 : null } as Partial<NonNullable<RebalanceConfig["risk_layer"]>>);
+  }
 
   return (
     <div className="space-y-3">
@@ -1172,6 +1200,78 @@ function RebalanceFields({
             <p className="text-[11px] leading-relaxed text-muted-foreground">
               재진입 버퍼: 지수가 이동평균을 이 비율만큼 상회해야 재편입(가짜 반등·휩쏘 억제,
               권장 5%). 청산 버퍼: 이동평균을 이 비율만큼 하회할 때 청산(0%면 하회 즉시).
+            </p>
+          </>
+        )}
+      </div>
+
+      <div className="rounded-md border p-3 space-y-3">
+        <label className="flex items-center gap-2 text-sm font-medium">
+          <input
+            type="checkbox"
+            checked={!!risk}
+            onChange={(e) => toggleRisk(e.target.checked)}
+          />
+          포트폴리오 리스크 레이어
+        </label>
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          선정·비중 산정 이후 목표비중에 위험 통제를 적용합니다. 각 항목은 빈칸이면 비활성입니다.
+          집중 한도는 소수 종목 쏠림을, 변동성 타겟팅은 고변동 국면 노출을, MDD 킬스위치는
+          파국적 낙폭을 제한합니다.
+        </p>
+        {risk && (
+          <>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <PctField
+                label="종목 집중 한도 %"
+                value={riskPct("max_position_pct")}
+                onChange={(v) => setRiskPct("max_position_pct", v)}
+              />
+              <PctField
+                label="목표 변동성 % (연)"
+                value={riskPct("target_vol")}
+                onChange={(v) => setRiskPct("target_vol", v)}
+              />
+              <PctField
+                label="MDD 킬스위치 %"
+                value={riskPct("mdd_kill_pct")}
+                onChange={(v) => setRiskPct("mdd_kill_pct", v)}
+              />
+              {risk.target_vol != null && (
+                <>
+                  <NumField
+                    label="변동성 룩백(거래일)"
+                    min={5}
+                    max={120}
+                    value={risk.vol_lookback ?? 20}
+                    onChange={(v) => patchRisk({ vol_lookback: v })}
+                  />
+                  <NumField
+                    label="최대 투자비중(≤1)"
+                    min={0.1}
+                    max={1}
+                    step={0.05}
+                    value={risk.max_leverage ?? 1.0}
+                    onChange={(v) => patchRisk({ max_leverage: v })}
+                  />
+                </>
+              )}
+              {risk.mdd_kill_pct != null && (
+                <NumField
+                  label="킬 쿨다운(거래일)"
+                  min={1}
+                  max={250}
+                  value={risk.mdd_rearm_days ?? 20}
+                  onChange={(v) => patchRisk({ mdd_rearm_days: v })}
+                />
+              )}
+            </div>
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              <b className="text-muted-foreground">집중 한도</b>는 드리프트 밴드(
+              {Number((config.drift_band_pct * 100).toFixed(2))}%)보다 커야 진입이 발생합니다.
+              <b className="text-muted-foreground"> 변동성 타겟팅</b>은 실현변동성이 목표를 넘으면
+              투자비중을 줄이며(차입 없음, 확대는 안 함), <b className="text-muted-foreground">킬스위치</b>는
+              고점 대비 낙폭이 임계를 넘으면 전량 청산 후 쿨다운 뒤 재가동합니다.
             </p>
           </>
         )}

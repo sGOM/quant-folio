@@ -274,12 +274,14 @@ def _targets_at(
                 for code, v in fac["vol_ann"].items()
                 if v is not None and not (isinstance(v, float) and math.isnan(v))
             }
-        return compute_target_weights({}, config, scores=scores, vols=vols)
+        weights = compute_target_weights({}, config, scores=scores, vols=vols)
+        return _apply_risk_caps(weights, hist, config.get("risk_layer") or {})
 
     price_history = {
         sym: hist[sym].dropna() for sym in universe if sym in hist.columns
     }
-    return compute_target_weights(price_history, config)
+    weights = compute_target_weights(price_history, config)
+    return _apply_risk_caps(weights, hist, config.get("risk_layer") or {})
 
 
 def _trade_rec(
@@ -447,6 +449,78 @@ def _vol_slippage_map(
     }
 
 
+def _cap_position_weights(targets: dict[str, float], cap: float) -> dict[str, float]:
+    """단일 종목 목표비중을 cap 으로 제한하고 초과분을 상한 미만 종목에 비례 재분배한다.
+
+    재분배로 다시 상한을 넘으면 반복하며, 재분배 여력(상한 미만 종목)이 없으면 남는
+    비중은 현금으로 둔다(합<1). n+1 회로 반복을 제한해 종료를 보장한다.
+    """
+    if cap >= 1.0 or not targets:
+        return targets
+    w = dict(targets)
+    for _ in range(len(w) + 1):
+        excess = sum(v - cap for v in w.values() if v > cap + 1e-12)
+        if excess <= 1e-12:
+            break
+        for s in list(w):
+            if w[s] > cap:
+                w[s] = cap
+        under = {s: v for s, v in w.items() if v < cap - 1e-12}
+        pool = sum(under.values())
+        if pool <= 1e-12:
+            break  # 재분배 여력 없음 → 초과분은 현금
+        for s in under:
+            w[s] += excess * under[s] / pool
+    return w
+
+
+def _portfolio_vol_ann(
+    hist: pd.DataFrame, weights: dict[str, float], lookback: int
+) -> float | None:
+    """목표비중 포트폴리오의 최근 lookback 봉 실현변동성(연율)을 공분산 기반으로 추정한다.
+
+    σ_p = sqrt(wᵀ Σ w × 252). Σ 는 일간수익 공분산(pairwise 결측 대응). 유효 관측이
+    부족하거나 분산이 비양수면 None. 미래참조 방지를 위해 hist(=panel.loc[:d]) 만 쓴다.
+    """
+    syms = [s for s in weights if s in hist.columns and weights[s] > 0]
+    if not syms:
+        return None
+    rets = hist[syms].pct_change().tail(lookback)
+    if len(rets) < max(10, lookback // 2):
+        return None
+    cov = rets.cov().to_numpy(dtype=float)
+    w = np.array([weights[s] for s in syms], dtype=float)
+    if np.isnan(cov).any():
+        cov = np.nan_to_num(cov)  # 잔여 결측(짝없음)은 0 공분산으로
+    var_daily = float(w @ cov @ w)
+    if not (var_daily > 0):
+        return None
+    return math.sqrt(var_daily * 252.0)
+
+
+def _apply_risk_caps(
+    targets: dict[str, float], hist: pd.DataFrame, risk: dict
+) -> dict[str, float]:
+    """목표비중에 리스크 레이어(집중 한도→변동성 타겟팅)를 적용한다(P1-2).
+
+    MDD 킬스위치는 일별 자산가치가 필요하므로 여기가 아니라 시뮬레이션 루프에서 처리한다.
+    """
+    if not targets or not risk:
+        return targets
+    cap = risk.get("max_position_pct")
+    if cap:
+        targets = _cap_position_weights(targets, float(cap))
+    tv = risk.get("target_vol")
+    if tv:
+        vol = _portfolio_vol_ann(hist, targets, int(risk.get("vol_lookback", 20) or 20))
+        if vol and vol > 0:
+            max_lev = float(risk.get("max_leverage", 1.0) or 1.0)
+            scale = min(max_lev, float(tv) / vol)
+            if scale < 1.0 - 1e-9:  # 디레버리징(비중 축소)만 적용, 확대는 max_lev 로 캡
+                targets = {s: w * scale for s, w in targets.items()}
+    return targets
+
+
 def _safe(x) -> float | None:
     """NaN/inf → None(JSON 안전)."""
     try:
@@ -536,7 +610,9 @@ def run_rebalance_backtest(
         초과 기준으로 산출한다(기본 rf=0).
     :return: {total_return, mdd, sharpe, sortino, cagr, alpha, beta, information_ratio,
         tracking_error, benchmark_return, excess_return, win_rate, num_trades,
-        num_rebalances, avg_turnover, equity_curve, markers, holdings, trades} — JSON.
+        num_rebalances, num_kills, avg_turnover, equity_curve, markers, holdings, trades}
+        — JSON. num_kills 는 MDD 킬스위치(risk_layer) 발동 횟수. 리스크 레이어(집중 한도·
+        변동성 타겟팅)는 목표비중에 반영되며 markers 에 'mdd_exit' 로 킬스위치 청산이 남는다.
     """
     panel = _normalize_index(close_panel).ffill()
     if panel.empty:
@@ -560,6 +636,13 @@ def run_rebalance_backtest(
     slip_vol_scale = max(0.0, float(config.get("slippage_vol_scale", 0.0) or 0.0))
     rf_annual = float(config.get("risk_free_rate", 0.0) or 0.0)  # 위험조정지표용 무위험수익률(연)
 
+    # 리스크 레이어(P1-2) — MDD 킬스위치 파라미터(집중 한도·변동성 타겟팅은 _targets_at
+    # 에서 목표비중에 반영된다). mdd_kill_pct 가 None 이면 킬스위치 비활성.
+    risk_layer = config.get("risk_layer") or {}
+    _mkp = risk_layer.get("mdd_kill_pct")
+    mdd_kill_pct = float(_mkp) if _mkp else None
+    mdd_rearm_days = int(risk_layer.get("mdd_rearm_days", 20) or 20)
+
     # 현금화 오버레이(레짐 필터) 준비
     rf = config.get("regime_filter") or {}
     regime_on: pd.Series | None = None
@@ -579,6 +662,10 @@ def run_rebalance_backtest(
     cost: dict[str, float] = {}   # 종목→원가 누적 투자액(포지션 수익률용)
     prev_prices: pd.Series | None = None
     prev_risk_off = False  # 직전일 레짐 상태(risk-off→risk-on 전환 즉시 재진입 판정용)
+    hwm = 1.0              # 고점(High-Water Mark) — MDD 킬스위치 기준선
+    killed = False         # 킬스위치 발동(현금 대피) 상태
+    kill_idx = -1          # 발동 시점(sim_dates 인덱스, 쿨다운 계산용)
+    num_kills = 0          # 킬스위치 발동 횟수
 
     equities_norm: list[float] = []   # 일별 종가 시점(리밸런싱 반영 후) 총자산
     equity_curve: list[dict] = []
@@ -606,7 +693,8 @@ def run_rebalance_backtest(
             )
             if turnover > 0:
                 turnovers.append(turnover)
-                markers.append({"t": d.isoformat(), "type": "regime_exit"})
+                mk = "mdd_exit" if decision["reason"] == "mdd_kill" else "regime_exit"
+                markers.append({"t": d.isoformat(), "type": mk})
         else:  # rebalance
             # 체결일 가격이 없는 종목은 제외(매매 불가). next_close 면 체결일 = d.
             targets = {
@@ -631,7 +719,7 @@ def run_rebalance_backtest(
                     })
         return cash
 
-    for d in sim_dates:
+    for i, d in enumerate(sim_dates):
         prices = panel.loc[d]
         # 1) 당일 수익률 반영(보유 종목 평가액 갱신)
         if prev_prices is not None and val:
@@ -647,16 +735,39 @@ def run_rebalance_backtest(
             cash = _run_decision(pending, prices, d, cash)
             pending = None
 
-        # 3) 당일 결정. risk-off 면 청산·현금화, 아니면 정기 리밸런싱/레짐 재진입.
-        #    재진입 게이팅 = (d in rebal_dates) 또는 (risk-on 전환 & 현금). 미래참조 방지:
-        #    선정·목표비중은 d 까지의 데이터(_targets_at 의 panel.loc[:d])만 사용한다.
+        # 3) MDD 킬스위치 상태 갱신(P1-2) — 마크투마켓·지연체결 반영 후 자산가치로 판정.
+        #    고점(HWM) 추적 + 쿨다운 경과 시 재가동(기준선 리셋).
+        cur_equity = cash + sum(val.values())
+        just_rearmed = False
+        if mdd_kill_pct is not None:
+            if cur_equity > hwm:
+                hwm = cur_equity
+            if killed and (i - kill_idx) >= mdd_rearm_days:
+                killed = False           # 쿨다운 경과 → 재가동, 고점 기준선 리셋
+                hwm = cur_equity
+                just_rearmed = True
+
+        # 4) 당일 결정. 우선순위: 킬스위치 발동 → (쿨다운 중 대기) → 레짐 청산 →
+        #    정기 리밸런싱/재진입. 미래참조 방지: 선정·목표비중은 d 까지의 데이터
+        #    (_targets_at 의 panel.loc[:d])만 사용한다.
         risk_off = bool(regime_on is not None and not bool(regime_on.get(d, True)))
         decision: dict | None = None
-        if risk_off and val:
+        if (mdd_kill_pct is not None and not killed
+                and hwm > 0 and cur_equity / hwm - 1.0 <= -mdd_kill_pct):
+            # 고점 대비 낙폭이 임계 초과 → 전량 청산·현금 대피(파국 백스톱).
+            killed = True
+            kill_idx = i
+            num_kills += 1
+            if val:
+                decision = {"kind": "liquidate", "reason": "mdd_kill"}
+        elif killed:
+            pass  # 쿨다운 중 — 신규 매수·재진입 없음(현금 대피 유지)
+        elif risk_off and val:
             decision = {"kind": "liquidate", "reason": "regime_exit"}
         elif not risk_off:
+            # 정기 리밸런싱일이거나, 레짐 회복 재진입이거나, 킬스위치 재가동 직후(현금)면 진입.
             regime_reentry = bool(regime_on is not None and prev_risk_off and not val)
-            if d in rebal_dates or regime_reentry:
+            if d in rebal_dates or regime_reentry or (just_rearmed and not val):
                 targets = _targets_at(d, panel, config, fundamentals_provider, pool_provider)
                 decision = {"kind": "rebalance", "targets": targets, "reason": "rebalance"}
 
@@ -732,6 +843,7 @@ def run_rebalance_backtest(
         "win_rate": None,  # 포트폴리오 전략에는 종목단위 승률 개념이 맞지 않음
         "num_trades": len(trades),
         "num_rebalances": len(turnovers),
+        "num_kills": num_kills,  # MDD 킬스위치 발동 횟수(P1-2)
         "avg_turnover": _safe(np.mean(turnovers)) if turnovers else 0.0,
         "equity_curve": equity_curve,
         "markers": markers,

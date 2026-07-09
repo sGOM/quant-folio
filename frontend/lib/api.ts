@@ -347,6 +347,25 @@ export interface RegimeFilter {
 }
 
 /**
+ * 포트폴리오 리스크 레이어(P1-2). 선정·비중 산정 이후 목표비중에 적용되는 위험 통제.
+ * 각 하위 항목은 개별 optional(미설정=해당 통제 비활성).
+ */
+export interface RiskLayer {
+  /** 단일 종목 목표비중 상한(0~1). 초과분은 상한 미만 종목에 비례 재분배(여력 없으면 현금). drift_band 보다 커야 함. */
+  max_position_pct?: number | null;
+  /** 목표 연율 변동성(예: 0.15=15%). 실현변동성이 넘으면 총투자비중 디레버리징. */
+  target_vol?: number | null;
+  /** 변동성 타겟팅용 실현변동성 측정 거래일. */
+  vol_lookback?: number;
+  /** 변동성 타겟팅 총투자비중 상한(≤1.0=차입 없음). */
+  max_leverage?: number;
+  /** 고점 대비 낙폭 킬스위치 임계(예: 0.25=−25%). 초과 시 전량 청산·현금화. */
+  mdd_kill_pct?: number | null;
+  /** 킬스위치 발동 후 재가동까지 쿨다운 거래일. */
+  mdd_rearm_days?: number;
+}
+
+/**
  * 주기적 포트폴리오 리밸런싱 전략. 단일 종목 전략과 달리 다종목 universe 를
  * 운용하며 BaseConfig(종목·리스크 청산)를 상속하지 않는다.
  */
@@ -368,6 +387,8 @@ export interface RebalanceConfig {
   drift_band_pct: number;
   /** 현금화 오버레이(레짐 필터). null/미설정이면 미적용(항상 100% 투자). */
   regime_filter?: RegimeFilter | null;
+  /** 포트폴리오 리스크 레이어(집중 한도·변동성 타겟팅·MDD 킬스위치). null/미설정이면 미적용. */
+  risk_layer?: RiskLayer | null;
   /** 이 전략이 운용할 배정 자본(원). */
   capital: number;
   /** 위탁수수료율. */
@@ -514,6 +535,8 @@ export interface BacktestResult {
   num_trades: number;
   /** 리밸런싱 실행 횟수(리밸런싱 백테스트). */
   num_rebalances?: number;
+  /** MDD 킬스위치(risk_layer) 발동 횟수(리밸런싱 백테스트). */
+  num_kills?: number;
   /** 평균 회전율 Σ|Δw|(리밸런싱 백테스트). */
   avg_turnover?: number | null;
   equity_curve: { t: string; v: number }[];

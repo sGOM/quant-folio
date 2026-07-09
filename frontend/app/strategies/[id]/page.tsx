@@ -336,6 +336,11 @@ function StrategyDetailContent({ sid }: { sid: number }) {
                 <p className="mt-2 text-xs text-muted-foreground">
                   리밸런싱 {latest.result.num_rebalances ?? 0}회 · 평균 회전율{" "}
                   {pct(latest.result.avg_turnover)}
+                  {latest.result.num_kills != null && latest.result.num_kills > 0 && (
+                    <span className="text-amber-600 dark:text-amber-400">
+                      {" "}· MDD 킬스위치 {latest.result.num_kills}회 발동
+                    </span>
+                  )}
                 </p>
               )}
             </div>
@@ -443,16 +448,18 @@ function StrategyDetailContent({ sid }: { sid: number }) {
                                   className={
                                     tr.side === "buy"
                                       ? "text-red-500"
-                                      : tr.reason === "regime_exit"
+                                      : tr.reason === "regime_exit" || tr.reason === "mdd_kill"
                                         ? "text-amber-500"
                                         : "text-blue-500"
                                   }
                                 >
                                   {tr.side === "buy"
                                     ? "매수"
-                                    : tr.reason === "regime_exit"
-                                      ? "청산"
-                                      : "매도"}
+                                    : tr.reason === "mdd_kill"
+                                      ? "킬스위치"
+                                      : tr.reason === "regime_exit"
+                                        ? "청산"
+                                        : "매도"}
                                 </span>
                               </td>
                               <td className="py-1 text-right">

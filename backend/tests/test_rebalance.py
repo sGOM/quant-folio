@@ -7,12 +7,16 @@ import pandas as pd
 import pytest
 
 from app.services.backtest.portfolio import (
+    _apply_risk_caps,
+    _cap_position_weights,
     _dynamic_universe,
+    _portfolio_vol_ann,
     _regime_on_flags,
     _score_factor_frame,
     _targets_at,
     run_rebalance_backtest,
 )
+from app.schemas.strategy import RebalanceConfig
 from engine import rebalance, rebalance_runner
 from engine.rebalance import (
     INVERSE_VOL_MAX_WEIGHT,
@@ -673,6 +677,9 @@ def _reentry_cfg() -> dict:
         "rebalance_dom": 1,
         "capital": 1_000_000,
         "drift_band_pct": 0.0,
+        # 재진입 '타이밍'(청산·회복 당일 체결)을 결정적으로 검증하기 위해 당일 종가 체결을
+        # 쓴다(기본 next_close 는 체결이 익일로 밀려 day0/day14 단정과 어긋난다).
+        "fill_mode": "same_close",
         "regime_filter": {"enabled": True, "ma_period": 5, "index": "KOSPI"},
     }
 
@@ -1097,3 +1104,93 @@ def _async(value):
         return value
 
     return _coro()
+
+
+# ───────────────────── 리스크 레이어(P1-2) ─────────────────────
+
+
+def test_cap_position_weights_redistributes_excess():
+    """단일 종목 상한 초과분을 상한 미만 종목에 비례 재분배(합 보존)."""
+    capped = _cap_position_weights({"A": 0.6, "B": 0.2, "C": 0.2}, 0.4)
+    assert abs(capped["A"] - 0.4) < 1e-9
+    assert abs(capped["B"] - 0.3) < 1e-9 and abs(capped["C"] - 0.3) < 1e-9
+    assert abs(sum(capped.values()) - 1.0) < 1e-9
+
+
+def test_cap_position_weights_excess_to_cash_when_no_room():
+    """모든 종목이 상한이면 초과분은 현금(합<1)."""
+    capped = _cap_position_weights({"A": 0.5, "B": 0.5}, 0.3)
+    assert all(v <= 0.3 + 1e-9 for v in capped.values())
+    assert sum(capped.values()) < 1.0 - 1e-9
+
+
+def test_portfolio_vol_ann_orders_by_risk():
+    """공분산 기반 연율 변동성이 고변동 종목에서 더 크다."""
+    rng = np.random.default_rng(0)
+    idx = pd.bdate_range("2023-01-01", periods=120)
+    hist = pd.DataFrame({
+        "LOW": 100 * np.exp(np.cumsum(rng.normal(0, 0.005, len(idx)))),
+        "HIGH": 100 * np.exp(np.cumsum(rng.normal(0, 0.04, len(idx)))),
+    }, index=idx)
+    assert _portfolio_vol_ann(hist, {"HIGH": 1.0}, 60) > _portfolio_vol_ann(hist, {"LOW": 1.0}, 60)
+
+
+def test_apply_risk_caps_vol_target_deleverages_only():
+    """변동성 타겟팅은 고변동 포트를 디레버리징하고 저변동 포트는 확대하지 않는다."""
+    rng = np.random.default_rng(1)
+    idx = pd.bdate_range("2023-01-01", periods=120)
+    hist = pd.DataFrame({
+        "LOW": 100 * np.exp(np.cumsum(rng.normal(0, 0.005, len(idx)))),
+        "HIGH": 100 * np.exp(np.cumsum(rng.normal(0, 0.04, len(idx)))),
+    }, index=idx)
+    risk = {"target_vol": 0.10, "vol_lookback": 60, "max_leverage": 1.0}
+    assert sum(_apply_risk_caps({"HIGH": 1.0}, hist, risk).values()) < 1.0 - 1e-6
+    assert abs(sum(_apply_risk_caps({"LOW": 1.0}, hist, risk).values()) - 1.0) < 1e-6
+
+
+def _kill_cfg(risk: dict | None) -> dict:
+    return {
+        "universe": ["A", "B"],
+        "selection": {"method": "all"},
+        "cadence": "monthly",
+        "rebalance_dom": 1,
+        "capital": 1_000_000,
+        "drift_band_pct": 0.0,
+        "fill_mode": "same_close",
+        "risk_layer": risk,
+    }
+
+
+def test_mdd_kill_switch_fires_and_reports():
+    """고점 대비 낙폭이 임계를 넘으면 킬스위치가 발동해 현금화하고 num_kills 로 노출된다."""
+    dates = pd.bdate_range("2024-01-01", periods=30)
+    # A·B 동일비중(50/50)에서 포트폴리오 낙폭이 25% 를 넘도록 A 를 -60% 급락시킨다
+    # (포트 ≈ 0.5×(-0.6) = -30%) 후 반등 — 킬스위치 발동을 유도.
+    a = [100.0] * 2 + [40.0] * 3 + [120.0] * 25
+    panel = pd.DataFrame({"A": a, "B": [100.0] * 30}, index=dates)
+    res = run_rebalance_backtest(panel, _kill_cfg({"mdd_kill_pct": 0.25, "mdd_rearm_days": 3}),
+                                 dates[0], dates[-1])
+    assert res["num_kills"] >= 1
+    assert any(m["type"] == "mdd_exit" for m in res["markers"])
+
+
+def test_mdd_kill_switch_inert_when_threshold_deep():
+    """임계가 자연 낙폭보다 깊으면 킬스위치는 발동하지 않고 결과에 영향이 없다."""
+    dates = pd.bdate_range("2024-01-01", periods=30)
+    a = [100.0] * 2 + [90.0] * 3 + [110.0] * 25  # 최대 낙폭 ~10%
+    panel = pd.DataFrame({"A": a, "B": [100.0] * 30}, index=dates)
+    base = run_rebalance_backtest(panel, _kill_cfg(None), dates[0], dates[-1])
+    deep = run_rebalance_backtest(panel, _kill_cfg({"mdd_kill_pct": 0.50}), dates[0], dates[-1])
+    assert deep["num_kills"] == 0
+    assert abs(deep["total_return"] - base["total_return"]) < 1e-9
+
+
+def test_max_position_pct_must_exceed_drift_band():
+    """집중 한도가 drift_band 이하이면 진입이 갇히므로 스키마가 거부한다."""
+    with pytest.raises(ValueError):
+        RebalanceConfig(
+            universe=["005930", "000660", "035420"],
+            selection={"method": "momentum", "top_n": 3, "lookback": 60},
+            drift_band_pct=0.05,
+            risk_layer={"max_position_pct": 0.05},
+        )

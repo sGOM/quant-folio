@@ -216,11 +216,21 @@ class RebalanceRunner:
         # "inverse_vol" 이면 method 무관하게 필요 — compute_target_weights 가 vols 미주입 시
         # price_history 로 변동성을 산출한다. 백테스트의 _compute_vol_ann(tail(253))과
         # 동일 정의를 맞추려면 최소 253봉을 확보해야 한다).
-        need_hist = bool(rule.get("type")) or method in ("momentum", "custom", "all") or weighting == "inverse_vol"
+        # 리스크 레이어(P1-2) 변동성 타겟팅도 종가 히스토리를 요구한다(vol_lookback 봉+1).
+        risk = self._cfg.get("risk_layer") or {}
+        want_vol_target = bool(risk.get("target_vol"))
+        need_hist = (
+            bool(rule.get("type"))
+            or method in ("momentum", "custom", "all")
+            or weighting == "inverse_vol"
+            or want_vol_target
+        )
         if need_hist:
             min_bars = int(rule.get("lookback", 0)) + 1 if rule.get("type") else 0
             if weighting == "inverse_vol":
                 min_bars = max(min_bars, 253)
+            if want_vol_target:
+                min_bars = max(min_bars, int(risk.get("vol_lookback", 20) or 20) + 1)
             history = await self._seed_history(pool, min_bars=min_bars)
 
         # 동적 유니버스: 상대강도 상위 pick 으로 후보풀 축소(백테스트 _dynamic_universe 동일).
@@ -240,6 +250,13 @@ class RebalanceRunner:
                 compute_universe_scores, universe, as_of, factor_weights
             )
         targets = compute_target_weights(history, cfg, scores=scores)
+        # 리스크 레이어(P1-2): 종목 집중 한도·변동성 타겟팅을 목표비중에 적용(백테스트
+        # _targets_at 와 동일 로직 재사용). MDD 킬스위치는 계좌 고점(HWM) 상태 지속이
+        # 필요해 백테스트 전용이다(러너 미적용 — 후속 과제).
+        if risk and targets:
+            from app.services.backtest.portfolio import _apply_risk_caps
+
+            targets = _apply_risk_caps(targets, pd.DataFrame(history), risk)
         return pool, targets
 
     async def preview(self) -> dict:
