@@ -330,8 +330,48 @@ DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
 }
 
 
+def _neutralize_size(df: pd.DataFrame, factor_cols: list[str]) -> pd.DataFrame:
+    """각 팩터 카테고리 z-score 를 로그 시가총액 축에 대해 직교화한다(사이즈 중립화, P1-3).
+
+    residual = s − β·x, β = Σ(s·x)/Σ(x²), x = 표준화(로그 시총, 평균 0). 팩터 점수에서
+    선형 사이즈 노출을 제거해 '팩터가 사실상 대형/소형주 베팅으로 변질'되는 것을 막는다.
+    df["market_cap"](원) 이 없거나 유효 표본<5 면 원본을 그대로 둔다(중립화 생략). NaN 인
+    팩터/시총 행은 보존한다(랭킹 제외 로직 유지). df 를 제자리 수정하고 반환한다.
+    """
+    cap = df.get("market_cap")
+    if cap is None:
+        return df
+    logcap = np.log(cap.where(cap > 0).astype(float))
+    sd = logcap.std(ddof=0)
+    if not (sd > 0):
+        return df
+    x = (logcap - logcap.mean()) / sd   # 표준화 로그 시총(평균 0)
+    valid = x.notna()
+    if int(valid.sum()) < 5:
+        return df
+    xv = x[valid]
+    denom = float((xv ** 2).sum())
+    if not (denom > 0):
+        return df
+    for col in factor_cols:
+        if col not in df.columns:
+            continue
+        s = df[col]
+        # 팩터·시총 모두 유효한 행에서만 β 추정·잔차화(팩터 NaN 행은 건드리지 않음).
+        m = valid & s.notna()
+        if int(m.sum()) < 5:
+            continue
+        sv = s[m]
+        xm = x[m]
+        beta = float((sv * xm).sum() / denom)
+        df.loc[m, col] = sv - beta * xm
+    return df
+
+
 def _compute_stock_scores(
-    df: pd.DataFrame, weights: dict[str, float] | None = None
+    df: pd.DataFrame,
+    weights: dict[str, float] | None = None,
+    neutralize: str = "none",
 ) -> pd.DataFrame:
     """후보 종목 데이터프레임에 종합 점수(score, score_*) 컬럼을 추가한다.
 
@@ -424,21 +464,29 @@ def _compute_stock_scores(
     ).fillna(0.0)
     score_growth = pd.concat([z_opg, z_netg, z_turn], axis=1).mean(axis=1)
 
-    # ── 종합 점수 ──
-    score = (
-        w.get("momentum", DEFAULT_FACTOR_WEIGHTS["momentum"]) * score_momentum
-        + w.get("value", DEFAULT_FACTOR_WEIGHTS["value"]) * score_value
-        + w.get("lowvol", DEFAULT_FACTOR_WEIGHTS["lowvol"]) * score_lowvol
-        + w.get("quality", DEFAULT_FACTOR_WEIGHTS["quality"]) * score_quality
-        + w.get("growth", DEFAULT_FACTOR_WEIGHTS["growth"]) * score_growth
-    )
+    # 카테고리 점수를 프레임에 싣는다(중립화·종합점수 산출의 기준).
+    result["score_momentum"] = score_momentum
+    result["score_value"] = score_value
+    result["score_lowvol"] = score_lowvol
+    result["score_quality"] = score_quality
+    result["score_growth"] = score_growth
 
-    result["score_momentum"] = score_momentum.round(4)
-    result["score_value"] = score_value.round(4)
-    result["score_lowvol"] = score_lowvol.round(4)
-    result["score_quality"] = score_quality.round(4)
-    result["score_growth"] = score_growth.round(4)
+    # ── 팩터 중립화(P1-3): 종합 전에 각 카테고리 점수를 지정 축에 직교화한다 ──
+    cat_cols = ["score_momentum", "score_value", "score_lowvol", "score_quality", "score_growth"]
+    if neutralize == "size":
+        result = _neutralize_size(result, cat_cols)
+
+    # ── 종합 점수(중립화 후 카테고리 점수로 합성) ──
+    score = (
+        w.get("momentum", DEFAULT_FACTOR_WEIGHTS["momentum"]) * result["score_momentum"]
+        + w.get("value", DEFAULT_FACTOR_WEIGHTS["value"]) * result["score_value"]
+        + w.get("lowvol", DEFAULT_FACTOR_WEIGHTS["lowvol"]) * result["score_lowvol"]
+        + w.get("quality", DEFAULT_FACTOR_WEIGHTS["quality"]) * result["score_quality"]
+        + w.get("growth", DEFAULT_FACTOR_WEIGHTS["growth"]) * result["score_growth"]
+    )
     result["score"] = score.round(4)
+    for c in cat_cols:
+        result[c] = result[c].round(4)
 
     return result
 
@@ -450,6 +498,7 @@ def compute_universe_scores(
     symbols: list[str],
     as_of: date,
     factor_weights: dict[str, float] | None = None,
+    neutralize: str = "none",
 ) -> dict[str, float]:
     """리밸런싱 selection.method="score" 전용: 지정 종목들의 종합점수를 계산한다.
 
@@ -525,7 +574,21 @@ def compute_universe_scores(
             if col in qdf.columns:
                 df[col] = qdf[col].reindex(df.index)
 
-    scored = _compute_stock_scores(df, weights=factor_weights)
+    # 사이즈 중립화(P1-3): 시가총액(PIT)을 붙여 스코어러가 로그 시총 축에 직교화한다.
+    if neutralize == "size":
+        try:
+            from app.services.data import krx_index
+
+            caps = krx_index.market_caps(as_of)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("사이즈 중립화용 시가총액 조회 실패 — 중립화 생략: %s", e)
+            caps = {}
+        if caps:
+            df["market_cap"] = pd.Series(
+                {c: caps.get(c) for c in df.index}, dtype="float64"
+            ).reindex(df.index)
+
+    scored = _compute_stock_scores(df, weights=factor_weights, neutralize=neutralize)
     return {
         code: float(val)
         for code, val in scored["score"].items()

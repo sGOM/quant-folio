@@ -171,3 +171,72 @@ def test_annual_metrics_caches_and_falls_back_to_ofs(monkeypatch):
     m2 = opendart.annual_metrics("00999999", 2024)
     assert m2 == m1
     assert fetched == []
+
+
+# ───────────────────── 사이즈 중립화(P1-3) ─────────────────────
+
+
+def test_neutralize_size_removes_market_cap_exposure():
+    """_neutralize_size 는 팩터 점수에서 로그 시총 선형노출을 제거한다(상관≈0)."""
+    rng = np.random.default_rng(0)
+    n = 60
+    codes = [f"{i:06d}" for i in range(n)]
+    cap = np.exp(rng.normal(28, 1.5, n))
+    logz = (np.log(cap) - np.log(cap).mean()) / np.log(cap).std()
+    df = pd.DataFrame(
+        {"score_momentum": 0.8 * logz + 0.6 * rng.normal(0, 1, n), "market_cap": cap},
+        index=codes,
+    )
+    before = np.corrcoef(df["score_momentum"], logz)[0, 1]
+    metrics._neutralize_size(df, ["score_momentum"])
+    after = np.corrcoef(df["score_momentum"], logz)[0, 1]
+    assert abs(before) > 0.5 and abs(after) < 1e-6
+
+
+def test_neutralize_size_preserves_factor_nan():
+    """팩터 NaN(랭킹 제외)·시총 결측 행을 보존한다."""
+    codes = [f"{i:06d}" for i in range(8)]
+    df = pd.DataFrame(
+        {
+            "score_value": [1.0, -0.5, np.nan, 0.3, 0.8, -1.2, 0.1, np.nan],
+            "market_cap": [1e12, 2e12, 3e12, np.nan, 5e12, 6e12, 7e12, 8e12],
+        },
+        index=codes,
+    )
+    nan_mask = df["score_value"].isna()
+    metrics._neutralize_size(df, ["score_value"])
+    assert df["score_value"].isna().equals(nan_mask)
+
+
+def test_neutralize_size_noop_without_market_cap():
+    """market_cap 컬럼이 없으면 원본을 그대로 둔다(중립화 생략)."""
+    df = pd.DataFrame({"score_momentum": [1.0, 2.0, 3.0]}, index=["A", "B", "C"])
+    orig = df["score_momentum"].tolist()
+    metrics._neutralize_size(df, ["score_momentum"])
+    assert df["score_momentum"].tolist() == orig
+
+
+def test_compute_scores_size_neutralize_reduces_size_tilt():
+    """neutralize=size 는 시총에 실린 모멘텀 점수의 시총 상관을 크게 줄인다."""
+    rng = np.random.default_rng(1)
+    n = 50
+    codes = [f"{i:06d}" for i in range(n)]
+    cap = np.exp(rng.normal(28, 1.5, n))
+    logz = (np.log(cap) - np.log(cap).mean()) / np.log(cap).std()
+    df = pd.DataFrame(
+        {
+            "mom_1m": 0.3 * logz + rng.normal(0, 0.02, n),
+            "mom_3m": 0.3 * logz + rng.normal(0, 0.03, n),
+            "mom_6m": 0.05 * logz + rng.normal(0, 0.05, n),
+            "high_52w_ratio": 0.9 + 0.05 * logz + rng.normal(0, 0.02, n),
+            "vol_ann": rng.uniform(0.2, 0.5, n),
+            "mdd_252": -rng.uniform(0.1, 0.4, n),
+            "market_cap": cap,
+        },
+        index=codes,
+    )
+    plain = metrics._compute_stock_scores(df.copy(), neutralize="none")
+    neut = metrics._compute_stock_scores(df.copy(), neutralize="size")
+    c_plain = abs(np.corrcoef(plain["score_momentum"], logz)[0, 1])
+    c_neut = abs(np.corrcoef(neut["score_momentum"], logz)[0, 1])
+    assert c_plain > 0.5 and c_neut < 0.01

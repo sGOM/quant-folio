@@ -306,6 +306,11 @@ export interface RebalanceSelection {
   top_n: number;
   /** method="score": 종합점수 카테고리 가중치(합=1.0). */
   factor_weights?: FactorWeights;
+  /**
+   * method="score": 팩터 중립화 축(P1-3). "none"(기본) / "size"(시가총액 중립화 →
+   * 각 팩터를 로그 시총 축에 직교화해 대형/소형주 베팅으로 변질되는 것을 막음).
+   */
+  neutralize?: "none" | "size";
   /** method="custom": 편입(매수) 논리식. 각 종목에 독립 적용. */
   entry?: ConditionGroup;
   /** method="custom": 청산(매도) 논리식. 각 종목에 독립 적용. */

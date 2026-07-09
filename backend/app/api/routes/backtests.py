@@ -138,6 +138,30 @@ def _fundamentals_provider(as_of_date, codes):
     return fdf.join(qdf, how="left")
 
 
+def _fundamentals_provider_with_market_cap(as_of_date, codes):
+    """_fundamentals_provider 결과에 as_of 시점 시가총액(원) 컬럼을 덧붙인다(사이즈 중립화용).
+
+    krx_index.market_caps(PIT)를 재사용한다. 미인증/실패로 시총이 비면 컬럼을 붙이지
+    않으므로 스코어러가 중립화를 자연히 생략한다(순수 팩터 그대로).
+    """
+    from app.services.data import krx_index
+
+    fdf = _fundamentals_provider(as_of_date, codes)
+    norm_codes = [str(c).zfill(6) for c in codes]
+    try:
+        caps = krx_index.market_caps(as_of_date)
+    except Exception:  # noqa: BLE001
+        caps = {}
+    if not caps:
+        return fdf
+    cap_series = pd.Series({c: caps.get(c) for c in norm_codes}, dtype="float64")
+    if fdf is None:
+        return cap_series.to_frame("market_cap")
+    fdf = fdf.copy()
+    fdf["market_cap"] = cap_series.reindex(fdf.index)
+    return fdf
+
+
 def _build_pit_pool(config: dict, start, end):
     """universe_rule.source 가 지수명이면 (합집합 universe, pool_provider) 를 만든다.
 
@@ -223,6 +247,10 @@ async def _run_rebalance_backtest(
     panel = pd.DataFrame(columns)
     method = config.get("selection", {}).get("method", "momentum")
     provider = _fundamentals_provider if method == "score" else None
+    # 사이즈 중립화(P1-3): 시가총액(PIT)을 펀더멘털 프레임에 실어 스코어러가 각 팩터를
+    # 로그 시총 축에 직교화하게 한다. 중립화가 꺼진 전략에는 추가 조회를 하지 않는다.
+    if provider is not None and config.get("selection", {}).get("neutralize") == "size":
+        provider = _fundamentals_provider_with_market_cap
 
     # 현금화 오버레이(레짐 필터): 켜져 있으면 기준지수 종가 시리즈를 적재해 주입한다.
     regime_series = None
