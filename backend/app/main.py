@@ -11,6 +11,7 @@ from app.api.routes import (
     engine,
     kis,
     metrics,
+    recommend,
     screener,
     strategies,
     symbols,
@@ -54,6 +55,7 @@ app.include_router(engine.router)
 app.include_router(trading.router)
 app.include_router(symbols.router)
 app.include_router(metrics.router)
+app.include_router(recommend.router)
 app.include_router(screener.router)
 app.include_router(ws.router)
 

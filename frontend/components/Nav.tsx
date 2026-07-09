@@ -13,6 +13,7 @@ import {
   Share2,
   BarChart3,
   TrendingUp,
+  Sparkles,
 } from "lucide-react";
 import { useLogout } from "@/lib/useAuth";
 import { GlossaryDrawer } from "@/components/GlossaryDrawer";
@@ -26,6 +27,7 @@ const LINKS = [
   { href: "/strategies/shared", label: "공유 전략", icon: Share2 },
   { href: "/monitor", label: "실시간", icon: Activity },
   { href: "/metrics", label: "지표", icon: BarChart3 },
+  { href: "/recommend", label: "추천", icon: Sparkles },
   { href: "/screener", label: "스크리너", icon: TrendingUp },
   { href: "/settings", label: "설정", icon: Settings },
 ];
