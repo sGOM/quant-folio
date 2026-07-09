@@ -429,6 +429,56 @@ class RegimeFilter(BaseModel):
     )
 
 
+class RiskLayer(BaseModel):
+    """포트폴리오 리스크 레이어(P1-2) — 선정·비중 산정 이후 적용되는 위험 통제 오버레이.
+
+    selection·weighting 으로 목표비중을 산정한 뒤, 체결 직전에 순서대로 적용된다:
+
+      1) 종목 집중 한도(max_position_pct): 단일 종목 목표비중 상한. 초과분은 상한 미만
+         종목에 비례 재분배하며(재분배로 다시 상한을 넘으면 반복), 재분배 여력이 없으면
+         남는 비중은 현금으로 둔다. 소수 종목 쏠림(idiosyncratic) 리스크를 제한한다.
+      2) 변동성 타겟팅(target_vol): 선정 포트폴리오의 최근 실현변동성(vol_lookback 봉,
+         공분산 기반 연율)을 추정해 목표변동성/실현변동성 비율로 총투자비중(gross)을
+         스케일한다. max_leverage(기본 1.0=차입 없음)로 캡하므로 변동성이 낮아도 100%를
+         넘기지 않고, 변동성이 높으면 비중을 줄여 현금을 늘린다(디레버리징 전용).
+      3) MDD 킬스위치(mdd_kill_pct): 고점(High-Water Mark) 대비 낙폭이 임계를 넘으면
+         전량 청산·현금화하는 파국 방어 서킷브레이커. mdd_rearm_days 거래일 쿨다운 후
+         재가동하며(고점 기준선 리셋), 재진입 자체는 기존 레짐 필터 게이팅을 따른다
+         (레짐=추세 오버레이, 킬스위치=파국 백스톱으로 역할 분리).
+
+    섹터/집중도 한도 중 '섹터 한도'는 신뢰할 수 있는 종목→섹터 매핑 소스가 확보되면
+    추가한다(현재 pykrx 업종 구성종목 API 가 빈 값을 반환해 미구현).
+    """
+    max_position_pct: float | None = Field(
+        default=None, gt=0, le=1,
+        description="단일 종목 목표비중 상한(0~1, 예: 0.10=10%). None=미적용. 초과분은 상한 "
+        "미만 종목에 비례 재분배, 여력 없으면 현금.",
+    )
+    target_vol: float | None = Field(
+        default=None, gt=0, le=2,
+        description="목표 연율 변동성(예: 0.15=15%). None=미적용. 실현변동성이 목표를 넘으면 "
+        "총투자비중을 낮춰 디레버리징(max_leverage 상한까지만, 차입 없음).",
+    )
+    vol_lookback: int = Field(
+        default=20, ge=5, le=120, description="변동성 타겟팅용 실현변동성 측정 거래일",
+    )
+    max_leverage: float = Field(
+        default=1.0, ge=0.1, le=1.0,
+        description="변동성 타겟팅 총투자비중 상한(≤1.0=차입 없음). 변동성이 낮아도 이 값을 "
+        "넘지 않는다.",
+    )
+    mdd_kill_pct: float | None = Field(
+        default=None, gt=0, le=1,
+        description="고점 대비 낙폭 킬스위치 임계(예: 0.25=−25%). None=미적용. 초과 시 전량 "
+        "청산·현금화.",
+    )
+    mdd_rearm_days: int = Field(
+        default=20, ge=1, le=250,
+        description="킬스위치 발동 후 재가동까지 쿨다운 거래일. 경과 후 고점 기준선을 리셋하고 "
+        "재진입은 레짐 게이팅을 따른다.",
+    )
+
+
 class RebalanceConfig(BaseModel):
     """주기적 포트폴리오 리밸런싱 전략.
 
@@ -468,6 +518,11 @@ class RebalanceConfig(BaseModel):
     regime_filter: RegimeFilter | None = Field(
         default=None,
         description="현금화 오버레이(레짐 필터). None 이면 미적용(항상 100% 투자).",
+    )
+    risk_layer: RiskLayer | None = Field(
+        default=None,
+        description="포트폴리오 리스크 레이어(P1-2): 종목 집중 한도·변동성 타겟팅·MDD 킬스위치. "
+        "None 이면 미적용.",
     )
     capital: float = Field(default=10_000_000, gt=0, description="이 전략이 운용할 배정 자본")
     fees: float = Field(default=0.00015, ge=0, le=0.01, description="위탁수수료율")
@@ -565,6 +620,15 @@ class RebalanceConfig(BaseModel):
                             "리밸런싱 커스텀 규칙은 종가 기반 지표만 사용할 수 있습니다"
                             "(open/high/low/volume 불가)."
                         )
+        # 리스크 레이어(P1-2) 집중 한도 가드: 상한이 드리프트 밴드 이하이면 상한으로 눌린
+        # 목표비중이 밴드 안에 갇혀 진입 자체가 발생하지 않는다(현금서 dev=cap≤band → 스킵).
+        if self.risk_layer is not None and self.risk_layer.max_position_pct is not None:
+            if self.risk_layer.max_position_pct <= self.drift_band_pct:
+                raise ValueError(
+                    f"risk_layer.max_position_pct({self.risk_layer.max_position_pct})는 "
+                    f"drift_band_pct({self.drift_band_pct})보다 커야 합니다: 상한이 드리프트 밴드 "
+                    "이하이면 목표비중이 밴드 안에 갇혀 매매가 발생하지 않습니다."
+                )
         if self.cadence == "weekly" and self.rebalance_weekday is None:
             self.rebalance_weekday = 0  # 기본: 월요일
         if self.cadence in ("monthly", "quarterly") and self.rebalance_dom is None:
