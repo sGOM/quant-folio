@@ -522,6 +522,13 @@ class RebalanceConfig(BaseModel):
     rebalance_time: str = Field(
         default="14:30", description="실행 시각 HH:MM (KST), 장 마감 전 체결 여유"
     )
+    initial_fill_immediate: bool = Field(
+        default=False,
+        description="콜드 스타트 즉시 발화. True 면 전략 첫 실행(마지막 실행 기록 없음·보유"
+        " 없음)에 한해 cadence 발화일/시각(rebalance_dom·rebalance_time)을 기다리지 않고"
+        " 장중이면 즉시 1회 리밸런싱한다. 이번 주기의 정기 리밸런싱을 대체(스케줄 소비)하며,"
+        " 레짐 위험회피 국면이면 발동하지 않는다. 이후 주기는 정상 cadence 를 따른다.",
+    )
     drift_band_pct: float = Field(
         default=0.05, ge=0, le=1, description="목표 대비 비중 편차 임계(초과만 매매)"
     )
