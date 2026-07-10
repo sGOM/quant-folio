@@ -31,7 +31,7 @@
                             └──────────────────────┘
 ```
 
-`docker-compose.yml` 의 서비스 6개가 정확히 이 그림이다: `proxy`, `frontend`,
+`docker-compose.yml` 의 서비스 7개가 정확히 이 그림이다: `proxy`, `frontend`,
 `web`, `engine`, `worker`, `db`, `redis`.
 
 ---

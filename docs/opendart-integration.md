@@ -96,7 +96,7 @@
 4. **PIT/룩어헤드** — `announcement_lagged_year`(+분기별 세분: 1Q 5월중순 / 2Q 8월중순
    / 3Q 11월중순 / 4Q 이듬해 3월말)를 백테스트 fundamentals_provider에 반영해, 공시일
    이전 시점엔 해당 실적을 쓰지 않도록 강제.
-5. **팩터 배선** — `app/services/metrics.py::_compute_stock_scores` / `_fetch_fundamentals`
+5. **팩터 배선** — `app/services/metrics/factors.py::_compute_stock_scores` / `metrics/fetch.py::_fetch_fundamentals`
    와 `backtests.py::_fundamentals_provider`에 OpenDART 파생지표를 합류. 새 팩터군(quality)
    또는 기존 value군 확장. **factor_weights 스키마 확장 필요 시** `schemas/strategy.py`.
 6. **전략 정의** — 우량가치(저PBR·저PER + 고ROE·저부채) / 실적상향(영업이익 YoY 서프라이즈

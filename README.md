@@ -89,7 +89,7 @@
 
 ### 데이터 모델 (요약)
 
-`users` · `strategies` · `backtests` · `orders` · `executions` · `positions` · `risk_limits` · `price_ticks`(TimescaleDB hypertable). 자세한 정의는 [`docs/PRD.md` §4](docs/PRD.md)와 `backend/app/models/models.py` 참고.
+`users` · `strategies` · `backtests` · `strategy_likes` · `orders` · `executions` · `positions` · `risk_limits` · `price_ticks`(TimescaleDB hypertable). 자세한 정의는 [`docs/PRD.md` §4](docs/PRD.md)와 `backend/app/models/models.py` 참고.
 
 ---
 
@@ -380,7 +380,7 @@ quant/
 │   │   ├── core/       # 설정·보안·세션·DB·Redis·채널 규약
 │   │   ├── models/     # SQLAlchemy 모델
 │   │   ├── schemas/    # Pydantic 스키마
-│   │   └── services/   # KIS 클라이언트·백테스트·데이터 적재
+│   │   └── services/   # 브로커(kis·toss)·백테스트·metrics(팩터)·data(적재·OpenDART)·screener·recommend
 │   ├── engine/         # 독립 매매 엔진 프로세스
 │   ├── worker/         # Celery 워커
 │   └── alembic/        # DB 마이그레이션
