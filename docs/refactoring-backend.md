@@ -37,22 +37,27 @@
 
 </details>
 
-## 🔴 2. `app/services/metrics.py` (1061줄) 책임 과다
+## 🔴 2. `app/services/metrics.py` (1061줄) 책임 과다 — **완료 ✅**
 
-pykrx 페칭 / 팩터 스코어링 / 섹터 계산 / 종목 계산 / 기술지표 / 종목명 맵을 한 파일이
-전담. 다음으로 분할 제안:
+단일 모듈을 책임별 패키지 `app/services/metrics/`로 분할했다.
 
 ```
 services/metrics/
-  fetch.py      # _fetch_fundamentals/_market_cap/_price_change/_index_* (pykrx)
-  factors.py    # _winsorize_zscore, _neutralize_size, _compute_stock_scores
+  __init__.py   # 전 심볼 재노출(기존 import 경로 보존)
+  common.py     # 영업일/날짜 변환, JSON-safe 숫자, MDD·변동성, _mkts, _pct_dec
+  fetch.py      # _fetch_fundamentals/_market_cap/_price_change/_index_* + 펀더멘털 캐시
+  factors.py    # _winsorize_zscore, _neutralize_size, _compute_stock_scores, compute_universe_scores
   sectors.py    # compute_sectors, _compute_one_sector
   stocks.py     # compute_stocks, _compute_tech_indicators
   names.py      # _build_krx_name_map, _build_name_map
 ```
 
-> 주의: `rebalance_runner.py`가 `_approx_start`, `_fetch_index_ohlcv`, `_last_business_day`,
-> `_ymd`, `compute_universe_scores`를 import 하므로 분할 시 재노출(`__init__.py`) 필요.
+- 외부(라우트·엔진·스크리너·추천·백테스트·테스트)는 기존과 동일하게
+  `from app.services.metrics import X` 로 접근 — `__init__.py`가 전 심볼을 재노출.
+- `factors ↔ stocks` 순환(`compute_universe_scores`가 `_compute_tech_indicators` 사용,
+  `compute_stocks`가 `_compute_stock_scores` 사용)은 `compute_universe_scores` 내부
+  지연 import로 해소.
+- 전체 테스트 223건 통과, 소비 모듈 9개 import 무결.
 
 ## 🟡 3. pykrx per-market 페칭 패턴 중복
 
@@ -84,7 +89,7 @@ try/except 경고 → concat, 빈 프레임 처리" 스켈레톤을 반복. 고�
 ## 진행 로그
 
 - [x] 1. 러너 베이스 클래스 추출 (완료 — 79 테스트 통과)
-- [ ] 2. metrics.py 모듈 분할
+- [x] 2. metrics.py 모듈 분할 (완료 — 패키지화, 223 테스트 통과)
 - [ ] 3. pykrx 페칭 헬퍼
 - [ ] 4. portfolio.py 모듈 분할
 - [ ] 5. 공용 num 유틸
