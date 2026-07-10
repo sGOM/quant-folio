@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import logging
 from datetime import date, timedelta
-from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from app.services.market import is_business_day
+# JSON-safe 숫자 변환은 서비스 공용 유틸로 통합했다. 기존 import 경로
+# (metrics.common / metrics 패키지)를 보존하기 위해 여기서 재노출한다.
+from app.services._num import _is_nan, _safe_bool, _safe_float  # noqa: F401
 
 logger = logging.getLogger("app.services.metrics")
 
@@ -58,34 +60,6 @@ def _ymd(d: date) -> str:
 def _pct_dec(series: pd.Series) -> pd.Series:
     """pykrx 퍼센트 값을 소수로 변환 (1.23% → 0.0123)."""
     return series / 100.0
-
-
-def _safe_float(val: Any) -> float | None:
-    """NaN/None/무한대를 None으로 변환해 JSON-safe float를 반환."""
-    try:
-        v = float(val)
-        if not np.isfinite(v):
-            return None
-        return v
-    except (TypeError, ValueError):
-        return None
-
-
-def _is_nan(val: Any) -> bool:
-    """None 또는 NaN 여부 확인."""
-    if val is None:
-        return True
-    try:
-        return not np.isfinite(float(val))
-    except (TypeError, ValueError):
-        return True
-
-
-def _safe_bool(val: Any) -> bool | None:
-    """NaN/None을 None으로 변환해 bool을 반환한다."""
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return None
-    return bool(val)
 
 
 def _compute_mdd(close: pd.Series) -> float | None:

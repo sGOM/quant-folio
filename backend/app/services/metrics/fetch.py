@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,50 @@ import pandas as pd
 from app.services.data.loader import bounded_socket_timeout  # pykrx 무응답 행 방지
 
 logger = logging.getLogger("app.services.metrics")
+
+
+def _pykrx_stock():
+    """pykrx.stock 모듈을 지연 로딩한다.
+
+    pykrx 임포트는 블로킹이므로 (모듈 import 시점이 아니라) 실제 조회 호출
+    컨텍스트에서만 로딩되도록 지연시킨다. 모든 조회 헬퍼가 이 한 곳을 경유한다.
+    """
+    from pykrx import stock
+
+    return stock
+
+
+def _fetch_per_market(
+    fetch_one: Callable[[Any, str], pd.DataFrame | None],
+    mkts: list[str],
+    *,
+    what: str,
+    when: str,
+    empty_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """시장별 조회를 "루프 → 실패 경고 → concat" 골격으로 일반화한다.
+
+    `fetch_one(stock, mkt)` 이 시장별 DataFrame(또는 None/빈 프레임=건너뜀)을 반환한다.
+    개별 시장 실패는 경고 로그 후 건너뛰고, 전부 실패하면 빈 프레임을 반환한다
+    (`empty_columns` 지정 시 해당 컬럼 스켈레톤).
+
+    :param what: 실패 로그용 데이터 명칭(예: "펀더멘털")
+    :param when: 실패 로그용 기간/일자 표기(예: as_of, "start~end")
+    """
+    stock = _pykrx_stock()
+    frames: list[pd.DataFrame] = []
+    for mkt in mkts:
+        try:
+            df = fetch_one(stock, mkt)
+            if df is None or df.empty:
+                continue
+            frames.append(df)
+        except Exception:
+            logger.warning("%s 조회 실패 (%s %s)", what, mkt, when, exc_info=True)
+
+    if not frames:
+        return pd.DataFrame(columns=empty_columns) if empty_columns else pd.DataFrame()
+    return pd.concat(frames)
 
 # 펀더멘털(PER/PBR/DIV) 프로세스 내 LRU 캐시.
 # 특정 as_of 일자의 전 종목 펀더멘털은 확정 후 변하지 않으므로 (as_of, 시장) 단위로
@@ -45,27 +90,24 @@ def _fetch_fundamentals(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
         _FUND_CACHE.move_to_end(key)  # 최근 사용으로 갱신
         return cached.copy()
 
-    from pykrx import stock  # 블로킹 임포트 지연(스레드 호출 컨텍스트)
+    def _one(stock, mkt: str) -> pd.DataFrame | None:
+        df = stock.get_market_fundamental(as_of_ymd, market=mkt)
+        if df is None or df.empty:
+            return None
+        df = df[["PER", "PBR", "DIV"]].copy()
+        df["market"] = mkt
+        # PER=0 → NaN 처리 (pykrx 는 적자 종목에 0 반환)
+        df.loc[df["PER"] <= 0, "PER"] = np.nan
+        return df
 
-    frames: list[pd.DataFrame] = []
-    for mkt in mkts:
-        try:
-            df = stock.get_market_fundamental(as_of_ymd, market=mkt)
-            if df is None or df.empty:
-                continue
-            df = df[["PER", "PBR", "DIV"]].copy()
-            df["market"] = mkt
-            # PER=0 → NaN 처리 (pykrx 는 적자 종목에 0 반환)
-            df.loc[df["PER"] <= 0, "PER"] = np.nan
-            frames.append(df)
-        except Exception:
-            logger.warning("펀더멘털 조회 실패 (%s %s)", mkt, as_of_ymd, exc_info=True)
-
-    if not frames:
+    result = _fetch_per_market(
+        _one, mkts, what="펀더멘털", when=as_of_ymd,
+        empty_columns=["PER", "PBR", "DIV", "market"],
+    )
+    if result.empty:
         # 빈 결과는 캐시하지 않는다(일시적 조회 실패를 영구화하지 않기 위함).
-        return pd.DataFrame(columns=["PER", "PBR", "DIV", "market"])
+        return result
 
-    result = pd.concat(frames)
     _FUND_CACHE[key] = result.copy()
     _FUND_CACHE.move_to_end(key)
     if len(_FUND_CACHE) > _FUND_CACHE_MAX:
@@ -78,23 +120,15 @@ def _fetch_market_cap(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
 
     컬럼: 시가총액, 상장주식수, 거래대금. 티커 인덱스.
     """
-    from pykrx import stock
+    def _one(stock, mkt: str) -> pd.DataFrame | None:
+        df = stock.get_market_cap(as_of_ymd, market=mkt)
+        if df is None or df.empty:
+            return None
+        # 필요 컬럼만 선택 (버전 차이 대비)
+        cols = [c for c in ["시가총액", "거래량", "거래대금", "상장주식수"] if c in df.columns]
+        return df[cols]
 
-    frames: list[pd.DataFrame] = []
-    for mkt in mkts:
-        try:
-            df = stock.get_market_cap(as_of_ymd, market=mkt)
-            if df is None or df.empty:
-                continue
-            # 필요 컬럼만 선택 (버전 차이 대비)
-            cols = [c for c in ["시가총액", "거래량", "거래대금", "상장주식수"] if c in df.columns]
-            frames.append(df[cols])
-        except Exception:
-            logger.warning("시가총액 조회 실패 (%s %s)", mkt, as_of_ymd, exc_info=True)
-
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames)
+    return _fetch_per_market(_one, mkts, what="시가총액", when=as_of_ymd)
 
 
 def _fetch_price_change(start_ymd: str, end_ymd: str, mkts: list[str]) -> pd.DataFrame:
@@ -103,21 +137,12 @@ def _fetch_price_change(start_ymd: str, end_ymd: str, mkts: list[str]) -> pd.Dat
     컬럼: 시가, 종가, 변동폭, 등락률, 거래량, 거래대금. 티커 인덱스.
     등락률은 pykrx 원값 그대로(%) — 호출자가 /100으로 변환한다.
     """
-    from pykrx import stock
+    def _one(stock, mkt: str) -> pd.DataFrame | None:
+        return stock.get_market_price_change(start_ymd, end_ymd, market=mkt)
 
-    frames: list[pd.DataFrame] = []
-    for mkt in mkts:
-        try:
-            df = stock.get_market_price_change(start_ymd, end_ymd, market=mkt)
-            if df is None or df.empty:
-                continue
-            frames.append(df)
-        except Exception:
-            logger.warning("가격변동 조회 실패 (%s~%s %s)", start_ymd, end_ymd, mkt, exc_info=True)
-
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames)
+    return _fetch_per_market(
+        _one, mkts, what="가격변동", when=f"{start_ymd}~{end_ymd}",
+    )
 
 
 def _fetch_index_ohlcv(start_ymd: str, end_ymd: str, ticker: str) -> pd.DataFrame | None:
@@ -127,7 +152,7 @@ def _fetch_index_ohlcv(start_ymd: str, end_ymd: str, ticker: str) -> pd.DataFram
       시가→open, 고가→high, 저가→low, 종가→close,
       거래량→volume, 거래대금→trading_value
     """
-    from pykrx import stock
+    stock = _pykrx_stock()
 
     try:
         with bounded_socket_timeout(20):
@@ -146,7 +171,7 @@ def _fetch_index_ohlcv(start_ymd: str, end_ymd: str, ticker: str) -> pd.DataFram
 
 def _fetch_index_tickers(date_ymd: str, mkt: str) -> list[str]:
     """업종지수 코드 목록을 반환한다."""
-    from pykrx import stock
+    stock = _pykrx_stock()
 
     try:
         result = stock.get_index_ticker_list(date=date_ymd, market=mkt)
@@ -160,7 +185,7 @@ def _fetch_index_tickers(date_ymd: str, mkt: str) -> list[str]:
 
 def _get_index_name(date_ymd: str, ticker: str) -> str:
     """업종지수 이름을 반환한다. 실패 시 ticker 코드를 반환."""
-    from pykrx import stock
+    stock = _pykrx_stock()
 
     try:
         # pykrx 버전에 따라 인자 형식이 다를 수 있으므로 두 가지 시도

@@ -59,30 +59,34 @@ services/metrics/
   지연 import로 해소.
 - 전체 테스트 223건 통과, 소비 모듈 9개 import 무결.
 
-## 🟡 3. pykrx per-market 페칭 패턴 중복
+## 🟡 3. pykrx per-market 페칭 패턴 중복 — **완료 ✅**
 
-`_fetch_fundamentals` / `_fetch_market_cap` / `_fetch_price_change`가 "시장 루프 →
-try/except 경고 → concat, 빈 프레임 처리" 스켈레톤을 반복. 고차 헬퍼 `_fetch_per_market(fn, mkts, ...)`로
-축약. 흩어진 `from pykrx import stock` 지연 임포트도 `fetch.py` 상단 한 곳으로 모은다.
+`_fetch_fundamentals` / `_fetch_market_cap` / `_fetch_price_change`의 "시장 루프 →
+try/except 경고 → concat, 빈 프레임 처리" 스켈레톤을 고차 헬퍼 `_fetch_per_market(
+fetch_one, mkts, *, what, when, empty_columns)`로 축약했다. `fetch_one(stock, mkt)` 만
+시장별 조회 로직을 담고, 반복·경고·concat·빈 프레임 처리는 헬퍼가 담당한다. 흩어진
+`from pykrx import stock` 지연 임포트는 `_pykrx_stock()` 단일 진입점으로 모아 index
+계열 헬퍼까지 경유하게 했다(블로킹 임포트 지연 특성 유지).
 
-## 🟡 4. `app/services/backtest/portfolio.py` (1007줄) 백테스트 God-module
+## 🟡 4. `app/services/backtest/portfolio.py` (1007줄) 백테스트 God-module — **완료 ✅**
 
-`run_rebalance_backtest` 하나에 리밸런싱 날짜/레짐/팩터 스코어/슬리피지/리스크 캡/
-팩터 귀속/리스크조정 지표가 얽힘. 최소 분리:
+리프 성격의 헬퍼를 책임별 하위 모듈로 분리하고, `portfolio.py`가 재노출해 기존 import
+경로를 보존했다(`rebalance_runner._compute_plan`·검증 스크립트·`test_rebalance` 호환).
 
-- `slippage.py` — `_slip`, `_vol_slippage_map`
+- `slippage.py` — `_vol_slippage_map` (`_slip`은 `_apply_rebalance` 내부 클로저라 잔류)
 - `risk_caps.py` — `_cap_position_weights`, `_portfolio_vol_ann`, `_apply_risk_caps`
-- `attribution.py` — `_factor_attribution`, `_risk_adjusted_metrics`
+- `attribution.py` — `_factor_attribution`, `_risk_adjusted_metrics`, `_FACTOR_SCORE_COLS`
 
-> 주의: `rebalance_runner._compute_plan`이 `_dynamic_universe`, `_apply_risk_caps`를
-> 런타임 import 하므로 경로 유지/재노출 필요.
+`_dynamic_universe`/`_regime_on_flags`/`_score_factor_frame`/`_targets_at` 등 시뮬레이션
+루프와 결합도가 높은 함수는 `portfolio.py`에 유지.
 
-## 🟢 5. 사소한 것들
+## 🟢 5. 사소한 것들 — **완료 ✅**
 
-- `_safe_float`/`_safe`/`_is_nan`/`_safe_bool`가 metrics.py·portfolio.py에 산재 →
-  `app/services/_num.py` 공용 유틸로 통합.
-- `backtests.py`의 `_fundamentals_provider` / `_fundamentals_provider_with_market_cap`은
-  후자가 전자를 감싸는 형태가 자연스러운지 확인.
+- `_safe_float`/`_safe`/`_is_nan`/`_safe_bool`를 `app/services/_num.py` 공용 유틸로 통합.
+  `metrics/common.py`·`backtest/portfolio.py`는 재노출로 기존 경로 유지, `_safe`는
+  `_safe_float` 별칭으로 정리(둘 다 NaN/inf→None JSON-safe float).
+- `backtests.py`의 `_fundamentals_provider_with_market_cap`은 이미
+  `_fundamentals_provider`를 감싸 시총 컬럼만 덧붙이는 자연스러운 형태 — 변경 불필요(검토 완료).
 
 ---
 
@@ -90,6 +94,6 @@ try/except 경고 → concat, 빈 프레임 처리" 스켈레톤을 반복. 고�
 
 - [x] 1. 러너 베이스 클래스 추출 (완료 — 79 테스트 통과)
 - [x] 2. metrics.py 모듈 분할 (완료 — 패키지화, 223 테스트 통과)
-- [ ] 3. pykrx 페칭 헬퍼
-- [ ] 4. portfolio.py 모듈 분할
-- [ ] 5. 공용 num 유틸
+- [x] 3. pykrx 페칭 헬퍼 (완료 — `_fetch_per_market`/`_pykrx_stock`, 223 테스트 통과)
+- [x] 4. portfolio.py 모듈 분할 (완료 — slippage/risk_caps/attribution, 재노출 유지)
+- [x] 5. 공용 num 유틸 (완료 — `app/services/_num.py`, backtests provider 검토 완료)
