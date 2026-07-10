@@ -66,6 +66,7 @@ docker compose exec frontend npm run build
 | DB 스키마·마이그레이션·시계열 쿼리 | `db-architect` |
 | 퀀트 전략 타당성·지표 수식·백테스트 방법론 자문 | `financial-expert` |
 | 백엔드/프론트 코드 리뷰 | `review-fastapi` / `review-nextjs` |
+| Git 커밋·브랜치·GitHub PR 생성/수정 | `pr-manager` |
 
 앱을 실제로 띄워 검증·스크린샷은 `run-quantfolio` 스킬 사용.
 
