@@ -11,16 +11,13 @@ import logging
 from datetime import date, datetime
 from decimal import Decimal
 
-import contextlib
 import pandas as pd
 from redis.asyncio import Redis
 from sqlalchemy import select
 
-from app.core.channels import position_lock_key
 from app.core.database import AsyncSessionLocal
-from app.models import Position, Strategy, User
+from app.models import Position
 from app.services.backtest.signals import latest_signal, min_periods, requires_ohlc
-from app.services.broker import BrokerClient, make_broker_for_user, user_has_credentials
 from app.services.data.loader import (
     get_close_series,
     get_ohlcv_frame,
@@ -29,68 +26,47 @@ from app.services.data.loader import (
 )
 from app.services.market import is_market_open
 from engine import risk
+from engine.base_runner import BaseRunner, _position_lock
 from engine.executor import execute_signal, make_idempotency_key
 
 logger = logging.getLogger("engine.runner")
 
-_POLL_INTERVAL = 30  # 초
-# 틱 1회 최대 허용 시간. 브로커 시세/체결 조회 등 외부 I/O 가 응답 없이 멈추면 러너
-# 전체가 무한정 멈추므로(engine/rebalance_runner.py 와 동일 이유), wait_for 로 방어한다.
-_TICK_TIMEOUT = 120  # 초
 _PRICE_CACHE_PREFIX = "price:"
-_POSITION_LOCK_TTL = 30  # 초
 _TRAIL_PREFIX = "trail:"  # 트레일링 스탑 고점(high-water-mark) 캐시
 _TRAIL_TTL = 60 * 60 * 24 * 7  # 7일(휴장 등 대비 여유)
 
 
-@contextlib.asynccontextmanager
-async def _position_lock(redis: Redis, user_id: int, symbol: str):
-    """(user, symbol) 단위 분산 락. 획득 실패 시 acquired=False 로 진입."""
-    key = position_lock_key(user_id, symbol)
-    acquired = bool(await redis.set(key, "1", nx=True, ex=_POSITION_LOCK_TTL))
-    try:
-        yield acquired
-    finally:
-        if acquired:
-            await redis.delete(key)
-
-
-class StrategyRunner:
+class StrategyRunner(BaseRunner):
     """단일 live 전략을 주기적으로 평가·주문하는 실행기.
+
+    흐름: 과거 일봉 시드 → 주기적으로 현재가 반영 → 신호 평가(손절 우선) → 주문.
 
     :param strategy_id: 구동할 전략 ID
     :param redis: 가격 캐시·분산 락·이벤트 발행에 쓰는 Redis 클라이언트
     """
 
+    _logger = logger
+    _label = "전략"
+    _tick_word = "tick"
+    _poll_interval = 30  # 초
+    # 브로커 시세/체결 조회 등 외부 I/O 가 응답 없이 멈추면 러너 전체가 무한정 멈추므로
+    # (rebalance_runner 와 동일 이유) 틱을 타임아웃으로 방어한다.
+    _tick_timeout = 120  # 초
+
     def __init__(self, strategy_id: int, redis: Redis):
-        self.strategy_id = strategy_id
-        self.redis = redis
+        super().__init__(strategy_id, redis)
         # close-only 전략은 종가 Series, OHLC 전략은 OHLCV DataFrame 을 시드한다.
         self._series: pd.Series | pd.DataFrame | None = None
         self._ohlc: bool = False
-        self._cfg: dict = {}
-        self._user_id: int | None = None
         self._symbol: str = ""
-        self._broker: BrokerClient | None = None
 
-    async def _load(self) -> bool:
-        async with AsyncSessionLocal() as db:
-            s = await db.scalar(select(Strategy).where(Strategy.id == self.strategy_id))
-            if s is None:
-                logger.warning("전략 %d 없음 — 실행 취소", self.strategy_id)
-                return False
-            user = await db.scalar(select(User).where(User.id == s.user_id))
-            if user is None or not user_has_credentials(user):
-                logger.warning("전략 %d 사용자 증권사 미등록 — 실행 취소", self.strategy_id)
-                return False
+    async def _on_load(self, db) -> None:
+        self._symbol = self._cfg["symbol"]
+        self._ohlc = requires_ohlc(self._cfg)
+        await self._seed_series(db)
 
-            self._cfg = dict(s.config)
-            self._user_id = s.user_id
-            self._symbol = self._cfg["symbol"]
-            self._ohlc = requires_ohlc(self._cfg)
-            self._broker = make_broker_for_user(user)
-            await self._seed_series(db)
-        return True
+    def _log_start(self) -> None:
+        logger.info("전략 %d 실행 시작 (%s)", self.strategy_id, self._symbol)
 
     async def _seed_series(self, db) -> None:
         """지표 계산용 과거 일봉 시드. price_ticks 없으면 적재.
@@ -137,42 +113,7 @@ class StrategyRunner:
             logger.warning("%s 현재가 조회 실패: %s", self._symbol, e)
             return None
 
-    async def _holding_qty(self, db) -> Decimal:
-        """현재 보유 수량을 반환한다(포지션 없으면 0)."""
-        pos = await db.scalar(
-            select(Position).where(
-                Position.user_id == self._user_id, Position.symbol == self._symbol
-            )
-        )
-        return pos.qty if pos else Decimal("0")
-
-    async def run(self, stop_event: asyncio.Event) -> None:
-        """전략을 적재한 뒤 stop_event 가 설정될 때까지 _POLL_INTERVAL 마다 평가·주문한다.
-
-        :param stop_event: 외부에서 중지를 요청하는 이벤트
-        """
-        if not await self._load():
-            return
-        logger.info("전략 %d 실행 시작 (%s)", self.strategy_id, self._symbol)
-
-        while not stop_event.is_set():
-            try:
-                await asyncio.wait_for(self._tick(), timeout=_TICK_TIMEOUT)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "전략 %d tick 타임아웃(%d초) — 외부 조회 지연으로 판단, "
-                    "이번 틱 중단하고 다음 주기 재시도", self.strategy_id, _TICK_TIMEOUT,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("전략 %d tick 오류", self.strategy_id)
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=_POLL_INTERVAL)
-            except asyncio.TimeoutError:
-                pass
-
-        logger.info("전략 %d 실행 종료", self.strategy_id)
-
-    async def _tick(self) -> None:
+    async def _tick_once(self) -> None:
         # 장 운영시간이 아니면 신호 평가·주문을 건너뛴다(휴장일·시간외 보호).
         if not is_market_open():
             return
@@ -214,7 +155,7 @@ class StrategyRunner:
                 return
 
             async with AsyncSessionLocal() as db:
-                held = await self._holding_qty(db)
+                held = await self._holding_qty(db, self._symbol)
 
                 # 1) 리스크 한도(RiskLimit) 기반 손절 우선
                 if held > 0 and await risk.check_stop_loss(

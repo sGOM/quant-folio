@@ -15,12 +15,10 @@ from datetime import datetime
 from decimal import Decimal
 
 import pandas as pd
-from redis.asyncio import Redis
 from sqlalchemy import select
 
 from app.core.database import AsyncSessionLocal
-from app.models import Position, Strategy, User
-from app.services.broker import BrokerClient, make_broker_for_user, user_has_credentials
+from app.models import Position
 from app.services.data.loader import (
     get_close_series,
     load_ohlcv,
@@ -35,23 +33,15 @@ from app.services.metrics import (
     compute_universe_scores,
 )
 from engine import risk
-from engine.executor import execute_signal, make_idempotency_key
+from engine.base_runner import BaseRunner, _position_lock
 from engine.rebalance import (
     compute_rebalance_orders,
     compute_target_weights,
     is_rebalance_due,
 )
-from engine.runner import _position_lock
 
 logger = logging.getLogger("engine.rebalance_runner")
 
-_POLL_INTERVAL = 60  # 초 — 발화 시점 점검 주기
-# 틱 1회 최대 허용 시간. compute_universe_scores 가 종목별로 pykrx/OpenDART 를 순차
-# 조회하는데, 그중 일부(pykrx)는 자체 타임아웃이 없어 KRX 응답 지연 시 무한 대기할 수
-# 있다. asyncio.wait_for 로 감싸 특정 틱이 걸려도 다음 주기에 러너가 계속 진행되게 한다
-# (단, to_thread 로 넘어간 하위 스레드 자체는 취소되지 않고 백그라운드에서 계속 대기한다 —
-#  이벤트 루프를 다시 살리는 것이 목적이며 스레드 강제 종료는 아니다).
-_TICK_TIMEOUT = 300  # 초
 _LAST_PREFIX = "rebalance:last:"
 _REGIME_PREFIX = "rebalance:regime:"  # 직전 레짐 상태(risk-off 여부) 보관
 _LAST_TTL = 60 * 60 * 24 * 90  # 90일(휴장 등 대비 여유)
@@ -60,39 +50,25 @@ _LAST_TTL = 60 * 60 * 24 * 90  # 90일(휴장 등 대비 여유)
 _REGIME_INDEX_TICKER = {"KOSPI": "1001", "KOSDAQ": "2001"}
 
 
-class RebalanceRunner:
+class RebalanceRunner(BaseRunner):
     """단일 리밸런싱 전략을 주기적으로 점검·실행하는 실행기.
 
     :param strategy_id: 구동할 전략 ID
     :param redis: 마지막 실행일 보관·분산 락·이벤트 발행용 Redis 클라이언트
     """
 
-    def __init__(self, strategy_id: int, redis: Redis):
-        self.strategy_id = strategy_id
-        self.redis = redis
-        self._cfg: dict = {}
-        self._user_id: int | None = None
-        self._broker: BrokerClient | None = None
+    _logger = logger
+    _label = "리밸런싱 전략"
+    _tick_word = "점검"
+    _poll_interval = 60  # 초 — 발화 시점 점검 주기
+    # compute_universe_scores 가 종목별로 pykrx/OpenDART 를 순차 조회하는데, 그중 일부
+    # (pykrx)는 자체 타임아웃이 없어 KRX 응답 지연 시 무한 대기할 수 있다. 틱을 타임아웃으로
+    # 감싸 특정 틱이 걸려도 다음 주기에 러너가 계속 진행되게 한다(단, to_thread 로 넘어간
+    # 하위 스레드 자체는 취소되지 않고 백그라운드에서 계속 대기한다 — 이벤트 루프를 다시
+    # 살리는 것이 목적이며 스레드 강제 종료는 아니다).
+    _tick_timeout = 300  # 초
 
-    async def _load(self) -> bool:
-        async with AsyncSessionLocal() as db:
-            s = await db.scalar(select(Strategy).where(Strategy.id == self.strategy_id))
-            if s is None:
-                logger.warning("전략 %d 없음 — 실행 취소", self.strategy_id)
-                return False
-            user = await db.scalar(select(User).where(User.id == s.user_id))
-            if user is None or not user_has_credentials(user):
-                logger.warning("전략 %d 사용자 증권사 미등록 — 실행 취소", self.strategy_id)
-                return False
-            self._cfg = dict(s.config)
-            self._user_id = s.user_id
-            self._broker = make_broker_for_user(user)
-        return True
-
-    async def run(self, stop_event: asyncio.Event) -> None:
-        """전략 적재 후 stop_event 가 설정될 때까지 주기적으로 발화 조건을 점검한다."""
-        if not await self._load():
-            return
+    def _log_start(self) -> None:
         rule = (self._cfg.get("selection", {}) or {}).get("universe_rule") or {}
         src = rule.get("source", "fixed")
         pool_desc = src if src != "fixed" else f"{len(self._cfg.get('universe', []))}종목"
@@ -100,23 +76,8 @@ class RebalanceRunner:
             "리밸런싱 전략 %d 실행 시작 (universe=%s, %s)",
             self.strategy_id, pool_desc, self._cfg.get("cadence"),
         )
-        while not stop_event.is_set():
-            try:
-                await asyncio.wait_for(self._maybe_rebalance(), timeout=_TICK_TIMEOUT)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "리밸런싱 전략 %d 점검 타임아웃(%d초) — 외부 조회 지연으로 판단, "
-                    "이번 틱 중단하고 다음 주기 재시도", self.strategy_id, _TICK_TIMEOUT,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("리밸런싱 전략 %d 점검 오류", self.strategy_id)
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=_POLL_INTERVAL)
-            except asyncio.TimeoutError:
-                pass
-        logger.info("리밸런싱 전략 %d 실행 종료", self.strategy_id)
 
-    async def _maybe_rebalance(self) -> None:
+    async def _tick_once(self) -> None:
         """정기 cadence 발화와 레짐 전환(청산/재진입)을 분리해 점검한다.
 
         백테스트 엔진과 동일 규약:
@@ -637,19 +598,3 @@ class RebalanceRunner:
                             "리밸런싱 매수 %s x%d @%s", sym, decision.qty, price
                         )
                         await self._place(db, sym, "buy", decision.qty, price, bar_ts)
-
-    async def _holding_qty(self, db, symbol: str) -> Decimal:
-        pos = await db.scalar(
-            select(Position).where(
-                Position.user_id == self._user_id, Position.symbol == symbol
-            )
-        )
-        return pos.qty if pos else Decimal("0")
-
-    async def _place(self, db, symbol: str, side: str, qty: int, price: Decimal, bar_ts: str) -> None:
-        await execute_signal(
-            db, self.redis, self._broker,
-            user_id=self._user_id, strategy_id=self.strategy_id,
-            symbol=symbol, side=side, qty=qty, price=price,
-            idempotency_key=make_idempotency_key(self.strategy_id, symbol, side, bar_ts),
-        )
