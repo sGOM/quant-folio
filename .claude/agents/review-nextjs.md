@@ -32,7 +32,7 @@ model: sonnet
 
 ### 4. 타입·품질·UX
 - TypeScript any 남용, API 응답 타입과 백엔드 스키마 정합성
-- 차트(TradingView/Lightweight Charts) 라이프사이클·자원 해제
+- 자체 SVG 차트(`components/LineChart.tsx`)의 데이터 유효성·빈 데이터 처리, 좌표 계산 정확성
 - 접근성(시맨틱 태그, aria, 키보드), 로딩/빈/에러 UI
 - 중복 코드, 죽은 코드, 일관성 없는 스타일
 
