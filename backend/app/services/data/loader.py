@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import socket
+import threading
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -21,23 +22,46 @@ from app.models import PriceTick
 logger = logging.getLogger(__name__)
 
 
+# socket.setdefaulttimeout 은 프로세스 전역값이라, 여러 러너 스레드가 bounded_socket_timeout
+# 을 동시·중첩 실행하면 각자의 prev 캡처/원복이 서로를 덮어써 전역값이 엉킨다(최악: None 이
+# 잔류해 무한 대기 — 방어하려던 무한 대기를 동시성으로 되살림). 락으로 원복 부기를 직렬화하고,
+# '현재 활성 요청들의 최소 타임아웃'을 전역에 유지하되, 원래 baseline 은 활성 요청이 하나도
+# 없어질 때 정확히 한 번만 복원한다(중첩·동시성 안전).
+_timeout_lock = threading.RLock()
+_active_timeouts: list[float] = []
+_timeout_baseline: float | None = None
+
+
 @contextlib.contextmanager
 def bounded_socket_timeout(seconds: float):
-    """블로킹 네트워크 호출에 임시 소켓 타임아웃을 건다.
+    """블로킹 네트워크 호출에 임시 소켓 타임아웃을 건다(프로세스 전역, 중첩·스레드 안전).
 
     FinanceDataReader/pykrx 는 내부 요청에 timeout 을 지정하지 않는 경로가 있어, 응답이
     없으면 스레드가 무한 대기한다. 이 호출은 asyncio.to_thread 로 별도 스레드에서
     실행되므로, 이벤트 루프 쪽의 asyncio.wait_for 타임아웃으로는 이미 실행 중인 스레드를
     끊을 수 없다(실행 중인 스레드로 넘어간 뒤엔 Future.cancel() 이 아무 효과가 없음) —
-    실질적인 방어는 이 소켓 레벨 타임아웃뿐이다. socket.setdefaulttimeout 은 프로세스
-    전역값이지만 새로 생성되는 소켓에만 적용되고, with 블록을 벗어나면 원복한다.
+    실질적인 방어는 이 소켓 레벨 타임아웃뿐이다. socket.setdefaulttimeout 은 새로 생성되는
+    소켓에만 적용되고, 활성 요청이 모두 끝나면 baseline 으로 원복한다.
     """
-    prev = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(seconds)
+    global _timeout_baseline
+    with _timeout_lock:
+        if not _active_timeouts:
+            _timeout_baseline = socket.getdefaulttimeout()
+        _active_timeouts.append(seconds)
+        socket.setdefaulttimeout(min(_active_timeouts))
     try:
         yield
     finally:
-        socket.setdefaulttimeout(prev)
+        with _timeout_lock:
+            # 자기 요청 하나만 제거(같은 값이 여러 개여도 하나만).
+            try:
+                _active_timeouts.remove(seconds)
+            except ValueError:
+                pass
+            if _active_timeouts:
+                socket.setdefaulttimeout(min(_active_timeouts))
+            else:
+                socket.setdefaulttimeout(_timeout_baseline)
 
 
 def load_ohlcv(symbol: str, start: str | date, end: str | date) -> pd.DataFrame:

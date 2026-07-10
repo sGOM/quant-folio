@@ -7,7 +7,6 @@ best-effort 확인하고, 조회 실패 시 보수적으로 '영업일'로 간�
 from __future__ import annotations
 
 import logging
-import socket
 from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
 
@@ -34,19 +33,20 @@ def is_business_day(d: date) -> bool:
     """영업일 여부. 주말 제외 + pykrx 휴장일 확인(가능할 때)."""
     if d.weekday() >= 5:  # 토(5)/일(6)
         return False
-    prev_timeout = socket.getdefaulttimeout()
+    # 전역 소켓 타임아웃 직접 조작은 다른 러너 스레드의 조작과 경합한다(prev 캡처가 서로
+    # 엉킴). 공유 컨텍스트 매니저로 통일해 락으로 직렬화된 안전한 타임아웃을 사용한다.
+    from app.services.data.loader import bounded_socket_timeout
+
     try:
         from pykrx import stock
 
-        socket.setdefaulttimeout(_BUSINESS_DAY_TIMEOUT)
-        ymd = d.strftime("%Y%m%d")
-        nearest = stock.get_nearest_business_day_in_a_week(ymd)
-        return nearest == ymd
+        with bounded_socket_timeout(_BUSINESS_DAY_TIMEOUT):
+            ymd = d.strftime("%Y%m%d")
+            nearest = stock.get_nearest_business_day_in_a_week(ymd)
+            return nearest == ymd
     except Exception as e:  # noqa: BLE001
         logger.debug("영업일 조회 실패(%s), 주말여부만 적용: %s", d, e)
         return True  # 주말이 아니면 일단 영업일로 (시세/주문에서 자연 차단)
-    finally:
-        socket.setdefaulttimeout(prev_timeout)
 
 
 def is_market_open(now: datetime | None = None) -> bool:

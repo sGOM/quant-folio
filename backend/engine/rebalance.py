@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import calendar
 import math
 from datetime import datetime
 
@@ -281,7 +282,13 @@ def compute_rebalance_orders(
         cur_qty = int(positions.get(sym, 0) or 0)
         cur_w = (cur_qty * price) / capital
 
-        if abs(cur_w - target_w) <= drift_band:
+        # 드리프트 밴드는 '이미 보유 중인 종목의 비중 미세조정'에만 적용한다.
+        # 신규 편입(미보유→목표)과 전량 청산(보유→목표 0)은 목표 비중이 밴드보다
+        # 작아도 반드시 체결해야 한다. (top_n 이 커서 등비중 목표가 drift_band 이하가
+        # 되면 편입이 영구 차단되는 버그 방지 — 100% 현금 고착)
+        is_new_entry = cur_qty <= 0 and target_w > 0.0
+        is_full_exit = target_w <= 0.0 and cur_qty > 0
+        if not (is_new_entry or is_full_exit) and abs(cur_w - target_w) <= drift_band:
             continue
 
         target_qty = math.floor(target_w * capital / price)
@@ -342,10 +349,18 @@ def is_rebalance_due(
         return False
 
     if cadence == "weekly":
-        if now.weekday() < int(cfg.get("rebalance_weekday") or 0):
+        # 장은 평일(weekday 0~4)에만 열리므로 weekday=5(토)/6(일) 설정 시 is_market_open 이
+        # 참인 시각엔 항상 now.weekday()<5 → 영구 미발화. 0~4 로 클램프한다.
+        wd = min(max(int(cfg.get("rebalance_weekday") or 0), 0), 4)
+        if now.weekday() < wd:
             return False
     elif cadence in ("monthly", "quarterly"):
-        if now.day < int(cfg.get("rebalance_dom") or 1):
+        # dom 이 해당 월 일수를 넘으면(예: 31일 지정 → 4/6/9/11월은 최대 30일, 2월은 28·29일)
+        # now.day 가 절대 dom 에 도달하지 못해 그 주기를 통째로 건너뛴다. 월 마지막 날로
+        # 클램프해 최소한 월말에는 발화하도록 한다(1 미만도 1 로 하한).
+        dom = min(max(int(cfg.get("rebalance_dom") or 1), 1),
+                  calendar.monthrange(now.year, now.month)[1])
+        if now.day < dom:
             return False
 
     return True

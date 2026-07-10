@@ -181,7 +181,9 @@ def _bollinger_signals(close: pd.Series, cfg: dict) -> tuple[pd.Series, pd.Serie
     period = int(cfg.get("period", 20))
     num_std = float(cfg.get("num_std", 2.0))
     mid = _sma(close, period)
-    std = close.rolling(window=period, min_periods=period).std()
+    # 볼린저 밴드는 관례상 모표준편차(ddof=0). pandas 기본 ddof=1(표본)이면 밴드가 ~2.6%
+    # 넓어져 크로스 타이밍이 어긋나고, 같은 파일 _donchian_squeeze 의 std(ddof=0)와도 불일치.
+    std = close.rolling(window=period, min_periods=period).std(ddof=0)
     upper = mid + num_std * std
     lower = mid - num_std * std
     entries = _cross_up(close, lower)

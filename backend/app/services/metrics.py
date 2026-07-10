@@ -352,8 +352,7 @@ def _neutralize_size(df: pd.DataFrame, factor_cols: list[str]) -> pd.DataFrame:
     if int(valid.sum()) < 5:
         return df
     xv = x[valid]
-    denom = float((xv ** 2).sum())
-    if not (denom > 0):
+    if not (float((xv ** 2).sum()) > 0):
         return df
     for col in factor_cols:
         if col not in df.columns:
@@ -365,7 +364,14 @@ def _neutralize_size(df: pd.DataFrame, factor_cols: list[str]) -> pd.DataFrame:
             continue
         sv = s[m]
         xm = x[m]
-        beta = float((sv * xm).sum() / denom)
+        # 무절편 OLS 사영 β = Σ_m(s·x)/Σ_m(x²). 분자·분모를 반드시 동일 표본(m)으로
+        # 계산해야 편향이 없다. denom 을 valid 전체(팩터 NaN 포함)의 Σx² 로 잡으면
+        # m ⊆ valid 라 분모가 과대 → β 가 0쪽으로 축소 → 사이즈 노출이 일부만 제거되고
+        # 소형주 틸트가 잔차에 남는다.
+        denom_m = float((xm ** 2).sum())
+        if not (denom_m > 0):
+            continue
+        beta = float((sv * xm).sum() / denom_m)
         df.loc[m, col] = sv - beta * xm
     return df
 
@@ -534,6 +540,18 @@ def compute_universe_scores(
         pc_21d = _fetch_price_change(_ymd(_approx_start(as_of, 21)), as_of_ymd, mkts)
         pc_63d = _fetch_price_change(_ymd(_approx_start(as_of, 63)), as_of_ymd, mkts)
         pc_126d = _fetch_price_change(_ymd(_approx_start(as_of, 126)), as_of_ymd, mkts)
+
+    # 모멘텀 팩터 완전 소멸 방어: 모멘텀 가중치가 유의미한데 3개 기간 등락률 조회가
+    # '모두' 비었으면 이는 개별 종목의 정상 NaN 이 아니라 KRX 조회 자체의 일시 장애다.
+    # 이 상태로 진행하면 스코어러가 남은 밸류/저변동만으로 재정규화해 에러 없이 전혀
+    # 다른 목표 포트폴리오를 산출하고 러너가 그대로 주문한다. 예외를 올려 이번 리밸런싱을
+    # 건너뛰면 러너 틱 루프가 잡아 다음 주기에 온전한 팩터로 재시도한다.
+    _w = factor_weights or DEFAULT_FACTOR_WEIGHTS
+    if float(_w.get("momentum", 0.0) or 0.0) > 0 and pc_21d.empty and pc_63d.empty and pc_126d.empty:
+        raise RuntimeError(
+            "모멘텀 팩터 데이터 전량 조회 실패(등락률 21/63/126일 모두 빈 응답) — "
+            "왜곡된 목표 산출 방지 위해 리밸런싱 건너뜀(다음 주기 재시도)"
+        )
 
     rows: list[dict] = []
     for code in codes:

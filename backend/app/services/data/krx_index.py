@@ -111,7 +111,10 @@ def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
         if codes:
             break
 
-    _MEMBERS_CACHE[key] = codes
+    # 성공 결과만 캐시한다(실패/미인증/일시 장애의 빈 응답을 캐시하면 프로세스 수명
+    # 내내 해당 시점 구성이 []로 고착 → 조용히 고정 유니버스로 폴백하는 생존편향 재유입).
+    if codes:
+        _MEMBERS_CACHE[key] = codes
     return codes
 
 
