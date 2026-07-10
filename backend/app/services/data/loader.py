@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
+import contextlib
 import logging
+import socket
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -19,15 +21,35 @@ from app.models import PriceTick
 logger = logging.getLogger(__name__)
 
 
+@contextlib.contextmanager
+def bounded_socket_timeout(seconds: float):
+    """블로킹 네트워크 호출에 임시 소켓 타임아웃을 건다.
+
+    FinanceDataReader/pykrx 는 내부 요청에 timeout 을 지정하지 않는 경로가 있어, 응답이
+    없으면 스레드가 무한 대기한다. 이 호출은 asyncio.to_thread 로 별도 스레드에서
+    실행되므로, 이벤트 루프 쪽의 asyncio.wait_for 타임아웃으로는 이미 실행 중인 스레드를
+    끊을 수 없다(실행 중인 스레드로 넘어간 뒤엔 Future.cancel() 이 아무 효과가 없음) —
+    실질적인 방어는 이 소켓 레벨 타임아웃뿐이다. socket.setdefaulttimeout 은 프로세스
+    전역값이지만 새로 생성되는 소켓에만 적용되고, with 블록을 벗어나면 원복한다.
+    """
+    prev = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(prev)
+
+
 def load_ohlcv(symbol: str, start: str | date, end: str | date) -> pd.DataFrame:
     """일봉 OHLCV 를 DataFrame 으로 반환.
 
     컬럼: open, high, low, close, volume / index: tz-naive DatetimeIndex.
     동기(blocking) 함수이므로 호출자는 스레드풀에서 실행할 것.
     """
-    df = _load_fdr(symbol, start, end)
-    if df is None or df.empty:
-        df = _load_pykrx(symbol, start, end)
+    with bounded_socket_timeout(20):
+        df = _load_fdr(symbol, start, end)
+        if df is None or df.empty:
+            df = _load_pykrx(symbol, start, end)
     if df is None or df.empty:
         raise ValueError(f"{symbol} 시세를 가져오지 못했습니다 ({start}~{end}).")
 

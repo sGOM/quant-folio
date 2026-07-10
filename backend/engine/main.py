@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import signal
+import socket
 
 from sqlalchemy import select
 
@@ -32,6 +33,14 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
 )
 logger = logging.getLogger("engine")
+
+# pykrx/FinanceDataReader 등 시세 라이브러리가 내부적으로 timeout 을 지정하지 않는
+# 요청 경로가 다수 있어(관측: KRX 로그인 이후 원인 불명 지점에서 무한 대기), 러너 태스크
+# 하나가 응답 없는 외부 호출에 영원히 멈춰 리밸런싱/신호평가 자체가 멈춰버리는 사고가
+# 있었다. 개별 호출부를 일일이 다 찾아 고치는 대신, 프로세스 전역 기본 소켓 타임아웃을
+# 걸어 이런 라이브러리 호출을 통째로 방어한다. KIS WebSocket(engine/kis_ws.py)은
+# websockets 라이브러리로 비동기 논블로킹 소켓을 쓰므로 이 전역값의 영향을 받지 않는다.
+socket.setdefaulttimeout(30)
 
 _shutdown = asyncio.Event()           # 그레이스풀 셧다운 신호
 _runners: dict[int, dict] = {}        # strategy_id -> {task, stop} 실행 중 전략 러너

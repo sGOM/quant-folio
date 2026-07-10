@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
+from app.services.data.loader import bounded_socket_timeout
+
 logger = logging.getLogger(__name__)
 
 _JSON_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
@@ -61,7 +63,12 @@ def _session():
     if sess is not None and getattr(sess, "is_valid", lambda: False)():
         return sess
     try:
-        return auth.build_krx_session()
+        # build_krx_session() 은 로그인 로그(로그인 시도/완료 print) 이후에도 내부적으로
+        # 추가 요청을 할 수 있는데, 그 경로엔 우리가 손댈 수 없는 timeout 미지정 호출이
+        # 있을 수 있다(실제로 로그인 완료 로그 이후 응답 없이 멈추는 현상을 관측함).
+        # 소켓 레벨로 강제 타임아웃을 걸어 무한 대기를 방지한다.
+        with bounded_socket_timeout(20):
+            return auth.build_krx_session()
     except Exception as e:  # noqa: BLE001
         logger.warning("KRX 인증 세션 생성 실패: %s", e)
         return None

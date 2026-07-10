@@ -34,6 +34,9 @@ from engine.executor import execute_signal, make_idempotency_key
 logger = logging.getLogger("engine.runner")
 
 _POLL_INTERVAL = 30  # 초
+# 틱 1회 최대 허용 시간. 브로커 시세/체결 조회 등 외부 I/O 가 응답 없이 멈추면 러너
+# 전체가 무한정 멈추므로(engine/rebalance_runner.py 와 동일 이유), wait_for 로 방어한다.
+_TICK_TIMEOUT = 120  # 초
 _PRICE_CACHE_PREFIX = "price:"
 _POSITION_LOCK_TTL = 30  # 초
 _TRAIL_PREFIX = "trail:"  # 트레일링 스탑 고점(high-water-mark) 캐시
@@ -154,7 +157,12 @@ class StrategyRunner:
 
         while not stop_event.is_set():
             try:
-                await self._tick()
+                await asyncio.wait_for(self._tick(), timeout=_TICK_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "전략 %d tick 타임아웃(%d초) — 외부 조회 지연으로 판단, "
+                    "이번 틱 중단하고 다음 주기 재시도", self.strategy_id, _TICK_TIMEOUT,
+                )
             except Exception:  # noqa: BLE001
                 logger.exception("전략 %d tick 오류", self.strategy_id)
             try:
