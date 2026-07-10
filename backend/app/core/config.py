@@ -120,6 +120,12 @@ class Settings(BaseSettings):
     # --- CORS ---
     FRONTEND_ORIGIN: str = "http://localhost:3000"
 
+    # --- 에러 응답 상세도 ---
+    # True 면 처리되지 않은 예외의 타입·메시지·트레이스백을 HTTP 응답 본문에
+    # 그대로 담아 반환한다(디버깅 편의). 내부 구조·경로·시크릿 단서가 노출될 수
+    # 있으므로 기본은 False. prod 환경에서는 아래 검증기가 강제로 False 로 되돌린다.
+    DEBUG_ERRORS: bool = False
+
     @model_validator(mode="after")
     def _export_krx_credentials(self) -> "Settings":
         """KRX 자격증명을 os.environ 으로 내보낸다(pykrx 가 os.getenv 로 직접 읽음).
@@ -184,6 +190,15 @@ class Settings(BaseSettings):
         # prod 에서 KIS 실거래인데 쿠키가 비보안이면 토큰 탈취 위험 → 거부.
         if self.APP_ENV == "prod" and not self.COOKIE_SECURE:
             raise ValueError("운영 환경에서는 COOKIE_SECURE=true 여야 합니다.")
+
+        # prod 에서 상세 에러 노출은 정보 유출 위험 → 켜져 있어도 강제로 끈다.
+        if self.APP_ENV == "prod" and self.DEBUG_ERRORS:
+            import logging
+
+            object.__setattr__(self, "DEBUG_ERRORS", False)
+            logging.getLogger(__name__).warning(
+                "운영(prod) 환경에서는 DEBUG_ERRORS 를 사용할 수 없어 False 로 강제합니다."
+            )
 
         # Fernet 키 형식 검증(잘못된 키는 첫 암호화 시점에야 터지므로 부팅 시 확인).
         try:
