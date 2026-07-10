@@ -687,9 +687,6 @@ _OHLC_BUILDERS = {
     "obv_trend": _obv_trend_signals,
 }
 
-# 하위호환: 기존 이름 유지(close-only + OHLC 통합 뷰).
-_SIGNAL_BUILDERS = {**_CLOSE_BUILDERS, **_OHLC_BUILDERS}
-
 
 def generate_signals(data, config: dict) -> tuple[pd.Series, pd.Series]:
     """전략 유형(config["type"])에 따라 (entries, exits) 신호를 생성한다.

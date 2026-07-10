@@ -20,13 +20,8 @@ def safe_float(val: Any) -> float | None:
 
 
 def is_nan(val: Any) -> bool:
-    """None 또는 NaN/무한대 여부를 확인한다."""
-    if val is None:
-        return True
-    try:
-        return not np.isfinite(float(val))
-    except (TypeError, ValueError):
-        return True
+    """None 또는 NaN/무한대 여부를 확인한다(safe_float 로 변환 불가면 True)."""
+    return safe_float(val) is None
 
 
 def safe_bool(val: Any) -> bool | None:

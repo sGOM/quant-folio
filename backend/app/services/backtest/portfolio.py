@@ -40,7 +40,6 @@
 from __future__ import annotations
 
 import logging
-import math
 
 import numpy as np
 import pandas as pd
@@ -50,7 +49,7 @@ from engine.rebalance import _period_key, compute_target_weights
 # 책임별로 분리한 하위 모듈의 헬퍼를 재노출한다(기존 import 경로 보존).
 # rebalance_runner·검증 스크립트·테스트가 portfolio 에서 직접 import 하므로
 # 여기서 되살려 두어야 한다.
-from app.services._num import _safe  # NaN/inf → None(JSON 안전)
+from app.services._num import _safe, is_nan  # NaN/inf → None(JSON 안전)
 from app.services.backtest.attribution import (
     _FACTOR_SCORE_COLS,
     _factor_attribution,
@@ -300,7 +299,7 @@ def _targets_at(
         scores = {
             code: float(v)
             for code, v in scored["score"].items()
-            if v is not None and not (isinstance(v, float) and math.isnan(v))
+            if not is_nan(v)
         }
         # weighting="inverse_vol" 용 변동성 — _score_factor_frame 이 이미 산출한 vol_ann
         # (app.services.metrics._compute_vol_ann 과 동일 정의)을 재사용해 실거래(vols=None →
@@ -310,7 +309,7 @@ def _targets_at(
             vols = {
                 code: float(v)
                 for code, v in fac["vol_ann"].items()
-                if v is not None and not (isinstance(v, float) and math.isnan(v))
+                if not is_nan(v)
             }
         weights = compute_target_weights({}, config, scores=scores, vols=vols)
         return _apply_risk_caps(weights, hist, config.get("risk_layer") or {})

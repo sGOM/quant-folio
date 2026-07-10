@@ -19,20 +19,10 @@ OHLCV DataFrame 을 입력으로 받는다. 어느 경우든 체결 기준가는
 """
 from __future__ import annotations
 
-import math
-
 import pandas as pd
 
+from app.services._num import safe_float as _safe  # NaN/inf → None(JSON 안전)
 from app.services.backtest.signals import generate_signals, min_periods
-
-
-def _safe(x) -> float | None:
-    """NaN/inf 를 JSON 안전 값(None)으로 변환."""
-    try:
-        f = float(x)
-    except (TypeError, ValueError):
-        return None
-    return None if (math.isnan(f) or math.isinf(f)) else f
 
 
 def run_backtest(data, config: dict) -> dict:
