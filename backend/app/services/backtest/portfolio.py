@@ -47,12 +47,41 @@ import pandas as pd
 
 from engine.rebalance import _period_key, compute_target_weights
 
+# 책임별로 분리한 하위 모듈의 헬퍼를 재노출한다(기존 import 경로 보존).
+# rebalance_runner·검증 스크립트·테스트가 portfolio 에서 직접 import 하므로
+# 여기서 되살려 두어야 한다.
+from app.services._num import _safe  # NaN/inf → None(JSON 안전)
+from app.services.backtest.attribution import (
+    _FACTOR_SCORE_COLS,
+    _factor_attribution,
+    _risk_adjusted_metrics,
+)
+from app.services.backtest.risk_caps import (
+    _apply_risk_caps,
+    _cap_position_weights,
+    _portfolio_vol_ann,
+)
+from app.services.backtest.slippage import _vol_slippage_map
+
 # 주의: app.services.metrics 는 app.services.backtest.signals 를 임포트하므로,
 # 이 모듈에서 metrics 를 최상위 임포트하면 순환 임포트가 된다
 # (backtest/__init__ → portfolio → metrics → backtest.signals). 따라서
 # metrics 의 헬퍼는 사용 시점에 함수 내부에서 지연 임포트한다.
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "run_rebalance_backtest",
+    # 하위 모듈에서 재노출(호환 유지)
+    "_apply_risk_caps",
+    "_cap_position_weights",
+    "_portfolio_vol_ann",
+    "_vol_slippage_map",
+    "_factor_attribution",
+    "_risk_adjusted_metrics",
+    "_FACTOR_SCORE_COLS",
+    "_safe",
+]
 
 
 def _normalize_index(panel: pd.DataFrame) -> pd.DataFrame:
@@ -430,264 +459,6 @@ def _apply_rebalance(
         )
 
     return cash, turnover
-
-
-def _vol_slippage_map(
-    hist: pd.DataFrame, symbols: list[str], base_frac: float, vol_scale: float
-) -> dict[str, float]:
-    """종목별 슬리피지(분수) 맵. 최근 20봉 수익률 표준편차/중앙값 비로 base 를 조정한다.
-
-    slip = max(0, base × (1 + vol_scale × (vol/median − 1))). base 나 vol_scale 이 0 이면
-    빈 맵을 돌려 호출부가 일괄 base_frac(고정 bps)을 쓰게 한다. 미래참조 방지를 위해
-    hist(=panel.loc[:체결일]) 만 사용한다.
-    """
-    if base_frac <= 0 or vol_scale <= 0:
-        return {}
-    vols: dict[str, float] = {}
-    for s in symbols:
-        if s not in hist.columns:
-            continue
-        r = hist[s].dropna().pct_change().tail(20)
-        if len(r) >= 10:
-            sd = float(r.std())
-            if sd == sd and sd > 0:  # NaN 이 아니고 양수
-                vols[s] = sd
-    if not vols:
-        return {}
-    med = float(np.median(list(vols.values())))
-    if not (med > 0):
-        return {}
-    return {
-        s: max(0.0, base_frac * (1.0 + vol_scale * (v / med - 1.0)))
-        for s, v in vols.items()
-    }
-
-
-# 팩터 IC/IR·성과귀속(P1-1)에서 다루는 팩터 점수 컬럼(개별 5팩터 + 종합).
-_FACTOR_SCORE_COLS = (
-    "score_momentum", "score_value", "score_lowvol",
-    "score_quality", "score_growth", "score",
-)
-
-
-def _factor_attribution(
-    snapshots: list[tuple[pd.Timestamp, pd.DataFrame]], panel: pd.DataFrame
-) -> dict[str, dict[str, float | int | None]]:
-    """리밸런싱 스냅샷(팩터 점수)과 다음 구간 순수 수익률로 팩터별 IC·IR·롱숏수익을 산출한다.
-
-    각 인접 스냅샷 구간 [d_i, d_{i+1}] 에서 후보풀 종목의 forward return(종가 기준)을 구하고,
-    팩터별로:
-      - IC_i: 팩터 점수와 forward return 의 순위상관(Spearman). 예측력의 부호·강도.
-      - LS_i: 팩터 상위 1/3 평균수익 − 하위 1/3 평균수익(팩터 모방 롱숏 포트 수익).
-    을 계산한 뒤 구간에 걸쳐 집계한다:
-      - ic_mean: 평균 IC(예측력)
-      - ic_ir: IC IR = mean(IC)/std(IC) × √(연간 리밸런싱 횟수). 예측의 일관성.
-      - ic_hit: IC>0 비율(방향 적중률)
-      - ls_return: 롱숏 누적수익(∏(1+LS_i)−1) — 이 구간 팩터가 실제로 값을 했는지(귀속).
-      - n: 유효 구간 수.
-
-    미래참조 없음: 각 IC 는 d_i 시점 점수 vs d_i→d_{i+1} 실현수익으로, 결정 시점 정보만 쓴다.
-    """
-    out: dict[str, dict[str, float | int | None]] = {}
-    if len(snapshots) < 3:
-        return out  # IR 안정성 위해 최소 3구간(스냅샷 4개) 필요
-
-    idx = panel.index
-    # 연율화 계수: 스냅샷 간 평균 거래일 간격 → 연 리밸런싱 횟수(√ 적용).
-    pos = []
-    for d, _ in snapshots:
-        loc = idx.searchsorted(d)
-        pos.append(int(loc))
-    gaps = [pos[i + 1] - pos[i] for i in range(len(pos) - 1) if pos[i + 1] > pos[i]]
-    avg_gap = float(np.mean(gaps)) if gaps else 21.0
-    periods_per_year = 252.0 / avg_gap if avg_gap > 0 else 12.0
-    ann = math.sqrt(periods_per_year)
-
-    per_factor_ic: dict[str, list[float]] = {c: [] for c in _FACTOR_SCORE_COLS}
-    per_factor_ls: dict[str, list[float]] = {c: [] for c in _FACTOR_SCORE_COLS}
-
-    for i in range(len(snapshots) - 1):
-        d0, frame = snapshots[i]
-        d1, _ = snapshots[i + 1]
-        if d0 not in panel.index or d1 not in panel.index:
-            continue
-        p0 = panel.loc[d0]
-        p1 = panel.loc[d1]
-        syms = [s for s in frame.index if s in panel.columns]
-        if len(syms) < 5:
-            continue
-        base = p0.reindex(syms).astype(float)
-        fwd = (p1.reindex(syms).astype(float) / base) - 1.0
-        fwd = fwd.replace([np.inf, -np.inf], np.nan)
-        valid = fwd.notna() & (base > 0)
-        fwd = fwd[valid]
-        if len(fwd) < 5:
-            continue
-        for col in _FACTOR_SCORE_COLS:
-            if col not in frame.columns:
-                continue
-            sc = frame[col].reindex(fwd.index).astype(float)
-            pair = pd.concat([sc, fwd], axis=1).dropna()
-            if len(pair) < 5 or pair.iloc[:, 0].nunique() < 3:
-                continue
-            ic = pair.iloc[:, 0].corr(pair.iloc[:, 1], method="spearman")
-            if ic == ic:  # NaN 아님
-                per_factor_ic[col].append(float(ic))
-            # 롱숏(터셔일): 팩터 상위 1/3 − 하위 1/3 평균 forward return.
-            k = len(pair) // 3
-            if k >= 1:
-                ranked = pair.sort_values(pair.columns[0], ascending=False)
-                top = ranked.iloc[:k, 1].mean()
-                bot = ranked.iloc[-k:, 1].mean()
-                if top == top and bot == bot:
-                    per_factor_ls[col].append(float(top - bot))
-
-    for col in _FACTOR_SCORE_COLS:
-        ics = per_factor_ic[col]
-        lss = per_factor_ls[col]
-        if len(ics) < 3:
-            continue
-        arr = np.array(ics, dtype=float)
-        sd = float(arr.std(ddof=1))
-        out[col] = {
-            "ic_mean": _safe(float(arr.mean())),
-            "ic_ir": _safe(float(arr.mean()) / sd * ann) if sd > 0 else None,
-            "ic_hit": _safe(float((arr > 0).mean())),
-            "ls_return": _safe(float(np.prod([1.0 + x for x in lss]) - 1.0)) if lss else None,
-            "n": len(ics),
-        }
-    return out
-
-
-def _cap_position_weights(targets: dict[str, float], cap: float) -> dict[str, float]:
-    """단일 종목 목표비중을 cap 으로 제한하고 초과분을 상한 미만 종목에 비례 재분배한다.
-
-    재분배로 다시 상한을 넘으면 반복하며, 재분배 여력(상한 미만 종목)이 없으면 남는
-    비중은 현금으로 둔다(합<1). n+1 회로 반복을 제한해 종료를 보장한다.
-    """
-    if cap >= 1.0 or not targets:
-        return targets
-    w = dict(targets)
-    for _ in range(len(w) + 1):
-        excess = sum(v - cap for v in w.values() if v > cap + 1e-12)
-        if excess <= 1e-12:
-            break
-        for s in list(w):
-            if w[s] > cap:
-                w[s] = cap
-        under = {s: v for s, v in w.items() if v < cap - 1e-12}
-        pool = sum(under.values())
-        if pool <= 1e-12:
-            break  # 재분배 여력 없음 → 초과분은 현금
-        for s in under:
-            w[s] += excess * under[s] / pool
-    return w
-
-
-def _portfolio_vol_ann(
-    hist: pd.DataFrame, weights: dict[str, float], lookback: int
-) -> float | None:
-    """목표비중 포트폴리오의 최근 lookback 봉 실현변동성(연율)을 공분산 기반으로 추정한다.
-
-    σ_p = sqrt(wᵀ Σ w × 252). Σ 는 일간수익 공분산(pairwise 결측 대응). 유효 관측이
-    부족하거나 분산이 비양수면 None. 미래참조 방지를 위해 hist(=panel.loc[:d]) 만 쓴다.
-    """
-    syms = [s for s in weights if s in hist.columns and weights[s] > 0]
-    if not syms:
-        return None
-    rets = hist[syms].pct_change().tail(lookback)
-    if len(rets) < max(10, lookback // 2):
-        return None
-    cov = rets.cov().to_numpy(dtype=float)
-    w = np.array([weights[s] for s in syms], dtype=float)
-    if np.isnan(cov).any():
-        cov = np.nan_to_num(cov)  # 잔여 결측(짝없음)은 0 공분산으로
-    var_daily = float(w @ cov @ w)
-    if not (var_daily > 0):
-        return None
-    return math.sqrt(var_daily * 252.0)
-
-
-def _apply_risk_caps(
-    targets: dict[str, float], hist: pd.DataFrame, risk: dict
-) -> dict[str, float]:
-    """목표비중에 리스크 레이어(집중 한도→변동성 타겟팅)를 적용한다(P1-2).
-
-    MDD 킬스위치는 일별 자산가치가 필요하므로 여기가 아니라 시뮬레이션 루프에서 처리한다.
-    """
-    if not targets or not risk:
-        return targets
-    cap = risk.get("max_position_pct")
-    if cap:
-        targets = _cap_position_weights(targets, float(cap))
-    tv = risk.get("target_vol")
-    if tv:
-        vol = _portfolio_vol_ann(hist, targets, int(risk.get("vol_lookback", 20) or 20))
-        if vol and vol > 0:
-            max_lev = float(risk.get("max_leverage", 1.0) or 1.0)
-            scale = min(max_lev, float(tv) / vol)
-            if scale < 1.0 - 1e-9:  # 디레버리징(비중 축소)만 적용, 확대는 max_lev 로 캡
-                targets = {s: w * scale for s, w in targets.items()}
-    return targets
-
-
-def _safe(x) -> float | None:
-    """NaN/inf → None(JSON 안전)."""
-    try:
-        f = float(x)
-    except (TypeError, ValueError):
-        return None
-    return None if (math.isnan(f) or math.isinf(f)) else f
-
-
-def _risk_adjusted_metrics(
-    rets: np.ndarray, bench_rets: np.ndarray | None, rf_annual: float
-) -> dict[str, float | None]:
-    """일간 수익률로 위험조정·벤치마크 상대 지표를 산출한다(연율화 √252).
-
-    - Sharpe/Sortino: 무위험수익률(rf_annual, 연) 초과분 기준. Sortino 는 하방편차만 쓴다.
-    - beta/alpha: 포트 일간수익을 벤치마크 일간수익에 회귀(OLS 기울기=beta, Jensen alpha 연율).
-    - information_ratio/tracking_error: 초과수익(포트−벤치) 기준.
-    - benchmark_return/excess_return: 구간 누적 벤치마크 수익률·초과.
-
-    NaN 인 벤치마크 일자는 짝지어 제거한다. 벤치마크가 없으면 관련 키는 None.
-    """
-    out: dict[str, float | None] = {
-        "sharpe": None, "sortino": None, "beta": None, "alpha": None,
-        "information_ratio": None, "tracking_error": None,
-        "benchmark_return": None, "excess_return": None,
-    }
-    rf_daily = (1.0 + rf_annual) ** (1.0 / 252.0) - 1.0
-    ann = math.sqrt(252.0)
-
-    if len(rets) > 1:
-        std = rets.std(ddof=1)
-        if std > 0:
-            out["sharpe"] = _safe((rets.mean() - rf_daily) / std * ann)
-        downside = np.minimum(rets - rf_daily, 0.0)
-        dstd = math.sqrt(float((downside ** 2).mean()))  # 하방편차(목표수익 rf 기준)
-        if dstd > 0:
-            out["sortino"] = _safe((rets.mean() - rf_daily) / dstd * ann)
-
-    if bench_rets is None:
-        return out
-
-    mask = ~np.isnan(bench_rets)
-    p = rets[mask]
-    b = bench_rets[mask]
-    if len(b) > 1:
-        out["benchmark_return"] = _safe(float(np.prod(1.0 + b) - 1.0))
-        bvar = b.var(ddof=1)
-        if bvar > 0:
-            beta = float(np.cov(p, b, ddof=1)[0, 1] / bvar)
-            out["beta"] = _safe(beta)
-            out["alpha"] = _safe(((p.mean() - rf_daily) - beta * (b.mean() - rf_daily)) * 252.0)
-        active = p - b
-        astd = active.std(ddof=1)
-        if astd > 0:
-            out["tracking_error"] = _safe(astd * ann)
-            out["information_ratio"] = _safe(active.mean() / astd * ann)
-    return out
 
 
 def run_rebalance_backtest(

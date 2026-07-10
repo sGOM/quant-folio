@@ -783,7 +783,7 @@ async def _make_runner(
     monkeypatch.setattr(r, "_is_risk_off", fake_is_risk_off)
     monkeypatch.setattr(r, "_has_holdings", fake_has_holdings)
 
-    await r._maybe_rebalance()
+    await r._tick_once()
     return calls, set_last, redis
 
 

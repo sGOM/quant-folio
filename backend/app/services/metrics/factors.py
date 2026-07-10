@@ -1,0 +1,341 @@
+"""멀티팩터 스코어링 — 윈저라이징 z-score, 사이즈 중립화, 종합점수, 유니버스 점수.
+
+카테고리(모멘텀/밸류/저변동/퀄리티/성장) z-score 를 합성해 종합점수를 산출한다.
+`compute_universe_scores` 는 리밸런싱 selection.method="score" 전용 진입점으로,
+fetch(등락률/펀더멘털)·stocks(기술지표)·opendart(재무)를 조합한다.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import date
+
+import numpy as np
+import pandas as pd
+
+from app.services.data.loader import bounded_socket_timeout
+from app.services.metrics.common import _approx_start, _is_nan, _ymd
+from app.services.metrics.fetch import _fetch_fundamentals, _fetch_price_change
+
+logger = logging.getLogger("app.services.metrics")
+
+
+def _winsorize_zscore(s: pd.Series, invert: bool = False) -> pd.Series:
+    """1/99% 윈저라이징 후 z-score를 계산한다.
+
+    :param s: 입력 시계열 (NaN 포함 허용)
+    :param invert: True이면 부호 반전 (낮을수록 좋은 지표 처리)
+    :return: z-score Series (입력과 동일 인덱스, NaN 유지)
+    """
+    valid = s.dropna()
+    if len(valid) < 3:
+        return pd.Series(np.nan, index=s.index)
+
+    lo = valid.quantile(0.01)
+    hi = valid.quantile(0.99)
+    clipped = s.clip(lower=lo, upper=hi)
+    mu = clipped.mean()
+    std = clipped.std(ddof=0)
+
+    if std == 0 or not np.isfinite(std):
+        return pd.Series(0.0, index=s.index)
+
+    z = (clipped - mu) / std
+    return -z if invert else z
+
+
+#: 기본 팩터 카테고리 가중치(모멘텀/밸류/저변동/퀄리티/성장). 합=1.0.
+#: quality·growth 기본 0.0 — OpenDART 재무데이터가 필요하며, 배선하지 않은 기존
+#: 전략은 해당 컬럼 부재로 중립(0) 처리되어 영향받지 않는다.
+DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
+    "momentum": 0.4, "value": 0.3, "lowvol": 0.3, "quality": 0.0, "growth": 0.0,
+}
+
+
+def _neutralize_size(df: pd.DataFrame, factor_cols: list[str]) -> pd.DataFrame:
+    """각 팩터 카테고리 z-score 를 로그 시가총액 축에 대해 직교화한다(사이즈 중립화, P1-3).
+
+    residual = s − β·x, β = Σ(s·x)/Σ(x²), x = 표준화(로그 시총, 평균 0). 팩터 점수에서
+    선형 사이즈 노출을 제거해 '팩터가 사실상 대형/소형주 베팅으로 변질'되는 것을 막는다.
+    df["market_cap"](원) 이 없거나 유효 표본<5 면 원본을 그대로 둔다(중립화 생략). NaN 인
+    팩터/시총 행은 보존한다(랭킹 제외 로직 유지). df 를 제자리 수정하고 반환한다.
+    """
+    cap = df.get("market_cap")
+    if cap is None:
+        return df
+    logcap = np.log(cap.where(cap > 0).astype(float))
+    sd = logcap.std(ddof=0)
+    if not (sd > 0):
+        return df
+    x = (logcap - logcap.mean()) / sd   # 표준화 로그 시총(평균 0)
+    valid = x.notna()
+    if int(valid.sum()) < 5:
+        return df
+    xv = x[valid]
+    if not (float((xv ** 2).sum()) > 0):
+        return df
+    for col in factor_cols:
+        if col not in df.columns:
+            continue
+        s = df[col]
+        # 팩터·시총 모두 유효한 행에서만 β 추정·잔차화(팩터 NaN 행은 건드리지 않음).
+        m = valid & s.notna()
+        if int(m.sum()) < 5:
+            continue
+        sv = s[m]
+        xm = x[m]
+        # 무절편 OLS 사영 β = Σ_m(s·x)/Σ_m(x²). 분자·분모를 반드시 동일 표본(m)으로
+        # 계산해야 편향이 없다. denom 을 valid 전체(팩터 NaN 포함)의 Σx² 로 잡으면
+        # m ⊆ valid 라 분모가 과대 → β 가 0쪽으로 축소 → 사이즈 노출이 일부만 제거되고
+        # 소형주 틸트가 잔차에 남는다.
+        denom_m = float((xm ** 2).sum())
+        if not (denom_m > 0):
+            continue
+        beta = float((sv * xm).sum() / denom_m)
+        df.loc[m, col] = sv - beta * xm
+    return df
+
+
+def _compute_stock_scores(
+    df: pd.DataFrame,
+    weights: dict[str, float] | None = None,
+    neutralize: str = "none",
+) -> pd.DataFrame:
+    """후보 종목 데이터프레임에 종합 점수(score, score_*) 컬럼을 추가한다.
+
+    방향 정규화:
+      - PER, PBR, vol_ann: 낮을수록 좋음 → invert=True
+      - mdd_252: 음수값, 0에 가까울수록(작은 낙폭) 좋음 → 높을수록 좋으므로 invert 불필요
+      - DIV, 모멘텀 지표, high_52w_ratio: 높을수록 좋음 → invert=False
+
+    결측 처리:
+      - PER 음수(적자) 종목: 밸류 z에서 PER 제외, 중립(0) 처리
+      - 모멘텀 결측 종목(mom_6m=NaN): score=NaN → 랭킹 제외
+      - 기타 결측: 중립(0) 처리
+
+    :param weights: 카테고리 합성 가중치 {"momentum","value","lowvol"}(합=1.0 권장).
+        None 이면 DEFAULT_FACTOR_WEIGHTS(0.4/0.3/0.3) 사용. 리밸런싱 전략의
+        RebalanceSelection.factor_weights 로 전략별 커스터마이즈가 가능하다
+        (스키마 레벨 합=1 검증은 app.schemas.strategy.FactorWeights 가 수행하므로
+        여기서는 재검증하지 않는다).
+    """
+    w = weights or DEFAULT_FACTOR_WEIGHTS
+    result = df.copy()
+
+    # ── 모멘텀 카테고리 z-score ──
+    z_m1 = _winsorize_zscore(df.get("mom_1m", pd.Series(np.nan, index=df.index)))
+    z_m3 = _winsorize_zscore(df.get("mom_3m", pd.Series(np.nan, index=df.index)))
+    z_m6 = _winsorize_zscore(df.get("mom_6m", pd.Series(np.nan, index=df.index)))
+    z_h52 = _winsorize_zscore(df.get("high_52w_ratio", pd.Series(np.nan, index=df.index)))
+
+    # 각 z-score 결측은 0(중립)으로 채운 뒤 평균 → 전체 결측이면 NaN
+    mom_stack = pd.concat([
+        z_m1.fillna(0), z_m3.fillna(0), z_m6.fillna(0), z_h52.fillna(0)
+    ], axis=1)
+    score_momentum = mom_stack.mean(axis=1)
+    # mom_6m 결측 종목은 모멘텀 점수 NaN → 랭킹 제외
+    score_momentum = score_momentum.where(df.get("mom_6m", pd.Series(np.nan, index=df.index)).notna())
+
+    # ── 밸류에이션 카테고리 z-score ──
+    # 컬럼명은 대문자 PER/PBR/DIV 로 통일한다. 데이터 생성부(_fetch_fundamentals,
+    # compute_stocks, compute_universe_scores)가 모두 대문자로 채우므로 여기서도
+    # 대문자로 읽어야 밸류 팩터가 실제로 반영된다(소문자로 읽으면 항상 결측→중립 0
+    # 이 되어 밸류 가중치가 통째로 무시되는 버그가 있었다).
+    per_col = df.get("PER", pd.Series(np.nan, index=df.index))
+    per_pos = per_col.where(per_col > 0)   # 음수 PER → NaN
+    z_per = _winsorize_zscore(per_pos, invert=True).fillna(0.0)   # 결측→중립
+    z_pbr = _winsorize_zscore(
+        df.get("PBR", pd.Series(np.nan, index=df.index)), invert=True
+    ).fillna(0.0)
+    z_div = _winsorize_zscore(
+        df.get("DIV", pd.Series(np.nan, index=df.index))
+    ).fillna(0.0)
+    score_value = pd.concat([z_per, z_pbr, z_div], axis=1).mean(axis=1)
+
+    # ── 저변동 카테고리 z-score ──
+    z_vol = _winsorize_zscore(
+        df.get("vol_ann", pd.Series(np.nan, index=df.index)), invert=True
+    ).fillna(0.0)
+    # mdd_252는 음수(예: -0.15), 0에 가까울수록 좋음 → z-score 그대로(반전 불필요)
+    z_mdd = _winsorize_zscore(
+        df.get("mdd_252", pd.Series(np.nan, index=df.index))
+    ).fillna(0.0)
+    score_lowvol = pd.concat([z_vol, z_mdd], axis=1).mean(axis=1)
+
+    # ── 퀄리티 카테고리 z-score (OpenDART 재무데이터) ──
+    # ROE 높을수록·부채비율 낮을수록·FCF 흑자일수록 우량. FCF 는 원화 절대액이라
+    # 크기 편향이 있어 '흑자 여부(1/0)'로 스케일-프리하게 반영한다. 세 컬럼이 모두
+    # 없으면(=OpenDART 미배선) score_quality 는 전부 0(중립)이 되어 기존 전략 무영향.
+    roe_col = df.get("roe", pd.Series(np.nan, index=df.index))
+    debt_col = df.get("debt_ratio", pd.Series(np.nan, index=df.index))
+    fcf_col = df.get("fcf", pd.Series(np.nan, index=df.index))
+    fscore_col = df.get("f_score", pd.Series(np.nan, index=df.index))
+    z_roe = _winsorize_zscore(roe_col).fillna(0.0)
+    z_debt = _winsorize_zscore(debt_col, invert=True).fillna(0.0)  # 저부채 우량
+    fcf_pos = fcf_col.where(fcf_col.notna())  # NaN 유지
+    fcf_pos = (fcf_pos > 0).astype(float).where(fcf_col.notna())   # 흑자=1, 적자=0, 결측 NaN
+    z_fcf = _winsorize_zscore(fcf_pos).fillna(0.0)
+    z_fscore = _winsorize_zscore(fscore_col).fillna(0.0)  # Piotroski F-Score(0~8), 높을수록 우량
+    score_quality = pd.concat([z_roe, z_debt, z_fcf, z_fscore], axis=1).mean(axis=1)
+
+    # ── 성장(실적상향) 카테고리 z-score (OpenDART 재무데이터) ──
+    # 영업이익·순이익 YoY 성장률(높을수록 우량) + 흑자전환(1/0). 세 컬럼이 모두
+    # 없으면(=OpenDART 미배선) score_growth 는 전부 0(중립) → 기존 전략 무영향.
+    z_opg = _winsorize_zscore(
+        df.get("op_growth", pd.Series(np.nan, index=df.index))
+    ).fillna(0.0)
+    z_netg = _winsorize_zscore(
+        df.get("net_growth", pd.Series(np.nan, index=df.index))
+    ).fillna(0.0)
+    z_turn = _winsorize_zscore(
+        df.get("turnaround", pd.Series(np.nan, index=df.index))
+    ).fillna(0.0)
+    score_growth = pd.concat([z_opg, z_netg, z_turn], axis=1).mean(axis=1)
+
+    # 카테고리 점수를 프레임에 싣는다(중립화·종합점수 산출의 기준).
+    result["score_momentum"] = score_momentum
+    result["score_value"] = score_value
+    result["score_lowvol"] = score_lowvol
+    result["score_quality"] = score_quality
+    result["score_growth"] = score_growth
+
+    # ── 팩터 중립화(P1-3): 종합 전에 각 카테고리 점수를 지정 축에 직교화한다 ──
+    cat_cols = ["score_momentum", "score_value", "score_lowvol", "score_quality", "score_growth"]
+    if neutralize == "size":
+        result = _neutralize_size(result, cat_cols)
+
+    # ── 종합 점수(중립화 후 카테고리 점수로 합성) ──
+    score = (
+        w.get("momentum", DEFAULT_FACTOR_WEIGHTS["momentum"]) * result["score_momentum"]
+        + w.get("value", DEFAULT_FACTOR_WEIGHTS["value"]) * result["score_value"]
+        + w.get("lowvol", DEFAULT_FACTOR_WEIGHTS["lowvol"]) * result["score_lowvol"]
+        + w.get("quality", DEFAULT_FACTOR_WEIGHTS["quality"]) * result["score_quality"]
+        + w.get("growth", DEFAULT_FACTOR_WEIGHTS["growth"]) * result["score_growth"]
+    )
+    result["score"] = score.round(4)
+    for c in cat_cols:
+        result[c] = result[c].round(4)
+
+    return result
+
+
+def compute_universe_scores(
+    symbols: list[str],
+    as_of: date,
+    factor_weights: dict[str, float] | None = None,
+    neutralize: str = "none",
+) -> dict[str, float]:
+    """리밸런싱 selection.method="score" 전용: 지정 종목들의 종합점수를 계산한다.
+
+    compute_stocks() 는 전 시장을 스캔해 시가총액 상위 200종목으로 제한하지만,
+    리밸런싱 universe 는 이미 사용자가 지정한 소수 종목(≤50)이므로 해당 종목만
+    직접 조회해 점수를 산출한다(불필요한 전 시장 스캔 비용을 피함).
+
+    미래참조 방지: as_of 는 반드시 직전 확정 영업일 이하여야 한다(호출자가
+    _last_business_day() 등으로 결정). 장중(당일 미확정 종가) 호출을 막기 위해
+    이 함수는 as_of 를 스스로 "오늘"로 보정하지 않는다 — 호출자 책임이다.
+
+    :param symbols: 종목코드 목록(6자리, 미확정 zero-fill 은 함수 내부에서 처리)
+    :param as_of: 점수 산출 기준일(확정 영업일)
+    :param factor_weights: {"momentum","value","lowvol"} 카테고리 가중치. None 이면 기본값.
+    :return: {종목코드: score} dict. 데이터 부족(예: mom_6m 결측)으로 계산 불가한
+        종목은 결과에서 제외된다(compute_target_weights 가 자연히 후순위/미선정 처리).
+    """
+    # _compute_tech_indicators 는 stocks 모듈에 있고, stocks 는 factors._compute_stock_scores
+    # 를 최상위 임포트하므로 여기서 최상위 임포트하면 순환이 된다 → 함수 내부 지연 임포트.
+    from app.services.metrics.stocks import _compute_tech_indicators
+
+    if not symbols:
+        return {}
+
+    codes = [str(s).strip().zfill(6) for s in symbols]
+    as_of_ymd = _ymd(as_of)
+    mkts = ["KOSPI", "KOSDAQ"]  # universe 종목의 소속 시장을 미리 알 수 없어 양쪽 조회
+
+    # pykrx 내부 호출 다수(get_market_fundamental/get_market_price_change 등)가 자체
+    # timeout 을 지정하지 않아, 응답 지연 시 이 함수 전체(최대 종목 수만큼 반복 호출)가
+    # 무한 대기할 수 있다. 소켓 레벨로 일괄 방어한다(개별 호출은 각자 try/except 로
+    # 이미 예외를 흡수하므로, 타임아웃 예외가 나면 해당 조회만 건너뛰고 계속 진행된다).
+    with bounded_socket_timeout(20):
+        fund_df = _fetch_fundamentals(as_of_ymd, mkts)
+        pc_21d = _fetch_price_change(_ymd(_approx_start(as_of, 21)), as_of_ymd, mkts)
+        pc_63d = _fetch_price_change(_ymd(_approx_start(as_of, 63)), as_of_ymd, mkts)
+        pc_126d = _fetch_price_change(_ymd(_approx_start(as_of, 126)), as_of_ymd, mkts)
+
+    # 모멘텀 팩터 완전 소멸 방어: 모멘텀 가중치가 유의미한데 3개 기간 등락률 조회가
+    # '모두' 비었으면 이는 개별 종목의 정상 NaN 이 아니라 KRX 조회 자체의 일시 장애다.
+    # 이 상태로 진행하면 스코어러가 남은 밸류/저변동만으로 재정규화해 에러 없이 전혀
+    # 다른 목표 포트폴리오를 산출하고 러너가 그대로 주문한다. 예외를 올려 이번 리밸런싱을
+    # 건너뛰면 러너 틱 루프가 잡아 다음 주기에 온전한 팩터로 재시도한다.
+    _w = factor_weights or DEFAULT_FACTOR_WEIGHTS
+    if float(_w.get("momentum", 0.0) or 0.0) > 0 and pc_21d.empty and pc_63d.empty and pc_126d.empty:
+        raise RuntimeError(
+            "모멘텀 팩터 데이터 전량 조회 실패(등락률 21/63/126일 모두 빈 응답) — "
+            "왜곡된 목표 산출 방지 위해 리밸런싱 건너뜀(다음 주기 재시도)"
+        )
+
+    rows: list[dict] = []
+    for code in codes:
+        row: dict = {"code": code}
+        if not fund_df.empty and code in fund_df.index:
+            f = fund_df.loc[code]
+            row["PER"] = f.get("PER")
+            row["PBR"] = f.get("PBR")
+            row["DIV"] = f.get("DIV")
+        if not pc_21d.empty and code in pc_21d.index and "등락률" in pc_21d.columns:
+            row["mom_1m"] = float(pc_21d.loc[code, "등락률"]) / 100.0
+        if not pc_63d.empty and code in pc_63d.index and "등락률" in pc_63d.columns:
+            row["mom_3m"] = float(pc_63d.loc[code, "등락률"]) / 100.0
+        if not pc_126d.empty and code in pc_126d.index and "등락률" in pc_126d.columns:
+            row["mom_6m"] = float(pc_126d.loc[code, "등락률"]) / 100.0
+        rows.append(row)
+
+    df = pd.DataFrame(rows).set_index("code")
+
+    hist_start_ymd = _ymd(_approx_start(as_of, 270, buffer=30))
+    tech_rows: list[dict] = []
+    for code in codes:
+        tech = _compute_tech_indicators(code, hist_start_ymd, as_of_ymd)
+        tech["code"] = code
+        tech_rows.append(tech)
+    tech_df = pd.DataFrame(tech_rows).set_index("code") if tech_rows else pd.DataFrame()
+
+    for col in ["high_52w_ratio", "vol_ann", "mdd_252"]:
+        if col in tech_df.columns:
+            df[col] = tech_df[col]
+
+    # 퀄리티 팩터(OpenDART 재무데이터, PIT 공시지연). 키 부재 시 {} → 컬럼 미추가로
+    # 중립 처리된다. factor_weights.quality>0 인 전략에서만 실제로 점수에 반영된다.
+    try:
+        from app.services.data import opendart
+
+        qmetrics = opendart.metrics_by_symbol(codes, as_of)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("OpenDART 퀄리티 팩터 조회 실패 — 중립 처리: %s", e)
+        qmetrics = {}
+    if qmetrics:
+        qdf = pd.DataFrame.from_dict(qmetrics, orient="index")
+        for col in ("roe", "debt_ratio", "fcf", "f_score",
+                    "op_growth", "net_growth", "turnaround"):
+            if col in qdf.columns:
+                df[col] = qdf[col].reindex(df.index)
+
+    # 사이즈 중립화(P1-3): 시가총액(PIT)을 붙여 스코어러가 로그 시총 축에 직교화한다.
+    if neutralize == "size":
+        try:
+            from app.services.data import krx_index
+
+            caps = krx_index.market_caps(as_of)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("사이즈 중립화용 시가총액 조회 실패 — 중립화 생략: %s", e)
+            caps = {}
+        if caps:
+            df["market_cap"] = pd.Series(
+                {c: caps.get(c) for c in df.index}, dtype="float64"
+            ).reindex(df.index)
+
+    scored = _compute_stock_scores(df, weights=factor_weights, neutralize=neutralize)
+    return {
+        code: float(val)
+        for code, val in scored["score"].items()
+        if not _is_nan(val)
+    }
