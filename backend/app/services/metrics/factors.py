@@ -121,11 +121,20 @@ def _compute_stock_scores(
     w = weights or DEFAULT_FACTOR_WEIGHTS
     result = df.copy()
 
+    # 컬럼 접근/z-score 헬퍼 — 없는 컬럼은 전 종목 결측(NaN) 시리즈로 대체.
+    nan_series = pd.Series(np.nan, index=df.index)
+
+    def _col(name: str) -> pd.Series:
+        return df.get(name, nan_series)
+
+    def _zc(name: str, *, invert: bool = False, fill: float = 0.0) -> pd.Series:
+        return _winsorize_zscore(_col(name), invert=invert).fillna(fill)
+
     # ── 모멘텀 카테고리 z-score ──
-    z_m1 = _winsorize_zscore(df.get("mom_1m", pd.Series(np.nan, index=df.index)))
-    z_m3 = _winsorize_zscore(df.get("mom_3m", pd.Series(np.nan, index=df.index)))
-    z_m6 = _winsorize_zscore(df.get("mom_6m", pd.Series(np.nan, index=df.index)))
-    z_h52 = _winsorize_zscore(df.get("high_52w_ratio", pd.Series(np.nan, index=df.index)))
+    z_m1 = _winsorize_zscore(_col("mom_1m"))
+    z_m3 = _winsorize_zscore(_col("mom_3m"))
+    z_m6 = _winsorize_zscore(_col("mom_6m"))
+    z_h52 = _winsorize_zscore(_col("high_52w_ratio"))
 
     # 각 z-score 결측은 0(중립)으로 채운 뒤 평균 → 전체 결측이면 NaN
     mom_stack = pd.concat([
@@ -133,62 +142,44 @@ def _compute_stock_scores(
     ], axis=1)
     score_momentum = mom_stack.mean(axis=1)
     # mom_6m 결측 종목은 모멘텀 점수 NaN → 랭킹 제외
-    score_momentum = score_momentum.where(df.get("mom_6m", pd.Series(np.nan, index=df.index)).notna())
+    score_momentum = score_momentum.where(_col("mom_6m").notna())
 
     # ── 밸류에이션 카테고리 z-score ──
     # 컬럼명은 대문자 PER/PBR/DIV 로 통일한다. 데이터 생성부(_fetch_fundamentals,
     # compute_stocks, compute_universe_scores)가 모두 대문자로 채우므로 여기서도
     # 대문자로 읽어야 밸류 팩터가 실제로 반영된다(소문자로 읽으면 항상 결측→중립 0
     # 이 되어 밸류 가중치가 통째로 무시되는 버그가 있었다).
-    per_col = df.get("PER", pd.Series(np.nan, index=df.index))
+    per_col = _col("PER")
     per_pos = per_col.where(per_col > 0)   # 음수 PER → NaN
     z_per = _winsorize_zscore(per_pos, invert=True).fillna(0.0)   # 결측→중립
-    z_pbr = _winsorize_zscore(
-        df.get("PBR", pd.Series(np.nan, index=df.index)), invert=True
-    ).fillna(0.0)
-    z_div = _winsorize_zscore(
-        df.get("DIV", pd.Series(np.nan, index=df.index))
-    ).fillna(0.0)
+    z_pbr = _zc("PBR", invert=True)
+    z_div = _zc("DIV")
     score_value = pd.concat([z_per, z_pbr, z_div], axis=1).mean(axis=1)
 
     # ── 저변동 카테고리 z-score ──
-    z_vol = _winsorize_zscore(
-        df.get("vol_ann", pd.Series(np.nan, index=df.index)), invert=True
-    ).fillna(0.0)
+    z_vol = _zc("vol_ann", invert=True)
     # mdd_252는 음수(예: -0.15), 0에 가까울수록 좋음 → z-score 그대로(반전 불필요)
-    z_mdd = _winsorize_zscore(
-        df.get("mdd_252", pd.Series(np.nan, index=df.index))
-    ).fillna(0.0)
+    z_mdd = _zc("mdd_252")
     score_lowvol = pd.concat([z_vol, z_mdd], axis=1).mean(axis=1)
 
     # ── 퀄리티 카테고리 z-score (OpenDART 재무데이터) ──
     # ROE 높을수록·부채비율 낮을수록·FCF 흑자일수록 우량. FCF 는 원화 절대액이라
     # 크기 편향이 있어 '흑자 여부(1/0)'로 스케일-프리하게 반영한다. 세 컬럼이 모두
     # 없으면(=OpenDART 미배선) score_quality 는 전부 0(중립)이 되어 기존 전략 무영향.
-    roe_col = df.get("roe", pd.Series(np.nan, index=df.index))
-    debt_col = df.get("debt_ratio", pd.Series(np.nan, index=df.index))
-    fcf_col = df.get("fcf", pd.Series(np.nan, index=df.index))
-    fscore_col = df.get("f_score", pd.Series(np.nan, index=df.index))
-    z_roe = _winsorize_zscore(roe_col).fillna(0.0)
-    z_debt = _winsorize_zscore(debt_col, invert=True).fillna(0.0)  # 저부채 우량
-    fcf_pos = fcf_col.where(fcf_col.notna())  # NaN 유지
-    fcf_pos = (fcf_pos > 0).astype(float).where(fcf_col.notna())   # 흑자=1, 적자=0, 결측 NaN
+    fcf_col = _col("fcf")
+    z_roe = _zc("roe")
+    z_debt = _zc("debt_ratio", invert=True)  # 저부채 우량
+    fcf_pos = (fcf_col > 0).astype(float).where(fcf_col.notna())   # 흑자=1, 적자=0, 결측 NaN
     z_fcf = _winsorize_zscore(fcf_pos).fillna(0.0)
-    z_fscore = _winsorize_zscore(fscore_col).fillna(0.0)  # Piotroski F-Score(0~8), 높을수록 우량
+    z_fscore = _zc("f_score")  # Piotroski F-Score(0~8), 높을수록 우량
     score_quality = pd.concat([z_roe, z_debt, z_fcf, z_fscore], axis=1).mean(axis=1)
 
     # ── 성장(실적상향) 카테고리 z-score (OpenDART 재무데이터) ──
     # 영업이익·순이익 YoY 성장률(높을수록 우량) + 흑자전환(1/0). 세 컬럼이 모두
     # 없으면(=OpenDART 미배선) score_growth 는 전부 0(중립) → 기존 전략 무영향.
-    z_opg = _winsorize_zscore(
-        df.get("op_growth", pd.Series(np.nan, index=df.index))
-    ).fillna(0.0)
-    z_netg = _winsorize_zscore(
-        df.get("net_growth", pd.Series(np.nan, index=df.index))
-    ).fillna(0.0)
-    z_turn = _winsorize_zscore(
-        df.get("turnaround", pd.Series(np.nan, index=df.index))
-    ).fillna(0.0)
+    z_opg = _zc("op_growth")
+    z_netg = _zc("net_growth")
+    z_turn = _zc("turnaround")
     score_growth = pd.concat([z_opg, z_netg, z_turn], axis=1).mean(axis=1)
 
     # 카테고리 점수를 프레임에 싣는다(중립화·종합점수 산출의 기준).

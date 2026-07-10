@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import { formatPercent, trendColor } from "@/lib/format";
+import { fmtPct, fmtNum, fmtAmt, pctColor } from "@/lib/format";
 
 // ─────────────────────────── 팩터 정의 ───────────────────────────
 
@@ -67,28 +67,6 @@ const PRESETS: { label: string; weights: Weights }[] = [
 
 const DEFAULT_WEIGHTS: Weights = PRESETS[0].weights;
 const TOPN_OPTIONS = [10, 20, 30, 50];
-
-// ─────────────────────────── 포맷 헬퍼 ───────────────────────────
-
-function fmtPct(v: number | null | undefined, digits = 1): string {
-  if (v == null) return "-";
-  return formatPercent(v, digits);
-}
-function fmtNum(v: number | null | undefined, digits = 1): string {
-  if (v == null) return "-";
-  return v.toFixed(digits);
-}
-function fmtAmt(v: number | null | undefined): string {
-  if (v == null) return "-";
-  const uk = v / 100_000_000;
-  if (uk >= 10_000) return `${(uk / 10_000).toFixed(1)}조`;
-  if (uk >= 1) return `${Math.round(uk).toLocaleString("ko-KR")}억`;
-  return `${Math.round(v / 10_000).toLocaleString("ko-KR")}만`;
-}
-function pctColor(v: number | null | undefined): string {
-  if (v == null) return "text-muted-foreground";
-  return trendColor(v);
-}
 
 // ─────────────────────────── 페이지 진입점 ───────────────────────────
 

@@ -120,26 +120,15 @@ def compute_stocks(market: str, as_of: date) -> StocksOut:
         if "등락률" in pc_1d.columns:
             merged["change_rate"] = _pct_dec(pc_1d["등락률"])
 
-    # 21-day 모멘텀 및 거래대금
-    if not pc_21d.empty:
-        if "등락률" in pc_21d.columns:
-            merged["mom_1m"] = _pct_dec(pc_21d["등락률"])
-        if "거래대금" in pc_21d.columns:
-            # 총 거래대금 / 20 = 일평균 (약 20 영업일)
-            merged["total_tv_21d"] = pc_21d["거래대금"]
-            merged["avg_value_20"] = pc_21d["거래대금"] / 20.0
+    # 21-day 거래대금(일평균 ≈ 20 영업일)
+    if not pc_21d.empty and "거래대금" in pc_21d.columns:
+        merged["avg_value_20"] = pc_21d["거래대금"] / 20.0
 
-    # 63-day 모멘텀
-    if not pc_63d.empty and "등락률" in pc_63d.columns:
-        merged["mom_3m"] = _pct_dec(pc_63d["등락률"])
-
-    # 126-day 모멘텀
-    if not pc_126d.empty and "등락률" in pc_126d.columns:
-        merged["mom_6m"] = _pct_dec(pc_126d["등락률"])
-
-    # 12-1 모멘텀
-    if not pc_12_1.empty and "등락률" in pc_12_1.columns:
-        merged["mom_12_1"] = _pct_dec(pc_12_1["등락률"])
+    # 기간별 모멘텀(등락률 → 소수 수익률)
+    for src, dst in ((pc_21d, "mom_1m"), (pc_63d, "mom_3m"),
+                     (pc_126d, "mom_6m"), (pc_12_1, "mom_12_1")):
+        if not src.empty and "등락률" in src.columns:
+            merged[dst] = _pct_dec(src["등락률"])
 
     # price 계산: 종가 우선, 없으면 시가총액/상장주식수
     if "price_close" not in merged.columns:
@@ -284,9 +273,8 @@ def _compute_tech_indicators(code: str, start_ymd: str, end_ymd: str) -> dict:
         # 연율 변동성
         result["vol_ann"] = _compute_vol_ann(close.tail(253))
 
-        # MDD_252
-        if len(close) >= 2:
-            result["mdd_252"] = _compute_mdd(close.tail(252))
+        # MDD_252 (여기선 len(close) >= 20 이 보장됨)
+        result["mdd_252"] = _compute_mdd(close.tail(252))
 
         # 정배열: SMA5 > SMA20 > SMA60 > SMA120 (signals.py의 _sma 재사용)
         if len(close) >= 120:

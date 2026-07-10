@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from app.schemas.screener import TurnaroundCandidate, TurnaroundScreenOut
+from app.services._num import is_nan
 from app.services.data import opendart
 from app.services.metrics import (
     _approx_start,
@@ -116,7 +117,7 @@ def screen_turnaround(
     items: list[TurnaroundCandidate] = []
     for code in candidates:
         surge_v = _safe_float(liquid.loc[code, "turnover_surge"])
-        mcap = int(liquid.loc[code, "시가총액"]) if not _isnan(liquid.loc[code, "시가총액"]) else 0
+        mcap = int(liquid.loc[code, "시가총액"]) if not is_nan(liquid.loc[code, "시가총액"]) else 0
         avgv = _safe_float(liquid.loc[code, "avg_value_20"]) or 0.0
         mkt = str(liquid.loc[code].get("시장", "")) if "시장" in liquid.columns else market
 
@@ -194,8 +195,3 @@ def _candidate_score(surge, turn, netg, fscore, net) -> float:
     return score
 
 
-def _isnan(x) -> bool:
-    try:
-        return not np.isfinite(float(x))
-    except (TypeError, ValueError):
-        return True

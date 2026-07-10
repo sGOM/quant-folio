@@ -8,18 +8,7 @@ import { Nav } from "@/components/Nav";
 import { RequireAuth } from "@/components/RequireAuth";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { formatPercent, trendColor } from "@/lib/format";
-
-function fmtAmt(v: number | null | undefined): string {
-  if (v == null) return "-";
-  const uk = v / 100_000_000;
-  if (uk >= 10_000) return `${(uk / 10_000).toFixed(1)}조`;
-  if (uk >= 1) return `${Math.round(uk).toLocaleString("ko-KR")}억`;
-  return `${Math.round(v / 10_000).toLocaleString("ko-KR")}만`;
-}
-function fmtPct(v: number | null | undefined, d = 0): string {
-  return v == null ? "-" : formatPercent(v, d);
-}
+import { fmtPct, fmtAmt, trendColor } from "@/lib/format";
 
 const MARKETS: MetricMarket[] = ["ALL", "KOSDAQ", "KOSPI"];
 
@@ -174,7 +163,7 @@ export default function ScreenerPage() {
                           {c.debt_ratio == null ? "-" : `${Math.round(c.debt_ratio * 100)}%`}
                         </td>
                         <td className={`text-right tabular-nums ${trendColor(c.net_growth ?? 0)}`}>
-                          {fmtPct(c.net_growth)}
+                          {fmtPct(c.net_growth, 0)}
                         </td>
                         <td className={`text-center tabular-nums font-semibold ${fscoreColor(c.f_score)}`}>
                           {c.f_score == null ? "-" : `${c.f_score}/8`}

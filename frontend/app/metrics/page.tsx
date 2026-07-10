@@ -28,7 +28,7 @@ import {
   TooltipProvider,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { formatPercent, trendColor } from "@/lib/format";
+import { fmtPct, fmtNum, fmtAmt, pctColor } from "@/lib/format";
 
 /** 종합점수(score) 계산 방식 설명 — 헤더 툴팁·안내에 공용으로 사용. */
 const SCORE_HINT =
@@ -37,33 +37,6 @@ const SCORE_HINT =
   "(PER·PBR·변동성은 낮을수록 가점). 0 이상이면 평균 이상, 값이 클수록 상대적으로 우수합니다. 절대 수익률이 아닙니다.";
 
 // ─────────────────────────── 포맷 헬퍼 ───────────────────────────
-
-/** null 가능한 소수 비율을 퍼센트 문자열로 변환. */
-function fmtPct(v: number | null | undefined, digits = 1): string {
-  if (v == null) return "-";
-  return formatPercent(v, digits);
-}
-
-/** null 가능한 숫자를 소수점 자릿수로 변환. */
-function fmtNum(v: number | null | undefined, digits = 1): string {
-  if (v == null) return "-";
-  return v.toFixed(digits);
-}
-
-/** 시가총액/거래대금을 억 단위로 변환. */
-function fmtAmt(v: number | null | undefined): string {
-  if (v == null) return "-";
-  const uk = v / 100_000_000; // 억
-  if (uk >= 10_000) return `${(uk / 10_000).toFixed(1)}조`;
-  if (uk >= 1) return `${Math.round(uk).toLocaleString("ko-KR")}억`;
-  return `${Math.round(v / 10_000).toLocaleString("ko-KR")}만`;
-}
-
-/** null 가능한 비율에 대한 CSS 색상 클래스. */
-function pctColor(v: number | null | undefined): string {
-  if (v == null) return "text-muted-foreground";
-  return trendColor(v);
-}
 
 /** 기준일 문자열을 표시용으로 포맷. */
 function fmtDate(s: string): string {
