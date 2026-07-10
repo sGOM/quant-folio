@@ -38,6 +38,7 @@ import pandas as pd
 
 from app.schemas.metrics import SectorMetric, SectorsOut, StockMetric, StocksOut
 from app.services.backtest.signals import _rsi, _sma  # 백테스트와 동일 정의 재사용
+from app.services.data.loader import bounded_socket_timeout  # pykrx 무응답 행 방지
 from app.services.data.loader import load_ohlcv
 from app.services.market import is_business_day
 from app.services.symbols import get_catalog
@@ -253,7 +254,8 @@ def _fetch_index_ohlcv(start_ymd: str, end_ymd: str, ticker: str) -> pd.DataFram
     from pykrx import stock
 
     try:
-        df = stock.get_index_ohlcv(start_ymd, end_ymd, ticker)
+        with bounded_socket_timeout(20):
+            df = stock.get_index_ohlcv(start_ymd, end_ymd, ticker)
         if df is None or df.empty:
             return None
         df = df.rename(columns={
@@ -523,10 +525,15 @@ def compute_universe_scores(
     as_of_ymd = _ymd(as_of)
     mkts = ["KOSPI", "KOSDAQ"]  # universe 종목의 소속 시장을 미리 알 수 없어 양쪽 조회
 
-    fund_df = _fetch_fundamentals(as_of_ymd, mkts)
-    pc_21d = _fetch_price_change(_ymd(_approx_start(as_of, 21)), as_of_ymd, mkts)
-    pc_63d = _fetch_price_change(_ymd(_approx_start(as_of, 63)), as_of_ymd, mkts)
-    pc_126d = _fetch_price_change(_ymd(_approx_start(as_of, 126)), as_of_ymd, mkts)
+    # pykrx 내부 호출 다수(get_market_fundamental/get_market_price_change 등)가 자체
+    # timeout 을 지정하지 않아, 응답 지연 시 이 함수 전체(최대 종목 수만큼 반복 호출)가
+    # 무한 대기할 수 있다. 소켓 레벨로 일괄 방어한다(개별 호출은 각자 try/except 로
+    # 이미 예외를 흡수하므로, 타임아웃 예외가 나면 해당 조회만 건너뛰고 계속 진행된다).
+    with bounded_socket_timeout(20):
+        fund_df = _fetch_fundamentals(as_of_ymd, mkts)
+        pc_21d = _fetch_price_change(_ymd(_approx_start(as_of, 21)), as_of_ymd, mkts)
+        pc_63d = _fetch_price_change(_ymd(_approx_start(as_of, 63)), as_of_ymd, mkts)
+        pc_126d = _fetch_price_change(_ymd(_approx_start(as_of, 126)), as_of_ymd, mkts)
 
     rows: list[dict] = []
     for code in codes:

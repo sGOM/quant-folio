@@ -46,6 +46,12 @@ from engine.runner import _position_lock
 logger = logging.getLogger("engine.rebalance_runner")
 
 _POLL_INTERVAL = 60  # 초 — 발화 시점 점검 주기
+# 틱 1회 최대 허용 시간. compute_universe_scores 가 종목별로 pykrx/OpenDART 를 순차
+# 조회하는데, 그중 일부(pykrx)는 자체 타임아웃이 없어 KRX 응답 지연 시 무한 대기할 수
+# 있다. asyncio.wait_for 로 감싸 특정 틱이 걸려도 다음 주기에 러너가 계속 진행되게 한다
+# (단, to_thread 로 넘어간 하위 스레드 자체는 취소되지 않고 백그라운드에서 계속 대기한다 —
+#  이벤트 루프를 다시 살리는 것이 목적이며 스레드 강제 종료는 아니다).
+_TICK_TIMEOUT = 300  # 초
 _LAST_PREFIX = "rebalance:last:"
 _REGIME_PREFIX = "rebalance:regime:"  # 직전 레짐 상태(risk-off 여부) 보관
 _LAST_TTL = 60 * 60 * 24 * 90  # 90일(휴장 등 대비 여유)
@@ -96,7 +102,12 @@ class RebalanceRunner:
         )
         while not stop_event.is_set():
             try:
-                await self._maybe_rebalance()
+                await asyncio.wait_for(self._maybe_rebalance(), timeout=_TICK_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "리밸런싱 전략 %d 점검 타임아웃(%d초) — 외부 조회 지연으로 판단, "
+                    "이번 틱 중단하고 다음 주기 재시도", self.strategy_id, _TICK_TIMEOUT,
+                )
             except Exception:  # noqa: BLE001
                 logger.exception("리밸런싱 전략 %d 점검 오류", self.strategy_id)
             try:
@@ -117,12 +128,18 @@ class RebalanceRunner:
         now = now_kst()
         rf = self._cfg.get("regime_filter") or {}
         regime_enabled = bool(rf.get("enabled"))
+        logger.info(
+            "전략 %d 틱 시작 (now=%s, regime_enabled=%s, market_open=%s)",
+            self.strategy_id, now.isoformat(), regime_enabled, is_market_open(now),
+        )
 
         risk_off = False
         reentry = False
         # 레짐 전환 판정은 장중에만(주문 실행 가능 시점). 매 tick 확인해 회복 즉시 반응.
         if regime_enabled and is_market_open(now):
+            logger.info("전략 %d 레짐 체크 진입", self.strategy_id)
             risk_off = await self._is_risk_off()
+            logger.info("전략 %d 레짐 체크 완료: risk_off=%s", self.strategy_id, risk_off)
             prev = await self._get_regime()
             await self._set_regime(risk_off)
             # risk-off → risk-on 전환이고 현재 현금(보유 없음) 상태면 재진입 트리거.
@@ -137,6 +154,9 @@ class RebalanceRunner:
 
         last = await self._get_last()
         due = is_rebalance_due(self._cfg, last, now)
+        logger.info(
+            "전략 %d 발화 판정: last=%s due=%s reentry=%s", self.strategy_id, last, due, reentry,
+        )
 
         # 콜드 스타트 즉시 발화: initial_fill_immediate=true 이고 아직 한 번도 실행한 적이
         # 없으며(last 미기록 & 보유 없음) 장중이면, cadence 발화일/시각을 기다리지 않고 즉시
@@ -218,6 +238,7 @@ class RebalanceRunner:
         # 후보풀(pool): 고정 목록 또는 시점별(PIT) 지수 구성종목. 보유 청산 판정은 축소 전
         # pool 전체로 해야 후보풀에서 빠진 보유종목도 목표 0 으로 매도된다.
         pool = await self._resolve_universe(as_of)
+        logger.info("전략 %d 후보풀 확보: %d종목", self.strategy_id, len(pool))
         if risk_off:
             return pool, {}
 
@@ -249,6 +270,7 @@ class RebalanceRunner:
             if want_vol_target:
                 min_bars = max(min_bars, int(risk.get("vol_lookback", 20) or 20) + 1)
             history = await self._seed_history(pool, min_bars=min_bars)
+            logger.info("전략 %d 히스토리 시딩 완료: %d종목", self.strategy_id, len(history))
 
         # 동적 유니버스: 상대강도 상위 pick 으로 후보풀 축소(백테스트 _dynamic_universe 동일).
         universe = pool
@@ -256,6 +278,7 @@ class RebalanceRunner:
             from app.services.backtest.portfolio import _dynamic_universe
 
             universe = _dynamic_universe(pd.DataFrame(history), pool, rule)
+            logger.info("전략 %d 동적 유니버스 축소: %d종목", self.strategy_id, len(universe))
 
         # compute_target_weights 는 cfg["universe"] 로 후보를 재필터하므로 해석된 유니버스를 주입.
         cfg = {**self._cfg, "universe": universe}
@@ -267,7 +290,9 @@ class RebalanceRunner:
             scores = await asyncio.to_thread(
                 compute_universe_scores, universe, as_of, factor_weights, neutralize
             )
+            logger.info("전략 %d 종합점수 산정 완료: %d종목", self.strategy_id, len(scores))
         targets = compute_target_weights(history, cfg, scores=scores)
+        logger.info("전략 %d 목표비중 산정 완료: %d종목", self.strategy_id, len(targets))
         # 리스크 레이어(P1-2): 종목 집중 한도·변동성 타겟팅을 목표비중에 적용(백테스트
         # _targets_at 와 동일 로직 재사용). MDD 킬스위치는 계좌 고점(HWM) 상태 지속이
         # 필요해 백테스트 전용이다(러너 미적용 — 후속 과제).
@@ -349,7 +374,9 @@ class RebalanceRunner:
 
         # 매매 후보 = 목표 종목 ∪ 현재 보유 종목
         symbols = set(targets) | set(positions)
+        logger.info("전략 %d 시세 조회 시작: %d종목", self.strategy_id, len(symbols))
         prices = await self._quotes(symbols)
+        logger.info("전략 %d 시세 조회 완료: %d/%d종목 성공", self.strategy_id, len(prices), len(symbols))
 
         # 청산 국면에서는 드리프트 밴드를 무시(0)하고 보유를 전량 매도한다.
         drift_band = 0.0 if risk_off else float(self._cfg.get("drift_band_pct", 0.05))
@@ -451,8 +478,12 @@ class RebalanceRunner:
 
         from app.services.data import krx_index
 
+        logger.info("전략 %d PIT 유니버스(%s) 조회 진입", self.strategy_id, source)
         try:
             members = await asyncio.to_thread(krx_index.index_members, as_of, source)
+            logger.info(
+                "전략 %d PIT 유니버스(%s) 조회 완료: %d종목", self.strategy_id, source, len(members),
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "전략 %d PIT 유니버스(%s) 조회 실패 — config.universe 폴백: %s",
@@ -497,7 +528,7 @@ class RebalanceRunner:
 
         history: dict[str, pd.Series] = {}
         async with AsyncSessionLocal() as db:
-            for sym in universe:
+            for i, sym in enumerate(universe, start=1):
                 series = await get_close_series(db, sym, start, end)
                 if len(series) < need:
                     try:
@@ -509,6 +540,12 @@ class RebalanceRunner:
                     except Exception as e:  # noqa: BLE001
                         logger.warning("%s 리밸런싱 시드 적재 실패: %s", sym, e)
                 history[sym] = series.astype(float)
+                # 대량 유니버스(수십~수백종목) 시딩이 오래 걸릴 때 진행 상황을 남겨,
+                # "멈춘 것처럼 보이지만 실제로는 순차 처리 중"인지 구분할 수 있게 한다.
+                if i % 20 == 0 or i == len(universe):
+                    logger.info(
+                        "전략 %d 히스토리 시딩 진행: %d/%d", self.strategy_id, i, len(universe),
+                    )
         return history
 
     async def _holdings(self, db, universe: list[str]) -> dict[str, Decimal]:
