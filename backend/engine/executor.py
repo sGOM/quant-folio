@@ -128,7 +128,10 @@ async def execute_signal(
         await _publish(redis, {
             "type": "execution", "user_id": user_id, "order_id": order.id,
             "symbol": symbol, "side": side, "qty": fill_qty, "price": float(fill_price),
-            "status": order.status.value, "kis_order_id": order.kis_order_id,
+            # status 컬럼은 String 이라 DB 재로드(expire/refresh) 시 순수 str 로 복원돼
+            # .value 가 AttributeError 를 낸다. StrEnum 은 str() 이 값 문자열을 주므로
+            # enum·str 양쪽에서 안전하게 직렬화한다.
+            "status": str(order.status), "kis_order_id": order.kis_order_id,
         })
         logger.info("주문 체결 기록: %s %s %d주 @ %s (실제 체결가)", side, symbol, fill_qty, fill_price)
         return order

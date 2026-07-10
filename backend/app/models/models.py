@@ -187,7 +187,7 @@ class Order(Base):
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     strategy_id: Mapped[int | None] = mapped_column(
-        ForeignKey("strategies.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("strategies.id", ondelete="SET NULL"), index=True, nullable=True
     )
     symbol: Mapped[str] = mapped_column(String(20), index=True, nullable=False)
     side: Mapped[OrderSide] = mapped_column(String(8), nullable=False)
@@ -203,7 +203,12 @@ class Order(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-    executions: Mapped[list["Execution"]] = relationship(back_populates="order")
+    # 계정 삭제(users→orders CASCADE) 시 체결이력도 DB 레벨에서 함께 삭제되도록 한다
+    # (executions.order_id ondelete=CASCADE). passive_deletes=True 로 ORM 이 별도 UPDATE/
+    # SELECT 없이 DB 캐스케이드에 위임한다.
+    executions: Mapped[list["Execution"]] = relationship(
+        back_populates="order", cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 # ─────────────────────────── executions ───────────────────────────
@@ -212,7 +217,7 @@ class Execution(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     order_id: Mapped[int] = mapped_column(
-        ForeignKey("orders.id", ondelete="RESTRICT"), index=True, nullable=False
+        ForeignKey("orders.id", ondelete="CASCADE"), index=True, nullable=False
     )
     filled_qty: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
     filled_price: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
@@ -271,7 +276,7 @@ class RiskLimit(Base):
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
     strategy_id: Mapped[int | None] = mapped_column(
-        ForeignKey("strategies.id", ondelete="CASCADE"), nullable=True
+        ForeignKey("strategies.id", ondelete="CASCADE"), index=True, nullable=True
     )
     max_position_size: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
     daily_loss_limit: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)

@@ -90,10 +90,14 @@ def run_backtest(data, config: dict) -> dict:
     slippage = base_slip
     if base_slip > 0 and slip_vol_scale > 0:
         vol = close.pct_change().rolling(20, min_periods=10).std()
-        med = float(vol.median())
-        if med == med and med > 0:  # med 가 NaN 이 아니고 양수
-            factor = 1.0 + slip_vol_scale * (vol / med - 1.0)
-            slippage = (base_slip * factor).clip(lower=0.0).fillna(base_slip)
+        # 시점별(확장) 중앙값으로 스케일한다. 전체구간 median(float(vol.median()))은 미래
+        # 변동성이 초기 구간 슬리피지에 반영되는 look-ahead 였다. portfolio._vol_slippage_map
+        # 의 panel.loc[:d] 시점별 median 규약과 일치시킨다. 초기(<10봉)·med=0 구간은 ratio 가
+        # NaN/inf → base_slip 으로 폴백.
+        med = vol.expanding(min_periods=10).median()
+        ratio = (vol / med).replace([float("inf"), float("-inf")], float("nan"))
+        factor = 1.0 + slip_vol_scale * (ratio - 1.0)
+        slippage = (base_slip * factor).clip(lower=0.0).fillna(base_slip)
 
     # 리스크 청산: 트레일링이 설정되면 추적 손절(sl_trail)로, 아니면 고정 손절로 반영.
     sl_stop = config.get("trailing_stop_pct") or config.get("stop_loss_pct")

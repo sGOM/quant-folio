@@ -373,10 +373,15 @@ def _apply_rebalance(
                 turnover += v / equity
     else:
         for sym in set(targets) | set(val):
-            cur_w = val.get(sym, 0.0) / equity
+            cur_val = val.get(sym, 0.0)
+            cur_w = cur_val / equity
             tgt_w = targets.get(sym, 0.0)
             dev = tgt_w - cur_w
-            if abs(dev) <= drift_band:
+            # 드리프트 밴드는 보유 종목의 비중 미세조정에만 적용. 신규 편입·전량 청산은
+            # 목표 비중이 밴드 이하여도 반드시 체결(라이브 로직 compute_rebalance_orders 와 일치).
+            is_new_entry = cur_val <= 1e-12 and tgt_w > 0.0
+            is_full_exit = tgt_w <= 0.0 and cur_val > 1e-12
+            if not (is_new_entry or is_full_exit) and abs(dev) <= drift_band:
                 continue
             turnover += abs(dev)
             if dev < 0:
@@ -721,7 +726,29 @@ def run_rebalance_backtest(
         킬스위치 청산이 남는다. factor_ic 는 method="score" 전략의 팩터별 IC·IR·롱숏수익
         (성과귀속, P1-1)이며 그 외 방식에선 {} 이다.
     """
-    panel = _normalize_index(close_panel).ffill()
+    # 상장폐지(장기 결측) 처리: 무한 ffill 은 폐지 종목의 마지막 종가를 이후 전 구간
+    # 동결시켜 폐지 손실이 평가액·매도에 전혀 반영되지 않아 성과를 상방 편향시킨다.
+    # 짧은 결측(휴장·거래정지)만 메우도록 ffill 을 delisting_gap_days 로 제한한다.
+    # 그 이상 결측이 나면 마크투마켓 루프에서 회수율(delist_recovery)만 현금화하고 포지션을
+    # 소멸시켜 폐지 손실을 확정하되, **반드시 terminal gap(그 종목의 마지막 유효 관측 이후로
+    # 두 번 다시 값이 없는 경우)일 때만** 소멸시킨다. 상장적격성 실질심사·개선기간처럼 수주~
+    # 1년 거래정지 후 '재개'되는 interior gap 을 폐지로 오분류해 영구 write-off 하는 것을
+    # 막기 위함이다(financial-expert 권고 1순위). last_valid 는 ffill 이전 원본 기준으로 잡는다.
+    _norm = _normalize_index(close_panel)
+    last_valid: dict[str, pd.Timestamp] = {
+        str(c): lv for c, lv in _norm.apply(lambda s: s.last_valid_index()).items()
+        if lv is not None
+    }
+    _delist_gap = int(config.get("delisting_gap_days", 10) or 0)
+    # 회수율 기본값 0.9: pykrx 가격 패널의 종점(terminal) 가격은 이미 최종 회수가치를 담는다.
+    # 실측(2026-07-11) — 자진/공개매수 상폐(쌍용C&E 003410)는 종점가=공개매수가(7,000원),
+    # 부실/회생 상폐(한진해운 117930)는 종점가=정리매매 폭락 확정가(780→12원, -98%).
+    # 즉 write-off 직전 val[sym] 은 이미 공정한 최종가로 mark-to-market 되어 있으므로, 여기에
+    # 낮은 회수율을 곱하면 이미 올바른 값을 추가로 깎는 계통적 이중 페널티가 된다. 0.9 는
+    # 마지막 관측일~write-off일 사이 1일 갭과 정리매매 유동성/스프레드를 반영한 소폭 haircut.
+    # (정리매매 종가가 없는 데이터 소스를 쓰는 유니버스면 config 로 0.35~0.5 로 낮출 것.)
+    delist_recovery = max(0.0, min(1.0, float(config.get("delisting_recovery", 0.9))))
+    panel = _norm.ffill(limit=_delist_gap if _delist_gap > 0 else None)
     if panel.empty:
         raise ValueError("가격 데이터가 비어 있습니다.")
 
@@ -832,13 +859,23 @@ def run_rebalance_backtest(
 
     for i, d in enumerate(sim_dates):
         prices = panel.loc[d]
-        # 1) 당일 수익률 반영(보유 종목 평가액 갱신)
+        # 1) 당일 수익률 반영(보유 종목 평가액 갱신) + 상장폐지 손실 확정
         if prev_prices is not None and val:
             for sym in list(val):
                 p0 = prev_prices.get(sym)
                 p1 = prices.get(sym)
-                if p0 and p1 and p0 > 0 and pd.notna(p0) and pd.notna(p1):
+                if p1 is not None and pd.notna(p1) and p0 and p0 > 0 and pd.notna(p0):
                     val[sym] *= float(p1) / float(p0)
+                elif (p1 is None or pd.isna(p1)):
+                    lv = last_valid.get(sym)
+                    if lv is not None and d > lv:
+                        # terminal gap(마지막 유효 관측 이후 두 번 다시 값 없음) → 상장폐지 확정.
+                        # 잔존 회수율만 현금화하고 포지션 소멸(폐지 손실 확정, 상방 편향 제거).
+                        proceeds = val.pop(sym) * delist_recovery
+                        cost.pop(sym, None)
+                        cash += proceeds
+                        markers.append({"t": d.isoformat(), "type": "delist", "symbol": sym})
+                    # else: interior gap(거래정지 후 재개형) → write-off 하지 않고 평가액 동결(유지).
         prev_prices = prices
 
         # 2) 전일 결정의 지연 체결(next_close). same_close 면 pending 이 항상 비어 있다.

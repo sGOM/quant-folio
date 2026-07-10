@@ -134,23 +134,31 @@ function MonitorContent() {
           <span
             className={cn(
               "flex items-center gap-2 rounded-full border px-3 py-1 text-sm font-medium",
-              engine.data?.engine_alive
-                ? "border-profit/30 bg-profit/10 text-profit"
-                : "border-loss/30 bg-loss/10 text-loss",
+              // 첫 응답 전(isLoading)엔 engine_alive 가 undefined(falsy) 라 실제 가동 중이어도
+              // 적색 '중지'로 오표시된다. 로딩 중엔 중립(muted) 상태로 분기한다.
+              engine.isLoading
+                ? "border-border bg-muted text-muted-foreground"
+                : engine.data?.engine_alive
+                  ? "border-profit/30 bg-profit/10 text-profit"
+                  : "border-loss/30 bg-loss/10 text-loss",
             )}
           >
             <span className="relative flex h-2 w-2">
-              {engine.data?.engine_alive && (
+              {engine.data?.engine_alive && !engine.isLoading && (
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-profit opacity-75" />
               )}
               <span
                 className={cn(
                   "relative inline-flex h-2 w-2 rounded-full",
-                  engine.data?.engine_alive ? "bg-profit" : "bg-loss",
+                  engine.isLoading
+                    ? "bg-muted-foreground"
+                    : engine.data?.engine_alive
+                      ? "bg-profit"
+                      : "bg-loss",
                 )}
               />
             </span>
-            매매 엔진 {engine.data?.engine_alive ? "동작 중" : "중지"}
+            매매 엔진 {engine.isLoading ? "확인 중…" : engine.data?.engine_alive ? "동작 중" : "중지"}
           </span>
         </div>
 
