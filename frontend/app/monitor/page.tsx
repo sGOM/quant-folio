@@ -35,10 +35,11 @@ import { formatNumber, formatPercent, trendColor } from "@/lib/format";
 // 매매·체결 관련 이벤트 타입 — 어느 것이든 잔고/주문을 다시 가져온다.
 const TRADE_EVENTS = new Set(["execution", "order", "position", "fill", "signal"]);
 
-/** 주문 상태별 표시 라벨·색조(초록=진행/체결, 빨강=거부/취소)·툴팁 설명. */
+/** 주문 상태별 표시 라벨·색조(초록=진행/체결, 빨강=거부/취소)·툴팁 설명.
+ *  tone 은 운영 상태 축이다 — 손익색(profit=적/loss=청)이 아니라 신호등 규칙(ok=초록/bad=적). */
 const ORDER_STATUS: Record<
   string,
-  { label: string; tone: "profit" | "loss" | "muted"; desc: string }
+  { label: string; tone: "ok" | "bad" | "muted"; desc: string }
 > = {
   pending: {
     label: "대기",
@@ -47,27 +48,27 @@ const ORDER_STATUS: Record<
   },
   submitted: {
     label: "접수",
-    tone: "profit",
+    tone: "ok",
     desc: "증권사가 주문을 정상 접수했습니다. 아직 체결 전이며 곧 체결·미체결이 확정됩니다.",
   },
   partial: {
     label: "일부체결",
-    tone: "profit",
+    tone: "ok",
     desc: "주문 수량 중 일부만 체결되었습니다. 나머지 수량은 계속 체결을 기다립니다.",
   },
   filled: {
     label: "체결완료",
-    tone: "profit",
+    tone: "ok",
     desc: "주문 수량이 전량 체결되어 포지션·잔고에 반영되었습니다.",
   },
   cancelled: {
     label: "취소",
-    tone: "loss",
+    tone: "bad",
     desc: "주문이 취소되어 체결되지 않았습니다.",
   },
   rejected: {
     label: "거부",
-    tone: "loss",
+    tone: "bad",
     desc: "증권사가 주문을 거부했습니다(잔고 부족·호가 이탈·장 상태 등). 체결되지 않았습니다.",
   },
 };
@@ -200,13 +201,13 @@ function MonitorContent() {
                   engine.isLoading
                     ? "border-border bg-muted text-muted-foreground"
                     : engine.data?.engine_alive
-                      ? "border-profit/30 bg-profit/10 text-profit"
-                      : "border-loss/30 bg-loss/10 text-loss",
+                      ? "border-status-ok/30 bg-status-ok/10 text-status-ok"
+                      : "border-status-bad/30 bg-status-bad/10 text-status-bad",
                 )}
               >
                 <span className="relative flex h-2 w-2">
                   {engine.data?.engine_alive && !engine.isLoading && (
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-profit opacity-75" />
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-status-ok opacity-75" />
                   )}
                   <span
                     className={cn(
@@ -214,8 +215,8 @@ function MonitorContent() {
                       engine.isLoading
                         ? "bg-muted-foreground"
                         : engine.data?.engine_alive
-                          ? "bg-profit"
-                          : "bg-loss",
+                          ? "bg-status-ok"
+                          : "bg-status-bad",
                     )}
                   />
                 </span>
@@ -334,7 +335,7 @@ function OrderAuditTable({
             orders.map((o) => {
               const st = ORDER_STATUS[o.status] ?? {
                 label: o.status,
-                tone: "muted" as const,
+                tone: "muted" as "ok" | "bad" | "muted",
                 desc: "알 수 없는 상태입니다.",
               };
               return (
@@ -364,10 +365,10 @@ function OrderAuditTable({
                           tabIndex={0}
                           className={cn(
                             "inline-flex cursor-help items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium",
-                            st.tone === "profit"
-                              ? "border-profit/30 bg-profit/10 text-profit"
-                              : st.tone === "loss"
-                                ? "border-loss/30 bg-loss/10 text-loss"
+                            st.tone === "ok"
+                              ? "border-status-ok/30 bg-status-ok/10 text-status-ok"
+                              : st.tone === "bad"
+                                ? "border-status-bad/30 bg-status-bad/10 text-status-bad"
                                 : "border-border bg-muted text-muted-foreground",
                           )}
                         >
@@ -591,7 +592,7 @@ function StrategyToggle({ strategy }: { strategy: Strategy }) {
               tabIndex={0}
               className={cn(
                 "h-2.5 w-2.5 shrink-0 cursor-help rounded-full",
-                isLive ? "bg-profit" : "bg-loss",
+                isLive ? "bg-status-ok" : "bg-status-bad",
               )}
             />
           </TooltipTrigger>
@@ -608,12 +609,14 @@ function StrategyToggle({ strategy }: { strategy: Strategy }) {
           </p>
         </div>
       </div>
+      {/* 실행 중 = 가동 상태(초록 '중지'), 정지 = 미가동 상태(빨강 '시작').
+          버튼 색은 현재 상태를 나타낸다 — 초록이면 운용 중, 빨강이면 꺼짐. */}
       <Button
         size="sm"
-        variant={isLive ? "destructive" : "default"}
+        variant={isLive ? "default" : "destructive"}
         onClick={() => toggle.mutate()}
         disabled={toggle.isPending}
-        className={cn(!isLive && "bg-profit text-white hover:bg-profit/90")}
+        className={cn(isLive && "bg-status-ok text-white hover:bg-status-ok/90")}
       >
         {toggle.isPending ? (
           <Loader2 className="h-4 w-4 animate-spin" />
