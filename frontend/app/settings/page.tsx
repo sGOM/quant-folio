@@ -225,7 +225,7 @@ function SettingsContent() {
                 </p>
               )}
               {save.isSuccess && (
-                <p className="flex items-center gap-1.5 text-sm text-profit">
+                <p className="flex items-center gap-1.5 text-sm text-status-ok">
                   <CheckCircle2 className="h-4 w-4 shrink-0" />
                   {meta.name} 연동 정보가 저장되었습니다.
                 </p>
@@ -301,7 +301,7 @@ function ProfileCard() {
             </p>
           )}
           {save.isSuccess && (
-            <p className="flex items-center gap-1.5 text-sm text-profit">
+            <p className="flex items-center gap-1.5 text-sm text-status-ok">
               <CheckCircle2 className="h-4 w-4 shrink-0" />
               닉네임이 저장되었습니다.
             </p>
@@ -393,7 +393,7 @@ function TossQuoteCard({ registered }: { registered: boolean }) {
             </p>
           )}
           {save.isSuccess && (
-            <p className="flex items-center gap-1.5 text-sm text-profit">
+            <p className="flex items-center gap-1.5 text-sm text-status-ok">
               <CheckCircle2 className="h-4 w-4 shrink-0" />
               토스 시세 연동 정보가 저장되었습니다.
             </p>

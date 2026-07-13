@@ -115,11 +115,11 @@ function DashboardContent() {
                     label="토큰 발급"
                     value={
                       kis.data?.token_issued ? (
-                        <span className="flex items-center gap-1 text-profit">
+                        <span className="flex items-center gap-1 text-status-ok">
                           <CheckCircle2 className="h-4 w-4" /> 성공
                         </span>
                       ) : (
-                        <span className="flex items-center gap-1 text-loss">
+                        <span className="flex items-center gap-1 text-status-bad">
                           <XCircle className="h-4 w-4" /> 실패
                         </span>
                       )

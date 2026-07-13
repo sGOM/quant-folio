@@ -50,6 +50,9 @@ export default {
         profit: "hsl(var(--profit))",
         loss: "hsl(var(--loss))",
         "neutral-trend": "hsl(var(--neutral-trend))",
+        // 운영 상태 색상(성공=초록, 실패=빨강). 손익과 의미축이 다르다.
+        "status-ok": "hsl(var(--status-ok))",
+        "status-bad": "hsl(var(--status-bad))",
       },
       borderRadius: {
         lg: "var(--radius)",
