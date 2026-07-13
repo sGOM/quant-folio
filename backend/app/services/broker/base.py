@@ -69,6 +69,34 @@ class Balance:
     positions: list[dict] = field(default_factory=list)
     summary: dict | list = field(default_factory=dict)
 
+    def positions_normalized(self) -> list[dict]:
+        """증권사별 원시 positions 를 {symbol, qty, avg_price} 리스트로 정규화한다.
+
+        KIS(pdno/hldg_qty/pchs_avg_pric)와 토스(symbol/qty/avg_price)의 키 차이를
+        흡수한다. 잔고 조회를 신뢰 소스로 쓰는 곳(정합·포지션 조회)이 공유하는 단일 진입점.
+        보유수량 0 이하는 제외한다.
+        """
+        from decimal import Decimal, InvalidOperation
+
+        out: list[dict] = []
+        for p in self.positions:
+            code = p.get("pdno") or p.get("symbol")
+            if not code:
+                continue
+            try:
+                qty = int(float(p.get("hldg_qty") or p.get("qty") or 0))
+            except (ValueError, TypeError):
+                qty = 0
+            if qty <= 0:
+                continue
+            avg_raw = p.get("pchs_avg_pric") or p.get("avg_price")
+            try:
+                avg = Decimal(str(avg_raw)) if avg_raw not in (None, "", "0") else None
+            except (InvalidOperation, ValueError):
+                avg = None
+            out.append({"symbol": code, "qty": qty, "avg_price": avg})
+        return out
+
 
 # 정규화된 주문 구분(증권사별 코드 매핑은 각 클라이언트가 담당).
 OrderSideStr = str   # "buy" | "sell"

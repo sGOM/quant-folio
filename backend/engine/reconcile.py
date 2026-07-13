@@ -18,7 +18,7 @@ DB 는 갱신되지 않는다. 이 모듈이 남은 미체결 주문을 재조�
 from __future__ import annotations
 
 import logging
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 from redis.asyncio import Redis
 from sqlalchemy import func, select
@@ -42,23 +42,14 @@ _RECONCILE_LOCK_TTL = 30  # 초
 
 
 def _balance_map(balance) -> dict[str, tuple[int, Decimal | None]]:
-    """KIS 잔고 positions 를 {종목코드: (보유수량, 매입평균가)} 로 정규화한다."""
-    out: dict[str, tuple[int, Decimal | None]] = {}
-    for p in balance.positions:
-        code = p.get("pdno") or p.get("symbol")
-        if not code:
-            continue
-        try:
-            qty = int(float(p.get("hldg_qty") or p.get("qty") or 0))
-        except (ValueError, TypeError):
-            qty = 0
-        avg_raw = p.get("pchs_avg_pric") or p.get("avg_price")
-        try:
-            avg = Decimal(str(avg_raw)) if avg_raw not in (None, "", "0") else None
-        except (InvalidOperation, ValueError):
-            avg = None
-        out[code] = (qty, avg)
-    return out
+    """KIS 잔고 positions 를 {종목코드: (보유수량, 매입평균가)} 로 정규화한다.
+
+    정규화 규칙은 Balance.positions_normalized 에 있다(라우트·정합이 공유).
+    """
+    return {
+        p["symbol"]: (p["qty"], p["avg_price"])
+        for p in balance.positions_normalized()
+    }
 
 
 async def _symbol_recorded_qty(db: AsyncSession, user_id: int, symbol: str) -> int:
