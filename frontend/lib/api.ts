@@ -792,6 +792,8 @@ export interface OrderRow {
   qty: number;
   price: number | null;
   status: string;
+  /** 감사 로그 상세 사유 — 어떤 신호·공식·리스크·리밸런싱 기준으로 주문했는지. 과거/수동 주문은 null. */
+  reason: string | null;
   created_at: string;
 }
 
