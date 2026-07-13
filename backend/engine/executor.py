@@ -10,7 +10,6 @@ Execution·Position 을 갱신한다(정밀 체결 통보 연동은 5단계).
 """
 from __future__ import annotations
 
-import json
 import logging
 from decimal import Decimal
 
@@ -19,19 +18,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.channels import (
-    ENGINE_EVENTS_CHANNEL,
-    ORDER_LOCK_PREFIX,
-    engine_events_channel,
-)
+from app.core.channels import ORDER_LOCK_PREFIX
 from app.models import (
-    Execution,
     Order,
     OrderSide,
     OrderStatus,
-    Position,
 )
 from app.services.broker import BrokerClient, BrokerError
+from engine.fills import publish_event as _publish
+from engine.fills import record_fill as _record_fill
 
 logger = logging.getLogger("engine.executor")
 
@@ -163,48 +158,3 @@ async def _resolve_fill(
         logger.warning("체결 평균가 없음 — 신호가로 폴백 %s", order.idempotency_key)
         return filled, signal_price
     return filled, Decimal(str(avg))
-
-
-async def _record_fill(
-    db: AsyncSession, order: Order, qty: int, price: Decimal, *, fully_filled: bool
-) -> None:
-    """Execution 기록 + Position 평균단가 갱신 + 주문 상태 갱신."""
-    db.add(Execution(
-        order_id=order.id,
-        filled_qty=Decimal(qty),
-        filled_price=price,
-        fee=Decimal("0"),
-    ))
-    order.status = OrderStatus.FILLED if fully_filled else OrderStatus.PARTIAL
-
-    pos = await db.scalar(
-        select(Position).where(
-            Position.user_id == order.user_id, Position.symbol == order.symbol
-        )
-    )
-    fill_qty = Decimal(qty)
-    if order.side == OrderSide.BUY:
-        if pos is None:
-            db.add(Position(
-                user_id=order.user_id, symbol=order.symbol,
-                qty=fill_qty, avg_price=price,
-            ))
-        else:
-            new_qty = pos.qty + fill_qty
-            pos.avg_price = (pos.qty * pos.avg_price + fill_qty * price) / new_qty
-            pos.qty = new_qty
-    else:  # SELL
-        if pos is not None:
-            pos.qty = max(pos.qty - fill_qty, Decimal("0"))
-            if pos.qty == 0:
-                pos.avg_price = Decimal("0")
-
-
-async def _publish(redis: Redis, payload: dict) -> None:
-    """사용자별 채널로 발행 — 각 WS 소켓이 자기 채널만 구독해 팬아웃을 줄인다."""
-    data = json.dumps(payload, default=str)
-    uid = payload.get("user_id")
-    if uid is not None:
-        await redis.publish(engine_events_channel(int(uid)), data)
-    # 하위호환: 공용 채널에도 발행(기존 구독자 보호).
-    await redis.publish(ENGINE_EVENTS_CHANNEL, data)

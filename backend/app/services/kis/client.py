@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from decimal import Decimal
 
 import httpx
@@ -22,6 +23,63 @@ logger = logging.getLogger(__name__)
 _TOKEN_TTL_SAFETY = 60  # 만료 직전 안전 마진(초)
 _TOKEN_LOCK_TTL = 10    # 발급 락 TTL(초)
 _TOKEN_LOCK_WAIT = 8    # 락 대기 동안 캐시 재확인 횟수
+
+# KIS REST 유량제한(EGW00201 "초당 거래건수 초과") 회피용 최소 호출 간격(초).
+# 모의투자(vts)는 실전보다 한도가 엄격하다. 여러 종목을 연속 조회하는 리밸런싱
+# (현재가 20건 버스트)에서 실측으로 EGW00201 이 재현돼, 계좌 단위로 호출을 직렬화한다.
+_RATE_MIN_INTERVAL_VTS = 0.5    # 모의투자 ~2건/초
+_RATE_MIN_INTERVAL_PROD = 0.12  # 실전 한도(~20건/초) 대비 보수적으로 ~8건/초
+# 유량제한에 걸렸을 때(EGW00201) 재시도 횟수·백오프. 전역 throttle 로도 못 막는
+# 교차 프로세스(web·engine·worker 동시 접근) 경합의 보완책.
+_RATE_RETRY = 3
+_RATE_BACKOFF = 0.6  # 초
+
+
+class _RateLimiter:
+    """프로세스 전역 계좌 단위 rate limiter — KIS 초당 호출 한도(EGW00201) 회피.
+
+    같은 계좌(appkey)로 나가는 모든 KIS REST 호출에 최소 간격을 강제한다. 각 호출자에게
+    min_interval 간격의 '슬롯'을 순차 배정하고 락은 즉시 풀어, 슬롯까지만 대기시킨다.
+    프로세스 내 버스트(리밸런싱 연속 시세 조회 등)를 막는 게 목적이며, 여러 프로세스가
+    같은 계좌를 동시에 쓰는 교차 프로세스 경합까지는 막지 않는다(재시도가 보완).
+    """
+
+    def __init__(self, min_interval: float):
+        self._min_interval = min_interval
+        self._lock = asyncio.Lock()
+        self._next_at = 0.0
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_at)
+            self._next_at = slot + self._min_interval
+            wait = slot - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+
+# 계좌(KIS_ENV+appkey)별 limiter. 프로세스 전역 공유(모든 KisClient 인스턴스가 재사용).
+_rate_limiters: dict[str, _RateLimiter] = {}
+
+
+def _get_rate_limiter(app_key: str) -> _RateLimiter:
+    key = f"{settings.KIS_ENV}:{app_key}"
+    limiter = _rate_limiters.get(key)
+    if limiter is None:
+        interval = (
+            _RATE_MIN_INTERVAL_VTS
+            if settings.is_paper_trading
+            else _RATE_MIN_INTERVAL_PROD
+        )
+        limiter = _RateLimiter(interval)
+        _rate_limiters[key] = limiter
+    return limiter
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """KIS 유량제한(EGW00201) 오류인지."""
+    return "EGW00201" in str(exc)
 
 
 class KisError(BrokerError):
@@ -37,6 +95,10 @@ class KisClient:
         self._account_no = account_no
         self._base_url = settings.kis_base_url
 
+    async def _throttle(self) -> None:
+        """이 계좌의 전역 rate limiter 를 통과(초당 호출 한도 준수)."""
+        await _get_rate_limiter(self._app_key).acquire()
+
     # 자격증명별로 분리된 토큰 캐시 키 (시크릿 자체는 저장하지 않음)
     def _token_cache_key(self) -> str:
         # app_key 는 식별자 용도로만 사용 (시크릿 아님)
@@ -50,6 +112,7 @@ class KisClient:
             "appkey": self._app_key,
             "appsecret": self._app_secret,
         }
+        await self._throttle()
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(url, json=body)
         if resp.status_code != 200:
@@ -107,18 +170,40 @@ class KisClient:
         }
 
     async def get_current_price(self, symbol: str) -> dict:
-        """국내주식 현재가 시세 조회 (FHKST01010100)."""
+        """국내주식 현재가 시세 조회 (FHKST01010100).
+
+        연속 조회(리밸런싱 등)는 전역 throttle 로 초당 한도를 지키지만, 교차 프로세스
+        경합으로 여전히 EGW00201 이 뜰 수 있어 짧은 백오프로 몇 회 재시도한다.
+        """
         url = f"{self._base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
-        headers = await self._auth_headers("FHKST01010100")
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol}
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers, params=params)
-        if resp.status_code != 200:
-            raise KisError(f"시세 조회 실패: HTTP {resp.status_code} {resp.text[:200]}")
-        data = resp.json()
-        if data.get("rt_cd") != "0":
-            raise KisError(f"시세 조회 오류: {data.get('msg1', data)}")
-        return data["output"]
+        last_exc: Exception | None = None
+        for attempt in range(_RATE_RETRY):
+            await self._throttle()
+            headers = await self._auth_headers("FHKST01010100")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code != 200:
+                exc = KisError(f"시세 조회 실패: HTTP {resp.status_code} {resp.text[:200]}")
+                if _is_rate_limit_error(exc) and attempt < _RATE_RETRY - 1:
+                    last_exc = exc
+                    await asyncio.sleep(_RATE_BACKOFF * (attempt + 1))
+                    continue
+                raise exc
+            data = resp.json()
+            if data.get("rt_cd") != "0":
+                # EGW00201(유량제한)은 msg_cd 에 담기고 msg1 은 한글 문구뿐이라, 재시도
+                # 판정을 위해 msg_cd 를 메시지에 포함해야 _is_rate_limit_error 가 잡는다.
+                exc = KisError(
+                    f"시세 조회 오류: [{data.get('msg_cd', '')}] {data.get('msg1', data)}"
+                )
+                if _is_rate_limit_error(exc) and attempt < _RATE_RETRY - 1:
+                    last_exc = exc
+                    await asyncio.sleep(_RATE_BACKOFF * (attempt + 1))
+                    continue
+                raise exc
+            return data["output"]
+        raise last_exc or KisError("시세 조회 실패")
 
     @staticmethod
     def _dec(o: dict, key: str) -> Decimal:
@@ -169,6 +254,7 @@ class KisClient:
             "appkey": self._app_key,
             "appsecret": self._app_secret,
         }
+        await self._throttle()
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(url, headers=headers, json=body)
         if resp.status_code != 200:
@@ -208,6 +294,7 @@ class KisClient:
         headers["hashkey"] = hashkey
 
         url = f"{self._base_url}/uapi/domestic-stock/v1/trading/order-cash"
+        await self._throttle()
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(url, headers=headers, json=body)
         if resp.status_code != 200:
@@ -225,11 +312,13 @@ class KisClient:
         체결 기록·평균단가 계산에는 반드시 이 값을 사용해야 한다.
         반환: Fill(filled_qty, avg_price, fully_filled, raw).
         """
-        from datetime import datetime
+        from app.services.market import now_kst
 
         cano, acnt_prdt = self._account_parts()
         tr_id = "VTTC8001R" if settings.is_paper_trading else "TTTC8001R"
-        today = datetime.now().strftime("%Y%m%d")
+        # 컨테이너 시계는 UTC 라 datetime.now() 는 KST 자정~09:00 사이 '전날'이 된다.
+        # 체결 조회일이 하루 어긋나면 그 시간대 체결이 0건으로 조회되므로 KST 로 고정한다.
+        today = now_kst().strftime("%Y%m%d")
         headers = await self._auth_headers(tr_id)
         params = {
             "CANO": cano,
@@ -248,6 +337,7 @@ class KisClient:
             "CTX_AREA_NK100": "",
         }
         url = f"{self._base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        await self._throttle()
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, headers=headers, params=params)
         if resp.status_code != 200:
@@ -294,6 +384,7 @@ class KisClient:
             "CTX_AREA_NK100": "",
         }
         url = f"{self._base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+        await self._throttle()
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, headers=headers, params=params)
         if resp.status_code != 200:
