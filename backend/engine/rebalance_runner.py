@@ -353,7 +353,26 @@ class RebalanceRunner(BaseRunner):
             return
 
         bar_ts = f"{now.date().isoformat()}:{bar_tag}"
-        await self._execute_orders(orders, prices, positions, bar_ts)
+        await self._execute_orders(orders, prices, positions, bar_ts, targets, risk_off)
+
+    def _sell_reason(
+        self, sym: str, targets: dict[str, float], risk_off: bool, sell_qty: int
+    ) -> str:
+        """리밸런싱 매도 사유 문장(감사 로그용).
+
+        - 레짐 위험회피: 현금화 전량 청산.
+        - 선정 제외(목표비중 0): 후보에서 탈락해 전량 청산.
+        - 비중 축소: 드리프트 밴드 초과분만 부분 매도.
+        """
+        if risk_off:
+            return f"레짐 위험회피(현금화): {sell_qty:,}주 전량 청산"
+        weight = targets.get(sym, 0.0)
+        if weight <= 0:
+            return f"리밸런싱 선정 제외(목표비중 0%): {sell_qty:,}주 전량 청산"
+        return (
+            f"리밸런싱 비중 축소: 목표비중 {weight * 100:.1f}%로 조정 "
+            f"(드리프트 밴드 초과분 {sell_qty:,}주 매도)"
+        )
 
     async def _is_risk_off(self) -> bool:
         """현금화 오버레이(레짐 필터) 판정 — stateful 히스테리시스(비대칭 밴드).
@@ -543,8 +562,19 @@ class RebalanceRunner(BaseRunner):
         prices: dict[str, Decimal],
         positions: dict[str, Decimal],
         bar_ts: str,
+        targets: dict[str, float] | None = None,
+        risk_off: bool = False,
     ) -> None:
-        """매도 우선 정렬된 주문 목록을 순차 실행한다(매수는 리스크 검증 후)."""
+        """매도 우선 정렬된 주문 목록을 순차 실행한다(매수는 리스크 검증 후).
+
+        :param targets: 종목→목표비중. 감사 로그 사유(편입 순위·목표비중) 생성에 쓴다.
+        :param risk_off: 레짐 위험회피(현금화) 국면 여부(청산 사유 문구 결정).
+        """
+        targets = targets or {}
+        # 목표비중 내림차순 편입 순위(1위=최대비중). 사유 문장의 "N/M위"에 쓴다.
+        ranked = sorted(targets.items(), key=lambda kv: kv[1], reverse=True)
+        rank_of = {sym: i for i, (sym, _) in enumerate(ranked, start=1)}
+        total_picks = len(ranked)
         current_prices = {s: p for s, p in prices.items()}
         async with AsyncSessionLocal() as db:
             # 매수 신규 진입 차단: 일일 손실 한도 초과 시.
@@ -576,13 +606,16 @@ class RebalanceRunner(BaseRunner):
                         if sell_qty <= 0:
                             continue
                         # 사후 전략 개선용: 매도 시점의 포지션 손익률을 로그로 남긴다.
+                        pnl_txt = ""
                         if pos and pos.avg_price and pos.avg_price > 0:
                             pnl = (price - pos.avg_price) / pos.avg_price
                             logger.info(
                                 "리밸런싱 매도 %s x%d @%s — 평단 %s, 손익률 %.2f%%",
                                 sym, sell_qty, price, pos.avg_price, float(pnl) * 100,
                             )
-                        await self._place(db, sym, "sell", sell_qty, price, bar_ts)
+                            pnl_txt = f" · 평단 {float(pos.avg_price):,.0f} 대비 손익 {float(pnl) * 100:+.2f}%"
+                        reason = self._sell_reason(sym, targets, risk_off, sell_qty) + pnl_txt
+                        await self._place(db, sym, "sell", sell_qty, price, bar_ts, reason)
                     else:  # buy
                         if not buys_allowed:
                             continue
@@ -597,4 +630,11 @@ class RebalanceRunner(BaseRunner):
                         logger.info(
                             "리밸런싱 매수 %s x%d @%s", sym, decision.qty, price
                         )
-                        await self._place(db, sym, "buy", decision.qty, price, bar_ts)
+                        weight = targets.get(sym, 0.0)
+                        rank = rank_of.get(sym)
+                        rank_txt = f"편입 {rank}/{total_picks}위, " if rank else ""
+                        reason = (
+                            f"리밸런싱 {rank_txt}목표비중 {weight * 100:.1f}% 구성 "
+                            f"· {decision.qty:,}주 @ {float(price):,.0f} 매수"
+                        )
+                        await self._place(db, sym, "buy", decision.qty, price, bar_ts, reason)
