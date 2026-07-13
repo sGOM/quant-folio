@@ -198,6 +198,10 @@ class Order(Base):
     status: Mapped[OrderStatus] = mapped_column(
         String(16), default=OrderStatus.PENDING, nullable=False
     )
+    # 감사 로그용 주문 사유 — 어떤 신호·공식·리스크·리밸런싱 기준으로 이 주문이
+    # 나갔는지 사람이 읽을 수 있는 한국어 설명(예: "골든크로스: SMA5 51,200 > SMA20 50,800",
+    # "리밸런싱 편입 3/20위, 목표비중 6.7%"). 과거 주문·수동 주문은 NULL.
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
