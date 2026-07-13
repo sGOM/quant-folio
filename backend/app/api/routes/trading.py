@@ -30,6 +30,7 @@ class OrderOut(BaseModel):
     qty: float
     price: float | None
     status: str
+    reason: str | None
     created_at: datetime
 
 
@@ -95,6 +96,7 @@ async def list_orders(
             qty=float(o.qty),
             price=float(o.price) if o.price is not None else None,
             status=o.status,
+            reason=o.reason,
             created_at=o.created_at,
         )
         for o in rows
