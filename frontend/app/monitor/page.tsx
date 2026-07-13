@@ -12,8 +12,9 @@ import {
   AlertCircle,
   Building2,
   Globe,
+  HelpCircle,
 } from "lucide-react";
-import { api, Strategy, BROKER_INFO, type Broker } from "@/lib/api";
+import { api, Strategy, BROKER_INFO, type Broker, type OrderRow } from "@/lib/api";
 import { Nav } from "@/components/Nav";
 import { RequireAuth } from "@/components/RequireAuth";
 import { useEventSocket } from "@/lib/useWebSocket";
@@ -22,11 +23,68 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { formatNumber, formatPercent, trendColor } from "@/lib/format";
 
 // 매매·체결 관련 이벤트 타입 — 어느 것이든 잔고/주문을 다시 가져온다.
 const TRADE_EVENTS = new Set(["execution", "order", "position", "fill", "signal"]);
+
+/** 주문 상태별 표시 라벨·색조(초록=진행/체결, 빨강=거부/취소)·툴팁 설명. */
+const ORDER_STATUS: Record<
+  string,
+  { label: string; tone: "profit" | "loss" | "muted"; desc: string }
+> = {
+  pending: {
+    label: "대기",
+    tone: "muted",
+    desc: "엔진이 주문을 생성했고 증권사(KIS/토스)로 전송하기 직전 상태입니다.",
+  },
+  submitted: {
+    label: "접수",
+    tone: "profit",
+    desc: "증권사가 주문을 정상 접수했습니다. 아직 체결 전이며 곧 체결·미체결이 확정됩니다.",
+  },
+  partial: {
+    label: "일부체결",
+    tone: "profit",
+    desc: "주문 수량 중 일부만 체결되었습니다. 나머지 수량은 계속 체결을 기다립니다.",
+  },
+  filled: {
+    label: "체결완료",
+    tone: "profit",
+    desc: "주문 수량이 전량 체결되어 포지션·잔고에 반영되었습니다.",
+  },
+  cancelled: {
+    label: "취소",
+    tone: "loss",
+    desc: "주문이 취소되어 체결되지 않았습니다.",
+  },
+  rejected: {
+    label: "거부",
+    tone: "loss",
+    desc: "증권사가 주문을 거부했습니다(잔고 부족·호가 이탈·장 상태 등). 체결되지 않았습니다.",
+  },
+};
+
+/** 매매 엔진 상태 배지에 붙일 상세 설명(툴팁). */
+function engineStatusDesc(loading: boolean, alive?: boolean): string {
+  if (loading) return "매매 엔진의 가동 여부를 확인하는 중입니다.";
+  if (alive)
+    return (
+      "24시간 자동매매 데몬(engine)이 이벤트 루프를 돌며 시세 수신·신호 평가·주문 실행을 " +
+      "정상 처리 중입니다. 활성 전략의 매매가 실시간으로 수행됩니다."
+    );
+  return (
+    "매매 엔진 데몬이 가동되지 않고 있습니다. 전략을 ON 으로 두어도 실제 주문이 나가지 " +
+    "않으니, 관리자에게 엔진 프로세스 상태를 확인하세요."
+  );
+}
 
 /** 실시간 이벤트 로그 한 줄. id 는 안정적인 React key 용 단조 증가 값. */
 interface LogEntry {
@@ -108,7 +166,7 @@ function MonitorContent() {
   });
 
   return (
-    <>
+    <TooltipProvider delayDuration={150}>
       <Nav />
       <main className="mx-auto max-w-5xl px-4 py-8 sm:px-6">
         <div className="flex items-center justify-between">
@@ -131,35 +189,45 @@ function MonitorContent() {
               </p>
             )}
           </div>
-          <span
-            className={cn(
-              "flex items-center gap-2 rounded-full border px-3 py-1 text-sm font-medium",
-              // 첫 응답 전(isLoading)엔 engine_alive 가 undefined(falsy) 라 실제 가동 중이어도
-              // 적색 '중지'로 오표시된다. 로딩 중엔 중립(muted) 상태로 분기한다.
-              engine.isLoading
-                ? "border-border bg-muted text-muted-foreground"
-                : engine.data?.engine_alive
-                  ? "border-profit/30 bg-profit/10 text-profit"
-                  : "border-loss/30 bg-loss/10 text-loss",
-            )}
-          >
-            <span className="relative flex h-2 w-2">
-              {engine.data?.engine_alive && !engine.isLoading && (
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-profit opacity-75" />
-              )}
+          <Tooltip>
+            <TooltipTrigger asChild>
               <span
+                tabIndex={0}
                 className={cn(
-                  "relative inline-flex h-2 w-2 rounded-full",
+                  "flex cursor-help items-center gap-2 rounded-full border px-3 py-1 text-sm font-medium",
+                  // 첫 응답 전(isLoading)엔 engine_alive 가 undefined(falsy) 라 실제 가동 중이어도
+                  // 적색 '중지'로 오표시된다. 로딩 중엔 중립(muted) 상태로 분기한다.
                   engine.isLoading
-                    ? "bg-muted-foreground"
+                    ? "border-border bg-muted text-muted-foreground"
                     : engine.data?.engine_alive
-                      ? "bg-profit"
-                      : "bg-loss",
+                      ? "border-profit/30 bg-profit/10 text-profit"
+                      : "border-loss/30 bg-loss/10 text-loss",
                 )}
-              />
-            </span>
-            매매 엔진 {engine.isLoading ? "확인 중…" : engine.data?.engine_alive ? "동작 중" : "중지"}
-          </span>
+              >
+                <span className="relative flex h-2 w-2">
+                  {engine.data?.engine_alive && !engine.isLoading && (
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-profit opacity-75" />
+                  )}
+                  <span
+                    className={cn(
+                      "relative inline-flex h-2 w-2 rounded-full",
+                      engine.isLoading
+                        ? "bg-muted-foreground"
+                        : engine.data?.engine_alive
+                          ? "bg-profit"
+                          : "bg-loss",
+                    )}
+                  />
+                </span>
+                매매 엔진{" "}
+                {engine.isLoading ? "확인 중…" : engine.data?.engine_alive ? "동작 중" : "중지"}
+                <HelpCircle className="h-3.5 w-3.5 opacity-60" />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>
+              {engineStatusDesc(engine.isLoading, engine.data?.engine_alive)}
+            </TooltipContent>
+          </Tooltip>
         </div>
 
         <Watchlist
@@ -224,22 +292,104 @@ function MonitorContent() {
           <h2 className="mb-2 text-sm font-medium text-muted-foreground">
             최근 주문 (감사 로그)
           </h2>
-          <Table
-            head={["시각", "종목", "구분", "수량", "상태"]}
-            rows={
-              orders.data?.map((o) => [
-                new Date(o.created_at).toLocaleString("ko-KR"),
-                nameOf(o.symbol),
-                o.side === "buy" ? "매수" : "매도",
-                o.qty.toLocaleString(),
-                o.status,
-              ]) ?? []
-            }
-            empty="주문 내역이 없습니다."
-          />
+          <OrderAuditTable orders={orders.data} nameOf={nameOf} />
         </section>
       </main>
-    </>
+    </TooltipProvider>
+  );
+}
+
+/**
+ * 주문 감사 로그 테이블.
+ * 각 주문이 '어떤 신호·공식·리스크·리밸런싱 기준'으로 나갔는지(reason)를 상세 열로 보여주고,
+ * 상태는 색조 배지(초록=진행/체결, 빨강=거부/취소)와 툴팁 설명으로 표기한다.
+ */
+function OrderAuditTable({
+  orders,
+  nameOf,
+}: {
+  orders?: OrderRow[];
+  nameOf: (code?: string | null) => string;
+}) {
+  return (
+    <div className="overflow-x-auto rounded-lg border">
+      <table className="w-full min-w-[52rem] text-sm">
+        <thead className="bg-muted/50 text-xs text-muted-foreground">
+          <tr>
+            {["시각", "종목", "구분", "수량", "상태", "사유"].map((h) => (
+              <th key={h} className="px-3 py-2 text-left font-medium">
+                {h}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {!orders || orders.length === 0 ? (
+            <tr>
+              <td colSpan={6} className="px-3 py-6 text-center text-muted-foreground">
+                주문 내역이 없습니다.
+              </td>
+            </tr>
+          ) : (
+            orders.map((o) => {
+              const st = ORDER_STATUS[o.status] ?? {
+                label: o.status,
+                tone: "muted" as const,
+                desc: "알 수 없는 상태입니다.",
+              };
+              return (
+                <tr
+                  key={o.id}
+                  className="border-t border-border/60 align-top transition-colors hover:bg-accent/30"
+                >
+                  <td className="whitespace-nowrap px-3 py-2 tabular-nums text-muted-foreground">
+                    {new Date(o.created_at).toLocaleString("ko-KR")}
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2">{nameOf(o.symbol)}</td>
+                  <td className="px-3 py-2">
+                    <span
+                      className={cn(
+                        "font-medium",
+                        o.side === "buy" ? "text-profit" : "text-loss",
+                      )}
+                    >
+                      {o.side === "buy" ? "매수" : "매도"}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2 tabular-nums">{o.qty.toLocaleString()}</td>
+                  <td className="px-3 py-2">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span
+                          tabIndex={0}
+                          className={cn(
+                            "inline-flex cursor-help items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium",
+                            st.tone === "profit"
+                              ? "border-profit/30 bg-profit/10 text-profit"
+                              : st.tone === "loss"
+                                ? "border-loss/30 bg-loss/10 text-loss"
+                                : "border-border bg-muted text-muted-foreground",
+                          )}
+                        >
+                          {st.label}
+                          <HelpCircle className="h-3 w-3 opacity-60" />
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent>{st.desc}</TooltipContent>
+                    </Tooltip>
+                  </td>
+                  <td className="px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                    {o.reason ?? (
+                      <span className="text-muted-foreground/50">—</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })
+          )}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -435,12 +585,22 @@ function StrategyToggle({ strategy }: { strategy: Strategy }) {
   return (
     <Card className="flex items-center justify-between px-4 py-3">
       <div className="flex items-center gap-3">
-        <span
-          className={cn(
-            "h-2 w-2 shrink-0 rounded-full",
-            isLive ? "bg-profit" : "bg-muted-foreground/40",
-          )}
-        />
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span
+              tabIndex={0}
+              className={cn(
+                "h-2.5 w-2.5 shrink-0 cursor-help rounded-full",
+                isLive ? "bg-profit" : "bg-loss",
+              )}
+            />
+          </TooltipTrigger>
+          <TooltipContent>
+            {isLive
+              ? "실행 중(live): 매매 엔진이 이 전략의 신호를 평가해 실제 주문을 냅니다."
+              : "정지됨(stopped): 이 전략은 꺼져 있어 신호가 나도 주문하지 않습니다. '시작'을 눌러 활성화하세요."}
+          </TooltipContent>
+        </Tooltip>
         <div>
           <p className="text-sm font-medium">{strategy.name}</p>
           <p className="text-xs text-muted-foreground">

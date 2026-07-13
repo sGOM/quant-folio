@@ -136,12 +136,17 @@ class BaseRunner:
         return pos.qty if pos else Decimal("0")
 
     async def _place(
-        self, db, symbol: str, side: str, qty: int, price: Decimal, bar_ts: str
+        self, db, symbol: str, side: str, qty: int, price: Decimal, bar_ts: str,
+        reason: str | None = None,
     ) -> None:
-        """멱등성 키를 구성해 주문을 실행한다(executor 재사용)."""
+        """멱등성 키를 구성해 주문을 실행한다(executor 재사용).
+
+        :param reason: 감사 로그용 주문 사유(Order.reason 에 기록).
+        """
         await execute_signal(
             db, self.redis, self._broker,
             user_id=self._user_id, strategy_id=self.strategy_id,
             symbol=symbol, side=side, qty=qty, price=price,
             idempotency_key=make_idempotency_key(self.strategy_id, symbol, side, bar_ts),
+            reason=reason,
         )

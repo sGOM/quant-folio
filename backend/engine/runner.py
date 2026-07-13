@@ -17,7 +17,12 @@ from sqlalchemy import select
 
 from app.core.database import AsyncSessionLocal
 from app.models import Position
-from app.services.backtest.signals import latest_signal, min_periods, requires_ohlc
+from app.services.backtest.signals import (
+    explain_signal,
+    latest_signal,
+    min_periods,
+    requires_ohlc,
+)
 from app.services.data.loader import (
     get_close_series,
     get_ohlcv_frame,
@@ -162,15 +167,17 @@ class StrategyRunner(BaseRunner):
                     db, self._user_id, self.strategy_id, self._symbol, price
                 ):
                     await self._clear_trail()
-                    await self._do_sell(db, price, bar_ts + ":stop")
+                    reason = await self._stop_loss_reason(db, price)
+                    await self._do_sell(db, price, bar_ts + ":stop", reason)
                     return
 
                 # 2) 전략 config 기반 청산(손절%/익절%/트레일링) 평가
                 if held > 0:
-                    exit_kind = await self._config_exit(db, price)
-                    if exit_kind is not None:
+                    exit_info = await self._config_exit(db, price)
+                    if exit_info is not None:
+                        exit_kind, exit_reason = exit_info
                         await self._clear_trail()
-                        await self._do_sell(db, price, f"{bar_ts}:{exit_kind}")
+                        await self._do_sell(db, price, f"{bar_ts}:{exit_kind}", exit_reason)
                         return
                 else:
                     # 보유 없음 → 트레일링 고점 캐시 정리(잔여 키 방지).
@@ -189,18 +196,24 @@ class StrategyRunner(BaseRunner):
                         Decimal(str(self._cfg.get("cash", 10_000_000))),
                     )
                     if decision.approved:
+                        reason = self._signal_reason(series, "buy")
+                        reason += (
+                            f" · 진입 {decision.qty:,}주 @ {float(price):,.0f}"
+                            f"(약 {decision.qty * float(price):,.0f}원)"
+                        )
                         await execute_signal(
                             db, self.redis, self._broker,
                             user_id=self._user_id, strategy_id=self.strategy_id,
                             symbol=self._symbol, side="buy", qty=decision.qty, price=price,
                             idempotency_key=make_idempotency_key(
                                 self.strategy_id, self._symbol, "buy", bar_ts),
+                            reason=reason,
                         )
                     else:
                         logger.info("매수 보류: %s", decision.reason)
                 elif sig == "sell" and held > 0:
                     await self._clear_trail()
-                    await self._do_sell(db, price, bar_ts)
+                    await self._do_sell(db, price, bar_ts, self._signal_reason(series, "sell"))
 
     def _trail_key(self) -> str:
         """트레일링 스탑 고점 캐시 키 — (strategy, symbol) 단위."""
@@ -210,13 +223,13 @@ class StrategyRunner(BaseRunner):
         """트레일링 고점 캐시를 제거한다(포지션 종료·청산 시)."""
         await self.redis.delete(self._trail_key())
 
-    async def _config_exit(self, db, price: Decimal) -> str | None:
+    async def _config_exit(self, db, price: Decimal) -> tuple[str, str] | None:
         """전략 config 의 손절%/익절%/트레일링 청산 조건을 평가한다.
 
         보유 포지션의 평균단가(avg_price) 대비 현재가로 손절·익절을, 보유 중 고점
         대비 하락률로 트레일링을 판정한다. 고점은 Redis 에 보관한다.
 
-        :return: 청산 사유 'sl'|'tp'|'trail', 해당 없으면 None
+        :return: (청산 사유 'sl'|'tp'|'trail', 감사 로그용 사유 문장) 또는 None
         """
         pos = await db.scalar(
             select(Position).where(
@@ -233,12 +246,20 @@ class StrategyRunner(BaseRunner):
 
         # 익절: 평균단가 대비 +tp 이상 상승
         if tp is not None and (price - avg) / avg >= Decimal(str(tp)):
-            logger.info("익절 도달: %s +%.4f", self._symbol, float((price - avg) / avg))
-            return "tp"
+            gain = float((price - avg) / avg)
+            logger.info("익절 도달: %s +%.4f", self._symbol, gain)
+            return "tp", (
+                f"익절: 현재가 {float(price):,.0f}가 평균단가 {float(avg):,.0f} 대비 "
+                f"+{gain * 100:.2f}%로 익절 기준 +{float(tp) * 100:.1f}% 도달"
+            )
         # 손절: 평균단가 대비 -sl 이상 하락
         if sl is not None and (avg - price) / avg >= Decimal(str(sl)):
-            logger.info("손절 도달: %s -%.4f", self._symbol, float((avg - price) / avg))
-            return "sl"
+            drop = float((avg - price) / avg)
+            logger.info("손절 도달: %s -%.4f", self._symbol, drop)
+            return "sl", (
+                f"손절: 현재가 {float(price):,.0f}가 평균단가 {float(avg):,.0f} 대비 "
+                f"−{drop * 100:.2f}%로 손절 기준 −{float(sl) * 100:.1f}% 이하로 하락"
+            )
         # 트레일링: 보유 중 고점 대비 -trail 이상 하락
         if trail is not None:
             key = self._trail_key()
@@ -248,18 +269,45 @@ class StrategyRunner(BaseRunner):
                 peak = price
             await self.redis.set(key, str(peak), ex=_TRAIL_TTL)
             if peak > 0 and (peak - price) / peak >= Decimal(str(trail)):
-                logger.info(
-                    "트레일링 스탑 도달: %s 고점 %s 대비 -%.4f",
-                    self._symbol, peak, float((peak - price) / peak),
+                fall = float((peak - price) / peak)
+                logger.info("트레일링 스탑 도달: %s 고점 %s 대비 -%.4f", self._symbol, peak, fall)
+                return "trail", (
+                    f"트레일링 스탑: 현재가 {float(price):,.0f}가 보유 중 고점 "
+                    f"{float(peak):,.0f} 대비 −{fall * 100:.2f}%로 기준 "
+                    f"−{float(trail) * 100:.1f}% 이하로 하락"
                 )
-                return "trail"
         return None
 
-    async def _do_sell(self, db, price: Decimal, bar_ts: str) -> None:
+    async def _stop_loss_reason(self, db, price: Decimal) -> str:
+        """리스크 한도(RiskLimit.stop_loss_pct) 손절의 감사 로그 사유를 만든다."""
+        pos = await db.scalar(
+            select(Position).where(
+                Position.user_id == self._user_id, Position.symbol == self._symbol
+            )
+        )
+        if pos and pos.avg_price and pos.avg_price > 0:
+            drop = float((Decimal(str(pos.avg_price)) - price) / Decimal(str(pos.avg_price)))
+            return (
+                f"리스크 손절 한도 도달: 현재가 {float(price):,.0f}가 평균단가 "
+                f"{float(pos.avg_price):,.0f} 대비 −{drop * 100:.2f}% 하락(RiskLimit 손절선 이하)"
+            )
+        return "리스크 손절 한도 도달(RiskLimit stop_loss_pct 이하로 하락)"
+
+    def _signal_reason(self, series, side: str) -> str:
+        """explain_signal 로 신호 사유 문장을 만든다(실패해도 매매를 막지 않도록 방어)."""
+        try:
+            return explain_signal(series, self._cfg, side)
+        except Exception:  # noqa: BLE001
+            return f"{self._cfg.get('type', '전략')} {'매수' if side == 'buy' else '매도'} 신호"
+
+    async def _do_sell(
+        self, db, price: Decimal, bar_ts: str, reason: str | None = None
+    ) -> None:
         """보유 수량 전량 매도를 실행한다(리스크 평가 후).
 
         :param price: 신호 시점가(체결 기록은 executor 가 실제 체결가로 보정)
         :param bar_ts: 멱등성 키 구성용 신호봉 식별자(손절은 ":stop" 접미)
+        :param reason: 감사 로그용 매도 사유(Order.reason 에 기록)
         """
         decision = await risk.evaluate_sell(db, self._user_id, self._symbol)
         if not decision.approved:
@@ -270,4 +318,5 @@ class StrategyRunner(BaseRunner):
             symbol=self._symbol, side="sell", qty=decision.qty, price=price,
             idempotency_key=make_idempotency_key(
                 self.strategy_id, self._symbol, "sell", bar_ts),
+            reason=reason,
         )

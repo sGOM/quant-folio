@@ -762,3 +762,227 @@ def latest_signal(data, config: dict) -> str | None:
     if bool(exits.iloc[-1]):
         return "sell"
     return None
+
+
+# ─────────────────────── 신호 사유 설명(감사 로그) ───────────────────────
+
+
+def _fmt(v: float, digits: int = 2) -> str:
+    """지표값을 사람이 읽기 좋게 포맷(가격류는 천단위 구분, 비율류는 소수)."""
+    try:
+        if abs(v) >= 1000:
+            return f"{v:,.0f}"
+        return f"{v:.{digits}f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def explain_signal(data, config: dict, side: str) -> str:
+    """방금 발화한 신호(side='buy'|'sell')가 '어떤 공식에서 어떤 값을 넘었는지'를
+    사람이 읽을 수 있는 한국어 한 줄로 설명한다(감사 로그 Order.reason 용).
+
+    전략 유형별로 신호를 발생시킨 지표의 '가장 최근 값'을 실제로 계산해 문장에 넣는다.
+    지표 계산이 실패하거나(데이터 부족 등) 미정의 유형이면 일반 설명으로 폴백한다.
+
+    :param data: 종가 Series 또는 OHLCV DataFrame(신호 계산에 쓴 것과 동일 입력)
+    :param side: 'buy'(진입 신호) 또는 'sell'(청산 신호)
+    """
+    stype = config.get("type", "sma_crossover")
+    try:
+        return _explain(data, config, stype, side)
+    except Exception:  # noqa: BLE001 — 설명 생성 실패가 매매를 막아선 안 된다.
+        buy = side == "buy"
+        return (
+            f"{stype} 전략 {'진입(매수)' if buy else '청산(매도)'} 신호 발생 "
+            f"(자세한 지표값 산출 실패 — 규칙 충족)"
+        )
+
+
+def _explain(data, config: dict, stype: str, side: str) -> str:
+    """explain_signal 본문 — 유형별 최근 지표값으로 사유 문장을 만든다."""
+    close = _as_close(data)
+    px = float(close.iloc[-1])
+    buy = side == "buy"
+
+    def last(s: pd.Series) -> float:
+        return float(s.iloc[-1])
+
+    if stype in ("sma_crossover", "ema_crossover"):
+        ma = _sma if stype == "sma_crossover" else _ema
+        label = "SMA" if stype == "sma_crossover" else "EMA"
+        fast = int(config.get("fast", 5 if stype == "sma_crossover" else 12))
+        slow = int(config.get("slow", 20 if stype == "sma_crossover" else 26))
+        f, s = last(ma(close, fast)), last(ma(close, slow))
+        if buy:
+            return (f"골든크로스: 단기 {label}{fast}({_fmt(f)})가 장기 {label}{slow}"
+                    f"({_fmt(s)})를 상향 돌파")
+        return (f"데드크로스: 단기 {label}{fast}({_fmt(f)})가 장기 {label}{slow}"
+                f"({_fmt(s)})를 하향 이탈")
+
+    if stype == "rsi":
+        period = int(config.get("period", 14))
+        lower = float(config.get("lower", 30))
+        upper = float(config.get("upper", 70))
+        rsi = last(_rsi(close, period))
+        if buy:
+            return f"RSI({period}) {_fmt(rsi)}가 과매도선 {_fmt(lower)}를 상향 복귀(매수)"
+        return f"RSI({period}) {_fmt(rsi)}가 과매수선 {_fmt(upper)}를 하향 이탈(매도)"
+
+    if stype == "macd":
+        fast = int(config.get("fast", 12))
+        slow = int(config.get("slow", 26))
+        signal = int(config.get("signal", 9))
+        ml, sl = _macd(close, fast, slow, signal)
+        m, s = last(ml), last(sl)
+        dirn = "상향 돌파" if buy else "하향 이탈"
+        return (f"MACD({fast},{slow},{signal}) 선 {_fmt(m)}가 시그널선 {_fmt(s)}를 "
+                f"{dirn}({'매수' if buy else '매도'})")
+
+    if stype == "bollinger":
+        period = int(config.get("period", 20))
+        num_std = float(config.get("num_std", 2.0))
+        mid = _sma(close, period)
+        std = close.rolling(window=period, min_periods=period).std(ddof=0)
+        band = last(mid) + (num_std if not buy else -num_std) * last(std)
+        if buy:
+            return f"종가 {_fmt(px)}가 볼린저 하단밴드 {_fmt(band)}(−{num_std}σ)를 상향 복귀(매수)"
+        return f"종가 {_fmt(px)}가 볼린저 상단밴드 {_fmt(band)}(+{num_std}σ)를 하향 이탈(매도)"
+
+    if stype == "breakout":
+        period = int(config.get("period", 20))
+        if buy:
+            ch = last(close.rolling(period, min_periods=period).max().shift(1))
+            return f"종가 {_fmt(px)}가 직전 {period}봉 최고가 {_fmt(ch)}를 상향 돌파(매수)"
+        ch = last(close.rolling(period, min_periods=period).min().shift(1))
+        return f"종가 {_fmt(px)}가 직전 {period}봉 최저가 {_fmt(ch)}를 하향 돌파(매도)"
+
+    if stype == "momentum":
+        lookback = int(config.get("lookback", 120))
+        mom = last(close / close.shift(lookback) - 1.0) * 100
+        if buy:
+            return f"{lookback}봉 모멘텀 {_fmt(mom)}%가 0%를 상향 돌파(추세 양전, 매수)"
+        return f"{lookback}봉 모멘텀 {_fmt(mom)}%가 0%를 하향 돌파(추세 음전, 매도)"
+
+    if stype == "zscore":
+        period = int(config.get("period", 20))
+        entry = float(config.get("entry", 2.0))
+        mid = _sma(close, period)
+        std = close.rolling(window=period, min_periods=period).std()
+        z = last((close - mid) / std)
+        if buy:
+            return f"z-score {_fmt(z)}가 저평가 임계 −{_fmt(entry)}를 상향 복귀(평균회귀 매수)"
+        return f"z-score {_fmt(z)}가 평균선 0을 상향 돌파(회귀 완료, 매도)"
+
+    if stype == "disparity":
+        period = int(config.get("period", 20))
+        lower = float(config.get("lower", 95.0))
+        upper = float(config.get("upper", 105.0))
+        disp = last(100.0 * close / _sma(close, period))
+        if buy:
+            return f"이격도(종가/SMA{period}) {_fmt(disp)}%가 하한 {_fmt(lower)}%를 상향 복귀(매수)"
+        return f"이격도(종가/SMA{period}) {_fmt(disp)}%가 상한 {_fmt(upper)}%를 하향 이탈(매도)"
+
+    if stype == "donchian_squeeze":
+        period = int(config.get("period", 20))
+        mid = last(_sma(close, period))
+        if buy:
+            return f"변동성 스퀴즈 해제 & 종가 {_fmt(px)}가 중심선 SMA{period} {_fmt(mid)} 위(추세 진입 매수)"
+        return f"종가 {_fmt(px)}가 중심선 SMA{period} {_fmt(mid)}를 하향 돌파(매도)"
+
+    if stype == "trix":
+        period = int(config.get("period", 15))
+        signal_period = int(config.get("signal_period", 9))
+        e1 = _ema(close, period)
+        e2 = _ema(e1, period)
+        e3 = _ema(e2, period)
+        trix = (e3 - e3.shift(1)) / e3.shift(1) * 100.0
+        sig = trix.ewm(span=signal_period, adjust=False, min_periods=signal_period).mean()
+        t, s = last(trix), last(sig)
+        dirn = "상향 돌파" if buy else "하향 이탈"
+        return f"TRIX {_fmt(t, 4)}가 시그널선 {_fmt(s, 4)}를 {dirn}({'매수' if buy else '매도'})"
+
+    if stype == "atr_trailing":
+        high, low, c = data["high"], data["low"], data["close"]
+        period = int(config.get("period", 22))
+        atr_period = int(config.get("atr_period", 22))
+        k = float(config.get("k", 3.0))
+        if buy:
+            ch = last(high.rolling(period, min_periods=period).max().shift(1))
+            return f"종가 {_fmt(px)}가 {period}봉 채널 상단 {_fmt(ch)}를 상향 돌파(추세 매수)"
+        atr = _atr(high, low, c, atr_period)
+        chand = last(high.rolling(period, min_periods=period).max()) - k * last(atr)
+        return f"종가 {_fmt(px)}가 샹들리에 청산선 {_fmt(chand)}(고점−{k}×ATR)을 하향 돌파(매도)"
+
+    if stype == "volatility_breakout":
+        open_, high, low = data["open"], data["high"], data["low"]
+        k = float(config.get("k", 0.5))
+        prev_range = last(high.shift(1) - low.shift(1))
+        target = last(open_) + k * prev_range
+        if buy:
+            return (f"당일 고가가 변동성 돌파 목표가 {_fmt(target)}"
+                    f"(시가+{k}×전일변동폭 {_fmt(prev_range)})를 상향 돌파(매수)")
+        return "변동성 돌파 진입 다음 봉 — 당일 종가 청산 규약(매도)"
+
+    if stype == "keltner":
+        high, low, c = data["high"], data["low"], data["close"]
+        ema_period = int(config.get("ema_period", 20))
+        atr_period = int(config.get("atr_period", 10))
+        mult = float(config.get("mult", 2.0))
+        mid = _ema(c, ema_period)
+        if buy:
+            atr = _atr(high, low, c, atr_period)
+            upper = last(mid) + mult * last(atr)
+            return f"종가 {_fmt(px)}가 켈트너 채널 상단 {_fmt(upper)}(EMA+{mult}×ATR)를 상향 돌파(매수)"
+        return f"종가 {_fmt(px)}가 켈트너 중심선 EMA{ema_period} {_fmt(last(mid))}를 하향 돌파(매도)"
+
+    if stype == "stochastic":
+        high, low, c = data["high"], data["low"], data["close"]
+        k_period = int(config.get("k_period", 14))
+        d_period = int(config.get("d_period", 3))
+        lower = float(config.get("lower", 20.0))
+        upper = float(config.get("upper", 80.0))
+        lowest = low.rolling(k_period, min_periods=k_period).min()
+        highest = high.rolling(k_period, min_periods=k_period).max()
+        rng = highest - lowest
+        pct_k = (100.0 * (c - lowest) / rng).where(rng != 0, 50.0)
+        pct_d = pct_k.rolling(d_period, min_periods=d_period).mean()
+        k, d = last(pct_k), last(pct_d)
+        if buy:
+            return (f"스토캐스틱 과매도(%K {_fmt(k)} < {_fmt(lower)})에서 %K가 %D {_fmt(d)}를 "
+                    f"상향 교차(매수)")
+        return (f"스토캐스틱 과매수(%K {_fmt(k)} > {_fmt(upper)})에서 %K가 %D {_fmt(d)}를 "
+                f"하향 교차(매도)")
+
+    if stype == "obv_trend":
+        period = int(config.get("period", 20))
+        dirn = "상향 돌파" if buy else "하향 이탈"
+        return f"OBV(거래량 누적)가 {period}봉 이동평균을 {dirn}({'매수' if buy else '매도'})"
+
+    if stype == "custom":
+        node = config.get("entry") if buy else config.get("exit")
+        conds = [
+            f"{_operand_desc(c['left'])} {c['op']} {_operand_desc(c['right'])}"
+            for c in _iter_conditions(node)
+        ]
+        joined = ", ".join(conds[:4]) + ("…" if len(conds) > 4 else "")
+        kind = "진입(매수)" if buy else "청산(매도)"
+        return f"사용자 정의 {kind} 조건 충족: {joined}" if joined else f"사용자 정의 {kind} 신호"
+
+    return f"{stype} 전략 {'매수' if buy else '매도'} 신호 발생(규칙 충족)"
+
+
+def _operand_desc(op: dict) -> str:
+    """custom 규칙 피연산자를 짧은 한국어 라벨로 표기(사유 문장용)."""
+    kind = op.get("kind")
+    if kind == "const":
+        return _fmt(float(op.get("value", 0)))
+    if kind == "price":
+        return {"close": "종가", "open": "시가", "high": "고가", "low": "저가",
+                "volume": "거래량"}.get(op.get("source", "close"), op.get("source", "종가"))
+    if kind in ("sma", "ema", "rsi"):
+        return f"{kind.upper()}{op.get('period', '')}"
+    if kind == "macd_line":
+        return "MACD선"
+    if kind == "macd_signal":
+        return "MACD시그널"
+    return str(kind)

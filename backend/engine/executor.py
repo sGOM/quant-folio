@@ -50,8 +50,13 @@ async def execute_signal(
     qty: int,
     price: Decimal,
     idempotency_key: str,
+    reason: str | None = None,
 ) -> Order | None:
-    """신호에 따른 주문 실행. 중복이면 None 반환."""
+    """신호에 따른 주문 실행. 중복이면 None 반환.
+
+    :param reason: 감사 로그용 주문 사유(어떤 신호·공식·리스크·리밸런싱 기준으로
+        이 주문이 나갔는지 사람이 읽을 수 있는 한국어 설명). Order.reason 에 기록된다.
+    """
     # 1) Redis 분산 락
     lock_key = f"{ORDER_LOCK_PREFIX}{idempotency_key}"
     got_lock = await redis.set(lock_key, "1", nx=True, ex=_LOCK_TTL)
@@ -79,6 +84,7 @@ async def execute_signal(
             order_type="market",
             status=OrderStatus.PENDING,
             idempotency_key=idempotency_key,
+            reason=reason,
         )
         db.add(order)
         try:

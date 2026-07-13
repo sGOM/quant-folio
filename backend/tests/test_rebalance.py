@@ -1099,7 +1099,7 @@ async def test_rebalance_once_pit_narrows_and_scores_injected_universe(monkeypat
     orders_seen: list = []
     monkeypatch.setattr(
         r, "_execute_orders",
-        lambda orders, prices, positions, bar_ts: _async(orders_seen.extend(orders)),
+        lambda orders, prices, positions, bar_ts, *a: _async(orders_seen.extend(orders)),
     )
 
     await r._rebalance_once(datetime(2025, 4, 1, 14, 30, tzinfo=KST), risk_off=False)
