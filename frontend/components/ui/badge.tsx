@@ -15,9 +15,9 @@ const badgeVariants = cva(
         destructive:
           "border-transparent bg-destructive text-destructive-foreground shadow",
         outline: "text-foreground",
-        // 금융 상태 전용
+        // 운영 상태 전용(성공/가동/정상 = 초록). 손익색(profit=적)과 구분한다.
         success:
-          "border-transparent bg-profit/15 text-profit",
+          "border-transparent bg-status-ok/15 text-status-ok",
         warning:
           "border-transparent bg-amber-500/15 text-amber-400",
         muted: "border-transparent bg-muted text-muted-foreground",
