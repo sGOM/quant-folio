@@ -1,8 +1,9 @@
 """KRX 장 운영시간/휴장일 판단.
 
-정규장 09:00~15:30 (KST), 주말·공휴일 휴장. 공휴일은 pykrx 영업일로
-best-effort 확인하고, 조회 실패 시 보수적으로 '영업일'로 간주하지 않는다
-(주문을 막는 방향이 안전).
+정규장 09:00~15:30 (KST), 주말·공휴일 휴장. 공휴일은 pykrx 로 best-effort 확인한다.
+pykrx 는 데이터 기반이라 '당일 데이터 미발행'(실거래 아침·미래 시계)을 휴장으로 오판할
+수 있어, 대상일 이후 지수 데이터 존재 여부로 '실제 휴장일'과 '미발행'을 구분한다. 판정
+불가(조회 실패·미발행)면 평일은 영업일로 간주하고, 실제 휴장이면 시세·주문에서 자연 차단.
 """
 from __future__ import annotations
 
@@ -43,7 +44,28 @@ def is_business_day(d: date) -> bool:
         with bounded_socket_timeout(_BUSINESS_DAY_TIMEOUT):
             ymd = d.strftime("%Y%m%d")
             nearest = stock.get_nearest_business_day_in_a_week(ymd)
-            return nearest == ymd
+            if nearest == ymd:
+                return True
+            # nearest != ymd: pykrx 가 대상일을 거래일로 확정하지 못했다. 두 경우가 있다.
+            #   (a) 실제 휴장일 → 대상일 '이후'에도 거래일 데이터가 존재한다.
+            #   (b) 데이터 미발행 → 당일 지수가 아직 미공표이거나(실거래 아침) 시계가
+            #       pykrx 데이터 지평선보다 앞서(테스트/미래 시계) 대상일 이후 데이터가 없다.
+            # get_nearest_business_day_in_a_week 는 휴장일·미발행 모두 '과거'로 되짚으므로
+            # 방향으로는 구분할 수 없다. 대상일 이후 지수 데이터 존재 여부로 (a)/(b)를 가른다.
+            after = stock.get_index_ohlcv_by_date(
+                (d + timedelta(days=1)).strftime("%Y%m%d"),
+                (d + timedelta(days=14)).strftime("%Y%m%d"),
+                "1001",
+            )
+            if after is not None and not after.empty:
+                return False  # 대상일 이후 거래일 존재 → 실제 휴장일
+            # 대상일 이후 데이터 없음 = 미발행. 주말은 이미 걸렀으므로 영업일로 간주한다.
+            # (이렇게 해야 당일 지수 미공표 상황에서도 엔진이 정상 발화한다. 실제로 휴장일
+            # 이라면 시세·주문 단계에서 자연히 차단된다.)
+            logger.warning(
+                "영업일 조회: %s 이후 지수 데이터 없음(미발행 추정) — 평일이므로 영업일로 간주", d
+            )
+            return True
     except Exception as e:  # noqa: BLE001
         logger.debug("영업일 조회 실패(%s), 주말여부만 적용: %s", d, e)
         return True  # 주말이 아니면 일단 영업일로 (시세/주문에서 자연 차단)

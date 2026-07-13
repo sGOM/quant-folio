@@ -182,6 +182,29 @@ async def _heartbeat_loop() -> None:
             pass
 
 
+# executor 는 주문 직후 1회만 체결을 조회하므로, 접수 직후 미체결이던 주문은 SUBMITTED
+# 로 남는다. 이 루프가 남은 미체결 주문을 주기적으로 재조회해 실제 체결로 수렴시킨다.
+_RECONCILE_INTERVAL = 60  # 초
+
+
+async def _reconcile_loop() -> None:
+    """주기적으로 미체결(SUBMITTED/PARTIAL) 주문을 재조회해 체결·포지션을 정합한다."""
+    from engine.reconcile import reconcile_open_orders
+
+    while not _shutdown.is_set():
+        try:
+            async with AsyncSessionLocal() as db:
+                stats = await reconcile_open_orders(db, redis_client)
+            if stats["filled"] or stats["partial"]:
+                logger.info("체결 재조회 정합: %s", stats)
+        except Exception:  # noqa: BLE001
+            logger.exception("체결 재조회 루프 오류")
+        try:
+            await asyncio.wait_for(_shutdown.wait(), timeout=_RECONCILE_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def main() -> None:
     """엔진 메인 루프 — 신호 핸들러 등록, live 전략 복구, 제어/하트비트 태스크 구동 후
     종료 신호를 받으면 전략·피드를 정리하고 종료한다."""
@@ -200,6 +223,7 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(_control_loop()),
         asyncio.create_task(_heartbeat_loop()),
+        asyncio.create_task(_reconcile_loop()),
     ]
     await _shutdown.wait()
 
