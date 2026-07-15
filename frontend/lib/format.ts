@@ -65,3 +65,24 @@ export function fmtAmt(v: number | null | undefined): string {
 export function pctColor(v: number | null | undefined): string {
   return v == null ? "text-muted-foreground" : trendColor(v);
 }
+
+/**
+ * ISO 타임스탬프를 "3분 전"/"방금 전" 같은 상대 시각 문구로 표시한다.
+ * 엔진 헬스·알림 등 실시간 정보의 최신성을 직관적으로 보여줄 때 사용한다.
+ * @param iso ISO 8601 타임스탬프. null/파싱 불가 시 "-".
+ */
+export function formatRelativeTime(iso: string | null | undefined): string {
+  if (!iso) return "-";
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return "-";
+  const diffSec = Math.round((Date.now() - t) / 1000);
+  if (diffSec < 5) return "방금 전";
+  if (diffSec < 0) return "곧";
+  if (diffSec < 60) return `${diffSec}초 전`;
+  const min = Math.round(diffSec / 60);
+  if (min < 60) return `${min}분 전`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}시간 전`;
+  const day = Math.round(hr / 24);
+  return `${day}일 전`;
+}

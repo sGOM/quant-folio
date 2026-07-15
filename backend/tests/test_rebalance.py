@@ -734,12 +734,41 @@ def test_no_reentry_without_regime_recovery():
 class _FakeRedis:
     def __init__(self):
         self.store: dict[str, str] = {}
+        self.published: list[tuple[str, str]] = []  # (channel, data) 발행 기록
 
     async def get(self, k):
         return self.store.get(k)
 
-    async def set(self, k, v, ex=None):
+    async def set(self, k, v, ex=None, nx=False):
+        if nx and k in self.store:
+            return None
         self.store[k] = v
+        return True
+
+    async def delete(self, k):
+        self.store.pop(k, None)
+
+    async def publish(self, channel, data):
+        self.published.append((channel, data))
+        return 1
+
+    def alerts(self) -> list[dict]:
+        """발행된 이벤트 중 type=="alert" 만 파싱해 반환(공용 채널만 집계, 중복 방지)."""
+        import json as _json
+
+        from app.core.channels import ENGINE_EVENTS_CHANNEL
+
+        out = []
+        for ch, data in self.published:
+            if ch != ENGINE_EVENTS_CHANNEL:
+                continue
+            try:
+                payload = _json.loads(data)
+            except (ValueError, TypeError):
+                continue
+            if payload.get("type") == "alert":
+                out.append(payload)
+        return out
 
 
 async def _make_runner(
@@ -1428,6 +1457,30 @@ async def test_mdd_kill_lifecycle_trigger_cooldown_rearm(monkeypatch):
     state = await r._get_mdd_state()
     assert state["killed"] is False and state["hwm"] == 11_000_000
     assert state["kill_date"] is None
+
+
+async def test_mdd_kill_publishes_alert_once_on_trigger(monkeypatch):
+    """MDD 킬스위치 발동 전환 시 critical 알림을 1회 발행한다(발동 지속 중 재발송 없음)."""
+    r, holder = await _mdd_runner(monkeypatch, mdd_kill_pct=0.2, rearm_days=5)
+    r._user_id = 11
+
+    async def step(eq, d):
+        holder["eq"] = eq
+        holder["now"] = datetime(d.year, d.month, d.day, 14, 30, tzinfo=KST)
+        return await r._evaluate_mdd_kill(0.2, 5)
+
+    await step(11_000_000, date(2024, 1, 2))  # 고점 11M
+    await step(8_700_000, date(2024, 1, 8))   # 고점 대비 −20.9% ≤ −20% → 발동
+    alerts = r.redis.alerts()
+    assert len(alerts) == 1
+    assert alerts[0]["code"] == "mdd_kill"
+    assert alerts[0]["severity"] == "critical"
+    assert alerts[0]["strategy_id"] == 1
+    assert alerts[0]["user_id"] == 11
+
+    # 발동 유지 구간(쿨다운) — 재평가해도 재발송하지 않는다.
+    await step(8_700_000, date(2024, 1, 9))
+    assert len(r.redis.alerts()) == 1
 
 
 async def test_mdd_kill_inert_when_threshold_deep(monkeypatch):

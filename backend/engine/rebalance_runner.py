@@ -34,6 +34,7 @@ from app.services.metrics import (
     compute_universe_scores,
 )
 from engine import risk
+from engine.alerts import publish_alert
 from engine.base_runner import BaseRunner, _position_lock
 from engine.rebalance import (
     compute_rebalance_orders,
@@ -69,6 +70,13 @@ class RebalanceRunner(BaseRunner):
     # 하위 스레드 자체는 취소되지 않고 백그라운드에서 계속 대기한다 — 이벤트 루프를 다시
     # 살리는 것이 목적이며 스레드 강제 종료는 아니다).
     _tick_timeout = 300  # 초
+
+    def __init__(self, strategy_id, redis):
+        super().__init__(strategy_id, redis)
+        # PIT 유니버스 폴백 알림 dedup 플래그. _resolve_universe 는 한 틱에 여러 번
+        # 호출될 수 있으므로, 폴백 진입 시 1회만 알림하고 PIT 조회가 다시 성공하면
+        # 해제해 재발송 가능하게 한다(연속 실패 알림과 동일한 '전환 시점' dedup 규약).
+        self._pit_fallback_active: bool = False
 
     def _log_start(self) -> None:
         rule = (self._cfg.get("selection", {}) or {}).get("universe_rule") or {}
@@ -334,11 +342,24 @@ class RebalanceRunner(BaseRunner):
         if not killed and hwm > 0 and equity / hwm - 1.0 <= -mdd_kill_pct:
             killed = True
             kill_date = today
+            drawdown_pct = (equity / hwm - 1.0) * 100
             logger.warning(
                 "리밸런싱 전략 %d MDD 킬스위치 발동 — 자산가치 %.0f / 고점 %.0f "
                 "(낙폭 %.2f%% ≤ −%.2f%%) → 전량 청산·현금 대피",
-                self.strategy_id, equity, hwm,
-                (equity / hwm - 1.0) * 100, mdd_kill_pct * 100,
+                self.strategy_id, equity, hwm, drawdown_pct, mdd_kill_pct * 100,
+            )
+            # 파국 방어 발동은 즉시 알림(critical). 발동은 이 전환 지점에서만 일어나므로
+            # (killed 지속·쿨다운 중에는 재진입하지 않음) 자연스러운 dedup 이 된다.
+            await publish_alert(
+                self.redis,
+                user_id=self._user_id,
+                strategy_id=self.strategy_id,
+                severity="critical",
+                code="mdd_kill",
+                message=(
+                    f"MDD 킬스위치 발동 — 고점 {hwm:,.0f} 대비 낙폭 {drawdown_pct:.2f}%가 "
+                    f"임계 −{mdd_kill_pct * 100:.1f}%를 넘어 전량 청산·현금 대피"
+                ),
             )
 
         await self._set_mdd_state(hwm, killed, kill_date)
@@ -488,6 +509,20 @@ class RebalanceRunner(BaseRunner):
             )
         elif not targets:
             logger.warning("리밸런싱 전략 %d 선정 종목 없음(데이터 부족) — 건너뜀", self.strategy_id)
+            # 팩터/가격 조회 전면 장애 등으로 목표 종목이 하나도 산정되지 않아 이번
+            # 리밸런싱을 통째로 건너뛰는 상황(조용한 스킵) — 사용자에게 알린다. 리밸런싱은
+            # cadence/레짐 게이팅으로 저빈도라 발생 시마다 알려도 폭주하지 않는다.
+            await publish_alert(
+                self.redis,
+                user_id=self._user_id,
+                strategy_id=self.strategy_id,
+                severity="warning",
+                code="factor_outage",
+                message=(
+                    f"리밸런싱 발화 시점에 선정 종목이 하나도 산정되지 않아 이번 "
+                    f"리밸런싱을 건너뜁니다(팩터/가격 데이터 조회 장애 가능). 다음 주기 재시도."
+                ),
+            )
             return
 
         async with AsyncSessionLocal() as db:
@@ -642,13 +677,18 @@ class RebalanceRunner(BaseRunner):
                 "전략 %d PIT 유니버스(%s) 조회 실패 — config.universe 폴백: %s",
                 self.strategy_id, source, e,
             )
+            await self._alert_pit_fallback(source, f"조회 실패({e})")
             return fixed
         if not members:
             logger.warning(
                 "전략 %d PIT 유니버스(%s) 비어있음 — config.universe 폴백",
                 self.strategy_id, source,
             )
+            await self._alert_pit_fallback(source, "구성종목 비어있음")
             return fixed
+
+        # PIT 조회 성공 — 폴백 상태였다면 해제(다음 폴백 진입 시 재알림 가능).
+        self._pit_fallback_active = False
 
         # 유동성 필터: 시가총액(억 원) 하한 미만 종목 제외(PIT — as_of 시점 시총 기준).
         min_cap = rule.get("min_market_cap")
@@ -658,6 +698,27 @@ class RebalanceRunner(BaseRunner):
                 min_cap_won = int(min_cap) * 10**8
                 members = [c for c in members if caps.get(c, 0) >= min_cap_won]
         return members
+
+    async def _alert_pit_fallback(self, source: str, cause: str) -> None:
+        """PIT 유니버스 폴백(고정 유니버스 전환) 알림 — 폴백 진입 시 1회만 발행.
+
+        생존편향 검증 원칙상 PIT 유니버스 이탈은 치명적이므로 warning 으로 알린다.
+        _pit_fallback_active 로 dedup 해 한 폴백 구간에 매 틱 재발송하지 않는다.
+        """
+        if self._pit_fallback_active:
+            return
+        self._pit_fallback_active = True
+        await publish_alert(
+            self.redis,
+            user_id=self._user_id,
+            strategy_id=self.strategy_id,
+            severity="warning",
+            code="pit_fallback",
+            message=(
+                f"PIT 유니버스({source}) {cause} — config.universe 고정 폴백으로 전환. "
+                f"생존편향 검증 원칙상 지수 구성 이탈은 즉시 점검이 필요합니다."
+            ),
+        )
 
     async def _seed_history(
         self, universe: list[str], min_bars: int = 0

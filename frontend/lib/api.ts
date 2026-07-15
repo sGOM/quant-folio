@@ -836,6 +836,41 @@ export interface Position {
   avg_price: number;
 }
 
+/** 엔진 실시간 알림(WS "alert" 이벤트)의 사유 코드. */
+export type AlertCode =
+  | "runner_failures"
+  | "pit_fallback"
+  | "mdd_kill"
+  | "factor_outage";
+
+/** 알림 심각도. critical=파국/치명, warning=주의(자동 폴백 등). */
+export type AlertSeverity = "warning" | "critical";
+
+/** 전략 러너 1개의 헬스 상태(백엔드 /api/engine/strategies/health 응답 항목). */
+export interface StrategyHealth {
+  strategy_id: number;
+  name: string;
+  status: Strategy["status"];
+  /** 마지막으로 틱을 정상 처리한 시각(ISO). 아직 한 번도 성공 못했으면 null. */
+  last_success_ts: string | null;
+  /** 연속 실패 횟수(threshold 이상이면 unhealthy). */
+  consecutive_failures: number;
+  /** 마지막 실패 사유(성공 시 null). */
+  last_error: string | null;
+  updated_at: string | null;
+  /** 러너가 최소 한 번 이상 상태를 보고했는지(false면 방금 시작해 아직 첫 틱 전). */
+  reported: boolean;
+  /** consecutive_failures < threshold. */
+  healthy: boolean;
+}
+
+/** 전략별 헬스 조회 응답 래퍼. */
+export interface StrategiesHealthOut {
+  /** unhealthy 판정 연속 실패 임계값. */
+  threshold: number;
+  strategies: StrategyHealth[];
+}
+
 export interface OrderRow {
   id: number;
   symbol: string;
@@ -1106,6 +1141,13 @@ export const api = {
   /** 매매 엔진 생존 여부(heartbeat) 조회. */
   engineStatus: () =>
     request<{ engine_alive: boolean }>("/api/engine/status"),
+
+  /**
+   * 현재 사용자 소유의 라이브 전략별 러너 헬스(마지막 성공 틱·연속 실패 횟수 등)를 조회한다.
+   * 엔진 프로세스 전역 생존(engineStatus)과 달리, 전략 단위 러너 이상을 보여준다.
+   */
+  getStrategiesHealth: () =>
+    request<StrategiesHealthOut>("/api/engine/strategies/health"),
 
   // --- 종목 검색 ---
   /**
