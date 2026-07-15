@@ -31,6 +31,9 @@ _BLD_STOCK_FINDER = "dbms/comm/finder/finder_stkisu"
 _MARKET_BY_CODE = {"STK": "KOSPI", "KSQ": "KOSDAQ", "KNX": "KONEX"}
 # 전종목 시가총액(MDCSTAT01501). 명시적 trdDd 로 조회 — 과거일이면 그날 종가 기준 시총.
 _BLD_MARKET_CAP = "dbms/MDC/STAT/standard/MDCSTAT01501"
+# 업종분류현황(MDCSTAT03901). 시장(mktId)별 전종목의 업종명(IDX_IND_NM)을 한 번에 반환.
+# 한 시장당 요청 1회로 전종목 업종을 얻어 섹터 집중 한도(risk_layer.max_sector_pct)에 쓴다.
+_BLD_SECTOR = "dbms/MDC/STAT/standard/MDCSTAT03901"
 
 # 주요 지수의 MDC 파라미터(indIdx/indIdx2). KOSPI200 = 1/028.
 INDEX_PARAMS: dict[str, dict[str, str]] = {
@@ -47,6 +50,10 @@ _STOCKS_CACHE: list[dict[str, str]] | None = None
 
 # YYYYMMDD -> {code: 시가총액(원)}. 시점별 시총(유동성 필터용) 캐시.
 _MKTCAP_CACHE: dict[str, dict[str, int]] = {}
+
+# {code: 업종명}. 업종 분류는 (PIT 시총·구성종목과 달리) 사실상 정적이라 프로세스 내
+# 1회만 로드해 재사용한다(성공 시에만 채움 — 실패를 캐시하면 섹터 한도가 조용히 무력화됨).
+_SECTOR_CACHE: dict[str, str] | None = None
 
 
 def _session():
@@ -204,6 +211,56 @@ def market_caps(as_of: date) -> dict[str, int]:
     if caps:
         _MKTCAP_CACHE[key] = caps
     return caps
+
+
+def sector_map(as_of: date | None = None) -> dict[str, str]:
+    """전 상장종목의 업종명 매핑 {code: 업종명} 을 KRX MDC(MDCSTAT03901)로 조회한다.
+
+    KOSPI(STK)·KOSDAQ(KSQ) 각 시장을 요청 1회씩(총 2회)만 호출해 전종목 업종을 얻는다
+    — OpenDART 기업개황(종목당 1회 호출) 대비 압도적으로 효율적이라 이쪽을 채택했다.
+    업종 분류는 사실상 정적이므로 (as_of 는 KRX 가 요구하는 조회 기준일일 뿐) 프로세스 내
+    1회 로드 후 캐시를 재사용한다. 미인증/실패/무자료 시 빈 dict 를 반환한다(호출부가
+    섹터 한도를 미적용으로 폴백하도록). 성공 결과만 캐시한다.
+
+    :param as_of: 조회 기준일(기본 today). 휴장일이면 최대 9일 소급해 직전 영업일로 스냅.
+        업종 분류 자체는 시점 의존이 낮으므로 정확한 PIT 는 요구하지 않는다.
+    """
+    global _SECTOR_CACHE
+    if _SECTOR_CACHE is not None:
+        return _SECTOR_CACHE
+
+    sess = _session()
+    if sess is None:
+        logger.debug("KRX 미인증 — 업종분류 조회 건너뜀")
+        return {}
+
+    base = as_of or date.today()
+    mapping: dict[str, str] = {}
+    for back in range(10):  # 휴장일·미래시계 대비 직전 영업일 소급
+        dd = (base - timedelta(days=back)).strftime("%Y%m%d")
+        for mkt in ("STK", "KSQ"):
+            payload = {
+                "bld": _BLD_SECTOR, "locale": "ko_KR",
+                "mktId": mkt, "trdDd": dd, "money": "1", "csvxls_isNo": "false",
+            }
+            try:
+                resp = sess.post(_JSON_URL, data=payload, timeout=20)
+                rows = resp.json().get("block1") or []
+            except Exception as e:  # noqa: BLE001
+                logger.warning("KRX 업종분류 조회 실패(%s %s): %s", mkt, dd, e)
+                rows = []
+            for r in rows:
+                code = str(r.get("ISU_SRT_CD") or "").strip().zfill(6)
+                ind = str(r.get("IDX_IND_NM") or "").strip()
+                if code != "000000" and ind:
+                    mapping[code] = ind
+        if mapping:
+            break
+
+    if mapping:
+        _SECTOR_CACHE = mapping
+        logger.info("KRX 업종분류 로드: %d종목", len(mapping))
+    return mapping
 
 
 def membership_union(dates: list[date], index: str = "KOSPI200") -> dict[str, list[str]]:
