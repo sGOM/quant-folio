@@ -1321,3 +1321,204 @@ def test_rebalance_backtest_exposes_factor_ic_for_score_method():
     mom_cfg = {**score_cfg, "selection": {"method": "momentum", "top_n": 4, "lookback": 60}}
     res2 = run_rebalance_backtest(panel, mom_cfg, dates[0], dates[-1])
     assert res2["factor_ic"] == {}
+
+
+# ───────── 실거래 러너: MDD 킬스위치(백테스트 parity) ─────────
+
+
+class _MddFakeDb:
+    """AsyncSessionLocal() 대체 — scalars 로 주입한 포지션 리스트를 돌려준다."""
+
+    def __init__(self, positions):
+        self._positions = positions
+
+    async def scalars(self, stmt):
+        return list(self._positions)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _Pos:
+    def __init__(self, symbol, qty, avg_price):
+        from decimal import Decimal
+
+        self.symbol = symbol
+        self.qty = Decimal(str(qty))
+        self.avg_price = Decimal(str(avg_price))
+
+
+async def test_live_equity_capital_plus_unrealized_pnl(monkeypatch):
+    """라이브 자산가치 = 배정자본 + 보유 종목 미실현손익(Σ 수량×(현재가−평단))."""
+    from decimal import Decimal
+
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._user_id = 1
+    r._cfg = {"capital": 10_000_000}
+    monkeypatch.setattr(r, "_resolve_universe", lambda as_of: _async(["A", "B"]))
+    positions = [_Pos("A", 10, 1000), _Pos("B", 5, 2000)]
+    monkeypatch.setattr(rebalance_runner, "AsyncSessionLocal", lambda: _MddFakeDb(positions))
+    monkeypatch.setattr(
+        r, "_quotes", lambda syms: _async({"A": Decimal("1200"), "B": Decimal("1800")})
+    )
+    # 10M + 10×(1200−1000) + 5×(1800−2000) = 10M + 2000 − 1000 = 10,001,000
+    assert await r._live_equity() == 10_001_000.0
+
+
+async def test_live_equity_no_holdings_returns_capital(monkeypatch):
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._user_id = 1
+    r._cfg = {"capital": 7_000_000}
+    monkeypatch.setattr(r, "_resolve_universe", lambda as_of: _async(["A"]))
+    monkeypatch.setattr(rebalance_runner, "AsyncSessionLocal", lambda: _MddFakeDb([]))
+    assert await r._live_equity() == 7_000_000.0
+
+
+async def test_live_equity_quote_failure_is_conservative(monkeypatch):
+    """시세 조회 실패 종목은 손익 0(평단 평가)으로 보수 처리 — 데이터 결손이 오발동을 유발하지 않는다."""
+    from decimal import Decimal
+
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._user_id = 1
+    r._cfg = {"capital": 10_000_000}
+    monkeypatch.setattr(r, "_resolve_universe", lambda as_of: _async(["A", "B"]))
+    positions = [_Pos("A", 10, 1000), _Pos("B", 5, 2000)]
+    monkeypatch.setattr(rebalance_runner, "AsyncSessionLocal", lambda: _MddFakeDb(positions))
+    # B 시세 누락 → B 는 손익 0, A 만 반영: 10M + 10×200 = 10,002,000
+    monkeypatch.setattr(r, "_quotes", lambda syms: _async({"A": Decimal("1200")}))
+    assert await r._live_equity() == 10_002_000.0
+
+
+async def _mdd_runner(monkeypatch, *, mdd_kill_pct=0.2, rearm_days=5):
+    """MDD 킬스위치 상태기계만 검증하기 위해 자산가치·거래일 판정을 대체한 러너."""
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._cfg = {"risk_layer": {"mdd_kill_pct": mdd_kill_pct, "mdd_rearm_days": rearm_days}}
+    holder = {"eq": 10_000_000.0, "now": datetime(2024, 1, 2, 14, 30, tzinfo=KST)}
+    monkeypatch.setattr(r, "_live_equity", lambda: _async(holder["eq"]))
+    monkeypatch.setattr(rebalance_runner, "now_kst", lambda: holder["now"])
+    # 테스트에서는 pykrx 조회 없이 주말 여부만으로 영업일 판정(월~금).
+    monkeypatch.setattr(rebalance_runner, "is_business_day", lambda d: d.weekday() < 5)
+    return r, holder
+
+
+async def test_mdd_kill_lifecycle_trigger_cooldown_rearm(monkeypatch):
+    """고점 추적 → 낙폭 임계 초과 발동 → 쿨다운 유지 → rearm_days 경과 재가동(고점 리셋)."""
+    r, holder = await _mdd_runner(monkeypatch, mdd_kill_pct=0.2, rearm_days=5)
+
+    async def step(eq, d):
+        holder["eq"] = eq
+        holder["now"] = datetime(d.year, d.month, d.day, 14, 30, tzinfo=KST)
+        return await r._evaluate_mdd_kill(0.2, 5)
+
+    # 1) 초기: 고점 10M, 미발동.
+    assert await step(10_000_000, date(2024, 1, 2)) is False
+    # 2) 상승 11M: 고점 갱신, 미발동.
+    assert await step(11_000_000, date(2024, 1, 3)) is False
+    # 3) 급락 8.7M(고점 11M 대비 −20.9% ≤ −20%): 발동.
+    assert await step(8_700_000, date(2024, 1, 8)) is True  # 월요일
+    state = await r._get_mdd_state()
+    assert state["killed"] is True and state["kill_date"] == "2024-01-08"
+    # 4) 2 영업일 경과(01-10): 자산가치 회복해도 쿨다운 미경과 → 발동 유지.
+    assert await step(11_000_000, date(2024, 1, 10)) is True
+    # 5) 5 영업일 경과(01-15 월): 재가동(해제) + 고점 기준선을 현재 자산가치로 리셋.
+    assert await step(11_000_000, date(2024, 1, 15)) is False
+    state = await r._get_mdd_state()
+    assert state["killed"] is False and state["hwm"] == 11_000_000
+    assert state["kill_date"] is None
+
+
+async def test_mdd_kill_inert_when_threshold_deep(monkeypatch):
+    """임계가 자연 낙폭보다 깊으면 발동하지 않는다(회귀 안전)."""
+    r, holder = await _mdd_runner(monkeypatch, mdd_kill_pct=0.5, rearm_days=5)
+
+    async def step(eq, d):
+        holder["eq"] = eq
+        holder["now"] = datetime(d.year, d.month, d.day, 14, 30, tzinfo=KST)
+        return await r._evaluate_mdd_kill(0.5, 5)
+
+    assert await step(10_000_000, date(2024, 1, 2)) is False
+    assert await step(9_000_000, date(2024, 1, 3)) is False  # −10% < −50% 임계
+    assert await step(8_500_000, date(2024, 1, 4)) is False
+
+
+async def test_mdd_state_lost_reinitializes_without_false_trigger(monkeypatch):
+    """Redis 상태 유실 시 고점이 현재 자산가치로 재설정되어 오발동하지 않는다(안전측)."""
+    r, holder = await _mdd_runner(monkeypatch, mdd_kill_pct=0.2, rearm_days=5)
+    # 상태 없음(유실) + 자산가치가 낮아도, 그 값이 새 고점이 되므로 낙폭 0 → 미발동.
+    holder["eq"] = 5_000_000.0
+    holder["now"] = datetime(2024, 1, 8, 14, 30, tzinfo=KST)
+    assert await r._evaluate_mdd_kill(0.2, 5) is False
+    state = await r._get_mdd_state()
+    assert state["hwm"] == 5_000_000.0 and state["killed"] is False
+
+
+async def test_tick_mdd_killed_liquidates_and_skips_regime(monkeypatch):
+    """킬스위치 발동 시 레짐/cadence 를 건너뛰고 즉시 mdd 태그로 전량 청산·조기 반환한다."""
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._cfg = {
+        "universe": ["A", "B"],
+        "regime_filter": {"enabled": True},  # 레짐이 켜져 있어도 MDD 가 우선함을 검증
+        "risk_layer": {"mdd_kill_pct": 0.2, "mdd_rearm_days": 5},
+        "cadence": "monthly",
+    }
+    monkeypatch.setattr(rebalance_runner, "is_market_open", lambda now=None: True)
+    monkeypatch.setattr(r, "_evaluate_mdd_kill", lambda pct, days: _async(True))
+
+    calls: list = []
+
+    async def fake_rebalance_once(now, risk_off=None, bar_tag="rebal", liq_kind="regime"):
+        calls.append({"risk_off": risk_off, "bar_tag": bar_tag, "liq_kind": liq_kind})
+
+    regime_calls: list = []
+
+    async def fake_is_risk_off():
+        regime_calls.append(True)
+        return False
+
+    monkeypatch.setattr(r, "_rebalance_once", fake_rebalance_once)
+    monkeypatch.setattr(r, "_is_risk_off", fake_is_risk_off)
+
+    await r._tick_once()
+
+    assert calls == [{"risk_off": True, "bar_tag": "mdd", "liq_kind": "mdd"}]
+    assert regime_calls == []  # MDD 조기 반환 → 레짐 평가로 진행하지 않음
+
+
+async def test_tick_mdd_not_killed_proceeds_to_cadence(monkeypatch):
+    """킬스위치 미발동이면 기존 정기 리밸런싱 경로가 정상 동작한다(회귀 보존)."""
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._cfg = {
+        "universe": ["A", "B"],
+        "risk_layer": {"mdd_kill_pct": 0.2, "mdd_rearm_days": 5},
+        "cadence": "monthly",
+    }
+    monkeypatch.setattr(rebalance_runner, "is_market_open", lambda now=None: True)
+    monkeypatch.setattr(rebalance_runner, "is_rebalance_due", lambda *a, **k: True)
+    monkeypatch.setattr(r, "_evaluate_mdd_kill", lambda pct, days: _async(False))
+
+    calls: list = []
+
+    async def fake_rebalance_once(now, risk_off=None, bar_tag="rebal", liq_kind="regime"):
+        calls.append({"risk_off": risk_off, "bar_tag": bar_tag, "liq_kind": liq_kind})
+
+    set_last: list = []
+    monkeypatch.setattr(r, "_rebalance_once", fake_rebalance_once)
+    monkeypatch.setattr(r, "_set_last", lambda dt: _async(set_last.append(dt)))
+
+    await r._tick_once()
+
+    # 정기 발화: risk_off False·bar_tag "rebal"·기본 liq_kind, 마지막 실행일 소비.
+    assert calls == [{"risk_off": False, "bar_tag": "rebal", "liq_kind": "regime"}]
+    assert len(set_last) == 1
+
+
+async def test_mdd_sell_reason_labels_kill(monkeypatch):
+    """MDD 청산 매도 사유가 킬스위치로 표기된다(레짐 현금화와 구분)."""
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    kill = r._sell_reason("A", {}, risk_off=True, sell_qty=3, liq_kind="mdd")
+    assert "MDD 킬스위치" in kill
+    regime = r._sell_reason("A", {}, risk_off=True, sell_qty=3, liq_kind="regime")
+    assert "레짐 위험회피" in regime
