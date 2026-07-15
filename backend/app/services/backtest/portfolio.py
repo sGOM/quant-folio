@@ -67,6 +67,7 @@ from app.services.backtest.attribution import (
 from app.services.backtest.risk_caps import (
     _apply_risk_caps,
     _cap_position_weights,
+    _cap_sector_weights,
     _portfolio_vol_ann,
 )
 from app.services.backtest.slippage import _vol_slippage_map
@@ -83,6 +84,7 @@ __all__ = [
     # 하위 모듈에서 재노출(호환 유지)
     "_apply_risk_caps",
     "_cap_position_weights",
+    "_cap_sector_weights",
     "_portfolio_vol_ann",
     "_vol_slippage_map",
     "_factor_attribution",
@@ -336,14 +338,18 @@ def _targets_at(
                 if not is_nan(v)
             }
         weights = compute_target_weights({}, config, scores=scores, vols=vols)
-        weights = _apply_risk_caps(weights, hist, config.get("risk_layer") or {})
+        weights = _apply_risk_caps(
+            weights, hist, config.get("risk_layer") or {}, config.get("_sector_map")
+        )
         return _scale_targets(weights, exposure)
 
     price_history = {
         sym: hist[sym].dropna() for sym in universe if sym in hist.columns
     }
     weights = compute_target_weights(price_history, config)
-    weights = _apply_risk_caps(weights, hist, config.get("risk_layer") or {})
+    weights = _apply_risk_caps(
+        weights, hist, config.get("risk_layer") or {}, config.get("_sector_map")
+    )
     return _scale_targets(weights, exposure)
 
 
@@ -583,6 +589,19 @@ def run_rebalance_backtest(
     _mkp = risk_layer.get("mdd_kill_pct")
     mdd_kill_pct = float(_mkp) if _mkp else None
     mdd_rearm_days = int(risk_layer.get("mdd_rearm_days", 20) or 20)
+
+    # 섹터 집중 한도(max_sector_pct)용 종목→업종 매핑을 백테스트 전체에서 1회만 조회해
+    # config 에 실어 _targets_at → _apply_risk_caps 로 흘려보낸다(업종 분류는 사실상 정적).
+    # 소스 미확보(빈 dict)면 _apply_risk_caps 가 섹터 캡을 조용히 미적용한다.
+    if risk_layer.get("max_sector_pct") and not config.get("_sector_map"):
+        from app.services.data.krx_index import sector_map as _sector_map_fn
+
+        smap = _sector_map_fn()
+        if smap:
+            config = {**config, "_sector_map": smap}
+            logger.info("섹터 집중 한도용 업종 매핑 로드: %d종목", len(smap))
+        else:
+            logger.warning("섹터 한도 설정됨(max_sector_pct)이나 업종 매핑 미확보 — 섹터 캡 미적용.")
 
     # 현금화 오버레이(레짐 필터) 준비
     rf = config.get("regime_filter") or {}
