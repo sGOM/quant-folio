@@ -77,6 +77,9 @@ class RebalanceRunner(BaseRunner):
         # 호출될 수 있으므로, 폴백 진입 시 1회만 알림하고 PIT 조회가 다시 성공하면
         # 해제해 재발송 가능하게 한다(연속 실패 알림과 동일한 '전환 시점' dedup 규약).
         self._pit_fallback_active: bool = False
+        # 섹터 집중 한도(risk_layer.max_sector_pct)용 종목→업종 매핑 캐시. 업종 분류는
+        # 사실상 정적이라 러너 수명 동안 1회만 조회해 재사용한다(None=미조회, {}=조회 실패).
+        self._sector_map: dict[str, str] | None = None
 
     def _log_start(self) -> None:
         rule = (self._cfg.get("selection", {}) or {}).get("universe_rule") or {}
@@ -442,8 +445,28 @@ class RebalanceRunner(BaseRunner):
         if risk and targets:
             from app.services.backtest.portfolio import _apply_risk_caps
 
-            targets = _apply_risk_caps(targets, pd.DataFrame(history), risk)
+            smap = await self._get_sector_map() if risk.get("max_sector_pct") else None
+            targets = _apply_risk_caps(targets, pd.DataFrame(history), risk, smap)
         return pool, targets
+
+    async def _get_sector_map(self) -> dict[str, str]:
+        """섹터 집중 한도용 종목→업종 매핑을 러너 수명 동안 1회만 조회해 캐시한다.
+
+        블로킹 KRX 조회이므로 스레드풀에서 실행한다. 미확보(빈 dict) 시 섹터 캡은
+        _apply_risk_caps 에서 조용히 미적용된다. 실패는 캐시하지 않아(빈 dict 는 조회
+        시도로 간주) 다음 리밸런싱에 재시도한다.
+        """
+        if self._sector_map:
+            return self._sector_map
+        from app.services.data.krx_index import sector_map as _sector_map_fn
+
+        smap = await asyncio.to_thread(_sector_map_fn)
+        if smap:
+            self._sector_map = smap
+            logger.info("전략 %d 섹터 한도용 업종 매핑 로드: %d종목", self.strategy_id, len(smap))
+        else:
+            logger.warning("전략 %d 섹터 한도 설정됨이나 업종 매핑 미확보 — 섹터 캡 미적용.", self.strategy_id)
+        return smap
 
     async def preview(self) -> dict:
         """주문을 내지 않고 '지금 리밸런싱하면 낼 주문'을 계산해 반환한다(노트북·점검용).

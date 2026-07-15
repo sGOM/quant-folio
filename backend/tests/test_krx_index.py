@@ -36,10 +36,12 @@ def _clear_cache(monkeypatch):
     krx_index._MEMBERS_CACHE.clear()
     krx_index._STOCKS_CACHE = None
     krx_index._MKTCAP_CACHE.clear()
+    krx_index._SECTOR_CACHE = None
     yield
     krx_index._MEMBERS_CACHE.clear()
     krx_index._STOCKS_CACHE = None
     krx_index._MKTCAP_CACHE.clear()
+    krx_index._SECTOR_CACHE = None
 
 
 def _rows(*codes):
@@ -235,6 +237,79 @@ def test_build_pit_pool_min_cap_keeps_all_when_cap_lookup_fails(monkeypatch):
     cfg = {"universe": [], "selection": {"universe_rule": {"source": "KOSPI200", "min_market_cap": 5000}}}
     union, _ = bt._build_pit_pool(cfg, date(2023, 1, 1), date(2023, 1, 31))
     assert set(union) == {"005930", "000660"}
+
+
+# ───────────────────── 업종분류(sector_map) · 섹터 한도 ─────────────────────
+
+
+class _FakeSectorSession:
+    """MDCSTAT03901(업종분류) 응답(block1)을 mkt별로 돌려주는 목 세션."""
+
+    def __init__(self, by_market, *, raise_exc=False):
+        self.by_market = by_market  # {"STK": [(code, 업종명), ...], "KSQ": [...]}
+        self.raise_exc = raise_exc
+        self.calls = 0
+
+    def post(self, url, data=None, timeout=None):
+        self.calls += 1
+        if self.raise_exc:
+            raise RuntimeError("네트워크 오류")
+        mkt = data["mktId"]
+        rows = [
+            {"ISU_SRT_CD": c, "IDX_IND_NM": ind}
+            for c, ind in self.by_market.get(mkt, [])
+        ]
+        return _FakeResp({"block1": rows})
+
+
+def test_sector_map_parses_and_merges_markets(monkeypatch):
+    fake = _FakeSectorSession({
+        "STK": [("005930", "전기전자"), ("000660", "전기전자"), ("005380", "운수장비")],
+        "KSQ": [("247540", "전기전자")],
+    })
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+    smap = krx_index.sector_map(date(2025, 6, 30))
+    assert smap["005930"] == "전기전자"
+    assert smap["005380"] == "운수장비"
+    assert smap["247540"] == "전기전자"  # KOSDAQ 병합 + 6자리
+
+
+def test_sector_map_snaps_back_over_holiday(monkeypatch):
+    calls = []
+
+    class _S:
+        def post(self, url, data=None, timeout=None):
+            calls.append(data["trdDd"])
+            # 05-31·06-01 휴장(빈 응답), 05-30 에만 자료 존재.
+            if data["trdDd"] == "20250530" and data["mktId"] == "STK":
+                return _FakeResp({"block1": [{"ISU_SRT_CD": "005930", "IDX_IND_NM": "전기전자"}]})
+            return _FakeResp({"block1": []})
+
+    monkeypatch.setattr(krx_index, "_session", lambda: _S())
+    smap = krx_index.sector_map(date(2025, 6, 1))
+    assert smap == {"005930": "전기전자"}
+    assert calls[:2] == ["20250601", "20250601"]  # STK·KSQ 각 1회씩 소급
+
+
+def test_sector_map_unauthenticated_empty(monkeypatch):
+    monkeypatch.setattr(krx_index, "_session", lambda: None)
+    assert krx_index.sector_map(date(2025, 6, 30)) == {}
+
+
+def test_sector_map_caches_on_success(monkeypatch):
+    fake = _FakeSectorSession({"STK": [("005930", "전기전자")]})
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+    krx_index.sector_map(date(2025, 6, 30))
+    n = fake.calls
+    krx_index.sector_map(date(2025, 6, 30))  # 캐시 히트 → 추가 호출 없음
+    assert fake.calls == n
+
+
+def test_sector_map_failure_not_cached(monkeypatch):
+    fake = _FakeSectorSession({}, raise_exc=True)
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+    assert krx_index.sector_map(date(2025, 6, 30)) == {}
+    assert krx_index._SECTOR_CACHE is None  # 실패는 캐시 안 함(자가복구)
 
 
 # ───────────────────── 팩터 커버리지 경고(_factor_coverage_warnings) ─────────────────────
