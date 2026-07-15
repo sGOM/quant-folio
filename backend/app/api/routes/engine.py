@@ -6,14 +6,20 @@ import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.api.routes.strategies import _get_owned
-from app.core.channels import ENGINE_CONTROL_CHANNEL, ENGINE_HEARTBEAT_KEY
+from app.core.channels import (
+    ENGINE_CONTROL_CHANNEL,
+    ENGINE_HEARTBEAT_KEY,
+    FAILURE_ALERT_THRESHOLD,
+    engine_health_key,
+)
 from app.core.database import get_db
 from app.core.redis import redis_client
-from app.models import StrategyStatus, User
+from app.models import Strategy, StrategyStatus, User
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/engine", tags=["engine"])
@@ -65,3 +71,53 @@ async def engine_status(_: User = Depends(get_current_user)):
     """엔진 생존 여부(heartbeat)."""
     alive = await redis_client.get(ENGINE_HEARTBEAT_KEY)
     return {"engine_alive": alive == "alive"}
+
+
+@router.get("/strategies/health")
+async def strategies_health(
+    current: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """로그인 사용자의 운용 중(live) 전략별 러너 헬스 상태.
+
+    프로세스 전역 heartbeat(/status)와 달리 개별 전략 러너 단위로 마지막 성공 틱 시각·
+    연속 실패 횟수를 노출한다(엔진이 engine:health:{id} 에 갱신). 러너가 조용히 실패해도
+    heartbeat 는 alive 이므로, 이 엔드포인트로 러너별 이상을 드러낸다.
+
+    :return: {"threshold": int, "strategies": [{strategy_id, name, status,
+        last_success_ts, consecutive_failures, last_error, updated_at, healthy}]}.
+        healthy 는 연속 실패가 임계 미만인지 여부(임계 이상이면 알림도 발행된 상태).
+    """
+    rows = await db.scalars(
+        select(Strategy)
+        .where(
+            Strategy.user_id == current.id,
+            Strategy.status == StrategyStatus.LIVE,
+        )
+        .order_by(Strategy.id.desc())
+    )
+    strategies = list(rows)
+
+    out = []
+    for s in strategies:
+        raw = await redis_client.get(engine_health_key(s.id))
+        health: dict = {}
+        if raw:
+            try:
+                health = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                health = {}
+        failures = int(health.get("consecutive_failures", 0) or 0)
+        out.append({
+            "strategy_id": s.id,
+            "name": s.name,
+            "status": str(s.status),
+            "last_success_ts": health.get("last_success_ts"),
+            "consecutive_failures": failures,
+            "last_error": health.get("last_error"),
+            "updated_at": health.get("updated_at"),
+            # 헬스 레코드가 아직 없으면(막 start) reported=False 로 구분 가능.
+            "reported": bool(health),
+            "healthy": failures < FAILURE_ALERT_THRESHOLD,
+        })
+    return {"threshold": FAILURE_ALERT_THRESHOLD, "strategies": out}
