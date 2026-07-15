@@ -82,6 +82,18 @@ _REGIME_INDEX_TICKER = {"KOSPI": "1001", "KOSDAQ": "2001"}
 _BENCHMARK_TICKER = {"KOSPI200": "1028", "KOSPI": "1001", "KOSDAQ": "2001"}
 
 
+def _load_panic_series(start_d, end_d, market: str):
+    """패닉 오버레이(panic_overlay)용 롤링 패닉 지표 시계열을 조회한다(블로킹, 스레드풀 내 호출).
+
+    compute_panic_series 를 재사용한다. 실패/부재 시 None 을 반환하면 백테스트 엔진이
+    오버레이를 적용하지 않는다(경고 로그만 남기고 코어 전략은 그대로 동작).
+    """
+    from app.services.metrics.panic import compute_panic_series
+
+    df = compute_panic_series(market, start_d, end_d)
+    return df if df is not None and not df.empty else None
+
+
 def _load_regime_series(start_d, end_d, ticker: str):
     """레짐 필터용 기준지수 종가 Series 를 조회한다(블로킹, 스레드풀 내 호출).
 
@@ -274,6 +286,19 @@ async def _run_rebalance_backtest(
     except Exception as e:  # noqa: BLE001
         logger.warning("벤치마크 지수 적재 실패(상대지표 미산출): %s", e)
 
+    # 패닉 오버레이(P2): 켜져 있으면 롤링 패닉 지표 시계열을 적재해 주입한다. 브레드스는
+    # pykrx 특성상 거래일마다 조회가 필요해 최초 실행이 느릴 수 있다(로컬 파일 캐시로
+    # 재실행은 빠르다 — app.services.metrics.panic._BREADTH_CACHE_DIR).
+    panic_series = None
+    po = config.get("panic_overlay") or {}
+    if po.get("enabled"):
+        try:
+            panic_series = await run_in_threadpool(
+                _load_panic_series, warmup_start, req.period_end, po.get("market", "KOSPI")
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("패닉 오버레이 시계열 적재 실패(오버레이 미적용): %s", e)
+
     try:
         result = await run_in_threadpool(
             run_rebalance_backtest,
@@ -285,6 +310,7 @@ async def _run_rebalance_backtest(
             regime_series,
             pool_provider,
             benchmark_series,
+            panic_series,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))

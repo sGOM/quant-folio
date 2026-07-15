@@ -489,6 +489,89 @@ class RiskLayer(BaseModel):
     )
 
 
+class PanicOverlay(BaseModel):
+    """패닉 재진입 가속기(오버레이) — 자본항복(capitulation) 확인 시 조기 재진입/노출 확대.
+
+    id=23류 저베타 멀티팩터 코어를 대체하지 않고 보완하는 장치다. regime_filter 는
+    패닉 국면에서 이미 현금화(risk-off)하는데, 자본항복은 통계적으로 바닥 근처이므로
+    "레짐이 겁먹고 나간 시점에 자본항복이 확인되면 조기 재진입"한다. 초과수익 원천은
+    종목선택 알파가 아니라 재진입 타이밍 알파다.
+
+    상태기계(Arm → Confirm → Fill, 떨어지는 칼날 회피):
+      - Arm: `app.services.metrics.panic.compute_panic_series` 의 KOSPI 종합지수 신호가
+        level(arm_level 이상) 또는 hard_trigger 를 만족한 날. 이후 arm_window 거래일
+        동안 재진입을 기다린다(그 안에 확인 못 하면 포기하고 idle 로 복귀).
+      - Confirm: armed 상태에서 지수 종가가 자본항복일(arm 발동일) 종가를 상회하고
+        당일 등락률(r1)이 양(+)인 첫날. 미래참조 방지를 위해 그날까지의 확정 종가만 쓴다.
+      - Fill: 기존 체결 규약(config.fill_mode, 기본 next_close=익일 종가)으로 Confirm
+        다음 결정 사이클에 체결한다(당일 종가 미래참조 차단).
+
+    노출: 평상시 base_exposure(리저브 확보), 확인 시 panic_exposure 로 확대한다.
+    event_only=True(대조군 B, "순수 이벤트 진입")면 상시 core 노출이 없다(base_exposure
+    무시하고 idle=0%) — 확인 시에만 (코어 selection 을 그대로 재사용해) 전액 편입하고
+    hold_days/익절/손절 중 먼저 도래하는 조건에 전량 현금화한다. A(기본, event_only=False)
+    는 스케일인(확인일 리저브 절반, ma_recovery_period 이평 회복 시 잔여 절반)을 적용한다.
+
+    청산(risk-off 우선순위: killed(MDD 킬스위치) > panic_override > regime_exit > 정기
+    리밸런싱):
+      - 익절(profit_reclaim_pct): 지수가 자본항복일 낙폭의 이 비율만큼 되돌리면 조기 종료.
+      - 손절(knife_stop_pct, 칼날 방어 — 필수): 지수 종가가 자본항복일 저가 대비 이
+        비율 이상 추가 하락하면 즉시 오버레이 해제(2008/2020 형 다중투매 파국 방지).
+      - 시간청산(hold_days): 위 조건이 없으면 hold_days 경과 후 오버레이를 해제한다.
+      오버레이 해제 시 A 는 regime_filter 판정을 따라 방어(현금화) 또는 base_exposure 로
+      복귀하고, B(event_only)는 항상 전량 현금화한다.
+    """
+    enabled: bool = Field(default=True, description="오버레이 사용 여부")
+    market: Literal["KOSPI", "KOSDAQ"] = Field(
+        default="KOSPI", description="패닉 신호 판정 기준 시장(compute_panic_series)"
+    )
+    arm_level: Literal["caution", "warning", "panic"] = Field(
+        default="warning", description="Arm 진입 최소 패닉 라벨(이 라벨 이상이거나 hard_trigger 면 Arm)"
+    )
+    arm_window: int = Field(
+        default=5, ge=1, le=60, description="Arm 이후 Confirm 을 기다리는 최대 거래일"
+    )
+    hold_days: int = Field(
+        default=20, ge=1, le=250, description="Confirm(Fill) 이후 오버레이 유지 최대 거래일(시간청산)"
+    )
+    profit_reclaim_pct: float = Field(
+        default=0.5, gt=0, le=1,
+        description="익절 조건: 지수가 자본항복일 낙폭의 이 비율을 되돌리면 조기 종료",
+    )
+    knife_stop_pct: float = Field(
+        default=0.05, gt=0, le=1,
+        description="손절 조건(필수): 지수 종가가 자본항복일 저가 대비 이 비율 이상 추가 하락 시 즉시 해제",
+    )
+    base_exposure: float = Field(
+        default=0.70, ge=0, le=1,
+        description="평상시(오버레이 비활성) 목표 총투자비중. event_only=True 면 무시(항상 0).",
+    )
+    panic_exposure: float = Field(
+        default=1.00, gt=0, le=1, description="패닉 확인(Confirm) 시 목표 총투자비중"
+    )
+    scale_in_confirm: float = Field(
+        default=0.5, ge=0, le=1,
+        description="A(event_only=False) 전용: Confirm(Fill) 시 리저브(panic_exposure-base_exposure) "
+        "중 즉시 배치할 비율. 나머지는 ma_recovery_period 이평 회복 시 배치.",
+    )
+    ma_recovery_period: int = Field(
+        default=20, ge=2, le=120,
+        description="A 전용: 잔여 스케일인 트리거용 지수 이동평균 기간(거래일)",
+    )
+    event_only: bool = Field(
+        default=False,
+        description="True 면 대조군 B(순수 이벤트 진입) — 상시 core 노출 없이 Confirm 시에만 "
+        "코어 selection 을 그대로 재사용해 전액 편입하고, hold_days/익절/손절 중 먼저 도래하는 "
+        "조건에 전량 현금화한다(신호 자체의 forward return 검증용).",
+    )
+
+    @model_validator(mode="after")
+    def _exposure_order(self):
+        if self.base_exposure > self.panic_exposure:
+            raise ValueError("base_exposure 는 panic_exposure 이하여야 합니다.")
+        return self
+
+
 class RebalanceConfig(BaseModel):
     """주기적 포트폴리오 리밸런싱 전략.
 
@@ -540,6 +623,10 @@ class RebalanceConfig(BaseModel):
         default=None,
         description="포트폴리오 리스크 레이어(P1-2): 종목 집중 한도·변동성 타겟팅·MDD 킬스위치. "
         "None 이면 미적용.",
+    )
+    panic_overlay: PanicOverlay | None = Field(
+        default=None,
+        description="패닉셀(자본항복) 재진입 가속기 오버레이. None 이면 미적용(regime_filter만 동작).",
     )
     capital: float = Field(default=10_000_000, gt=0, description="이 전략이 운용할 배정 자본")
     fees: float = Field(default=0.00015, ge=0, le=0.01, description="위탁수수료율")
