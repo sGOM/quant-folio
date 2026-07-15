@@ -13,8 +13,16 @@ import {
   Building2,
   Globe,
   HelpCircle,
+  HeartPulse,
 } from "lucide-react";
-import { api, Strategy, BROKER_INFO, type Broker, type OrderRow } from "@/lib/api";
+import {
+  api,
+  Strategy,
+  BROKER_INFO,
+  type Broker,
+  type OrderRow,
+  type StrategyHealth,
+} from "@/lib/api";
 import { Nav } from "@/components/Nav";
 import { RequireAuth } from "@/components/RequireAuth";
 import { useEventSocket } from "@/lib/useWebSocket";
@@ -30,7 +38,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { formatNumber, formatPercent, trendColor } from "@/lib/format";
+import { formatNumber, formatPercent, formatRelativeTime, trendColor } from "@/lib/format";
 
 // 매매·체결 관련 이벤트 타입 — 어느 것이든 잔고/주문을 다시 가져온다.
 const TRADE_EVENTS = new Set(["execution", "order", "position", "fill", "signal"]);
@@ -145,10 +153,21 @@ function MonitorContent() {
     queryFn: api.engineStatus,
     refetchInterval: 10000,
   });
+  // 전략별 러너 헬스(마지막 성공 틱·연속 실패). 엔진 전역 생존과 별개로 러너 단위 이상을 감지.
+  const health = useQuery({
+    queryKey: ["strategies-health"],
+    queryFn: api.getStrategiesHealth,
+    refetchInterval: 30000,
+  });
 
   // 실시간 이벤트 → 쿼리 무효화 + 로그
   useEventSocket((data) => {
     const type = data.type as string;
+    if (type === "alert") {
+      // 러너 실패·MDD 킬 등은 헬스 위젯을 즉시 갱신(30초 폴링을 기다리지 않음).
+      qc.invalidateQueries({ queryKey: ["strategies-health"] });
+      return;
+    }
     if (TRADE_EVENTS.has(type)) {
       qc.invalidateQueries({ queryKey: ["positions"] });
       qc.invalidateQueries({ queryKey: ["orders"] });
@@ -248,6 +267,17 @@ function MonitorContent() {
               <p className="text-sm text-muted-foreground">전략이 없습니다.</p>
             )}
           </div>
+        </section>
+
+        <section className="mt-8">
+          <h2 className="mb-2 flex items-center gap-1.5 text-sm font-medium text-muted-foreground">
+            <HeartPulse className="h-4 w-4" /> 전략 러너 헬스
+          </h2>
+          <StrategyHealthPanel
+            data={health.data}
+            isLoading={health.isLoading}
+            isError={health.isError}
+          />
         </section>
 
         <div className="mt-8 grid gap-6 lg:grid-cols-2">
@@ -631,6 +661,90 @@ function StrategyToggle({ strategy }: { strategy: Strategy }) {
         )}
       </Button>
     </Card>
+  );
+}
+
+/**
+ * 라이브 전략 러너 헬스 목록.
+ * `GET /api/engine/strategies/health` 를 30초 주기로 폴링해(+ WS "alert" 수신 시 즉시 무효화),
+ * 각 러너의 마지막 성공 틱 상대시각·연속 실패 횟수·healthy 배지를 보여준다.
+ * 엔진 프로세스 전역 생존(상단 배지)과 달리, 전략 단위로 "조용한 실패"(외부 조회 지연 등)를 드러낸다.
+ */
+function StrategyHealthPanel({
+  data,
+  isLoading,
+  isError,
+}: {
+  data?: { threshold: number; strategies: StrategyHealth[] };
+  isLoading: boolean;
+  isError: boolean;
+}) {
+  if (isLoading) {
+    return <p className="text-sm text-muted-foreground">헬스 상태 확인 중…</p>;
+  }
+  if (isError) {
+    return (
+      <p className="flex items-center gap-1 text-sm text-status-bad">
+        <AlertCircle className="h-3.5 w-3.5" /> 헬스 상태를 불러오지 못했습니다.
+      </p>
+    );
+  }
+  const strategies = data?.strategies ?? [];
+  if (strategies.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        실행 중(live)인 전략이 없습니다. 전략을 시작하면 여기에 헬스가 표시됩니다.
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      {strategies.map((s) => (
+        <Card key={s.strategy_id} className="flex items-center justify-between px-4 py-3">
+          <div className="min-w-0">
+            <p className="truncate text-sm font-medium">{s.name}</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {s.reported ? (
+                <>마지막 성공 틱: {formatRelativeTime(s.last_success_ts)}</>
+              ) : (
+                "아직 첫 틱 전(방금 시작)"
+              )}
+              {s.consecutive_failures > 0 && (
+                <span className="ml-2 text-status-bad">
+                  연속 실패 {s.consecutive_failures}회
+                </span>
+              )}
+            </p>
+            {s.last_error && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <p className="mt-0.5 cursor-help truncate text-xs text-status-bad/80">
+                    최근 오류: {s.last_error}
+                  </p>
+                </TooltipTrigger>
+                <TooltipContent>{s.last_error}</TooltipContent>
+              </Tooltip>
+            )}
+          </div>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span tabIndex={0} className="cursor-help">
+                <Badge variant={!s.reported ? "muted" : s.healthy ? "success" : "destructive"}>
+                  {!s.reported ? "대기" : s.healthy ? "정상" : "이상"}
+                </Badge>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>
+              {!s.reported
+                ? "엔진이 이 전략을 시작했지만 아직 첫 틱을 처리하지 못했습니다."
+                : s.healthy
+                  ? `연속 실패 ${s.consecutive_failures}회 (임계 ${data?.threshold} 미만) — 정상 처리 중입니다.`
+                  : `연속 실패 ${s.consecutive_failures}회로 임계(${data?.threshold})를 넘었습니다. 외부 조회 지연·오류가 지속되고 있을 수 있습니다.`}
+            </TooltipContent>
+          </Tooltip>
+        </Card>
+      ))}
+    </div>
   );
 }
 
