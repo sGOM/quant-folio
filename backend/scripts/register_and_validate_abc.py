@@ -95,17 +95,6 @@ CONFIGS = {
 }
 
 
-def _validate_all() -> dict[str, dict]:
-    """스키마(RebalanceConfig discriminated union) 검증. 실패 시 그대로 예외 전파."""
-    validated = {}
-    for name, cfg in CONFIGS.items():
-        model = StrategyConfig.validate_python(cfg) if hasattr(StrategyConfig, "validate_python") else None
-        # StrategyConfig 는 TypeAdapter 가 아니라 Annotated Union 일 수 있으므로 개별 방식 시도.
-        validated[name] = cfg
-        print(f"[검증 OK] {name}", flush=True)
-    return validated
-
-
 async def _register(cfg_map: dict[str, dict]) -> dict[str, int]:
     ids: dict[str, int] = {}
     async with AsyncSessionLocal() as db:

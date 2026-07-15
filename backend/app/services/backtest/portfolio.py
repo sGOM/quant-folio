@@ -627,18 +627,26 @@ def run_rebalance_backtest(
     arm_rank = _LEVEL_RANK.get(arm_level, 2)
     arm_window = int(po.get("arm_window") or 5)
     hold_days_ov = int(po.get("hold_days") or 20)
-    profit_reclaim_pct = float(po.get("profit_reclaim_pct") if po.get("profit_reclaim_pct") is not None else 0.5)
-    knife_stop_pct = float(po.get("knife_stop_pct") if po.get("knife_stop_pct") is not None else 0.05)
-    base_exposure_ov = float(po.get("base_exposure") if po.get("base_exposure") is not None else 0.70)
-    panic_exposure_ov = float(po.get("panic_exposure") if po.get("panic_exposure") is not None else 1.00)
-    scale_in_confirm = float(po.get("scale_in_confirm") if po.get("scale_in_confirm") is not None else 0.5)
+
+    def _pof(key: str, default: float) -> float:
+        # 0.0 이 유효값이므로 `or` 대신 None 여부로만 기본값 대체(단일 .get()).
+        v = po.get(key)
+        return float(v) if v is not None else default
+
+    profit_reclaim_pct = _pof("profit_reclaim_pct", 0.5)
+    knife_stop_pct = _pof("knife_stop_pct", 0.05)
+    base_exposure_ov = _pof("base_exposure", 0.70)
+    panic_exposure_ov = _pof("panic_exposure", 1.00)
+    scale_in_confirm = _pof("scale_in_confirm", 0.5)
     ma_recovery_period = int(po.get("ma_recovery_period") or 20)
     event_only = bool(po.get("event_only", False))
 
     panic_ma: pd.Series | None = None
+    panic_prev_close: pd.Series | None = None
     if panic_on:
         min_p = max(5, ma_recovery_period // 2)
         panic_ma = panic_ps["close"].rolling(ma_recovery_period, min_periods=min_p).mean()
+        panic_prev_close = panic_ps["close"].shift(1)  # 전일 종가(루프마다 재계산 방지)
 
     # 상태기계: idle → armed → confirmed_half → confirmed_full (A) / confirmed (B, event_only)
     panic_state = "idle"
@@ -648,10 +656,6 @@ def run_rebalance_backtest(
     capit_drop: float | None = None    # 자본항복일 낙폭(전일종가-당일종가, 양수=하락)
     confirm_idx = -1              # Confirm 발생 sim_dates 인덱스(hold_days 카운트 기준)
     num_panic_events = 0          # Confirm(재진입) 발동 횟수
-
-    # 정기 리밸런싱에 적용할 현재 목표 노출(exposure). 오버레이 비활성이면 항상 1.0.
-    # event_only(B)는 idle/armed 구간엔 core 노출이 없다(0.0), 확인 시에만 전액 편입.
-    current_exposure = 1.0 if not panic_on else (0.0 if event_only else base_exposure_ov)
 
     cash = 1.0            # 정규화 총자산(=capital 배율)
     val: dict[str, float] = {}    # 종목→평가액
@@ -775,7 +779,7 @@ def run_rebalance_backtest(
             hard_i = bool(panic_ps["hard_trigger"].get(d, False))
             close_i = panic_ps["close"].get(d)
             low_i = panic_ps["low"].get(d)
-            prev_close_i = panic_ps["close"].shift(1).get(d)
+            prev_close_i = panic_prev_close.get(d)
             ma_i = panic_ma.get(d) if panic_ma is not None else None
             has_close = close_i is not None and pd.notna(close_i)
             has_prev = prev_close_i is not None and pd.notna(prev_close_i)
@@ -810,7 +814,6 @@ def run_rebalance_backtest(
                     )
                     decision = {"kind": "rebalance", "targets": targets, "reason": "panic_confirm"}
                     panic_state = "confirmed" if event_only else "confirmed_half"
-                    current_exposure = exposure_fill
                     confirm_idx = i
                     num_panic_events += 1
                     markers.append({"t": d.isoformat(), "type": "panic_confirm"})
@@ -848,7 +851,6 @@ def run_rebalance_backtest(
                     panic_state = "idle"
                     capit_close = capit_low = capit_drop = None
                     confirm_idx = -1
-                    current_exposure = 0.0 if event_only else base_exposure_ov
                 elif (
                     not event_only and panic_state == "confirmed_half"
                     and has_close and ma_i is not None and pd.notna(ma_i)
@@ -861,7 +863,6 @@ def run_rebalance_backtest(
                     )
                     decision = {"kind": "rebalance", "targets": targets, "reason": "panic_scale_full"}
                     panic_state = "confirmed_full"
-                    current_exposure = panic_exposure_ov
                     markers.append({"t": d.isoformat(), "type": "panic_scale_full"})
 
         if mdd_trigger_today:
@@ -875,7 +876,6 @@ def run_rebalance_backtest(
                 panic_state = "idle"
                 capit_close = capit_low = capit_drop = None
                 confirm_idx = -1
-                current_exposure = 0.0 if event_only else base_exposure_ov
             if val:
                 decision = {"kind": "liquidate", "reason": "mdd_kill"}
         elif decision is not None:
@@ -894,7 +894,8 @@ def run_rebalance_backtest(
             if due and not (panic_on and event_only):
                 targets = _targets_at(
                     d, panel, config, fundamentals_provider, pool_provider,
-                    score_out=score_snapshots, exposure=current_exposure,
+                    score_out=score_snapshots,
+                    exposure=(base_exposure_ov if panic_on else 1.0),
                 )
                 decision = {"kind": "rebalance", "targets": targets, "reason": "rebalance"}
 

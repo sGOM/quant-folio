@@ -155,14 +155,14 @@ def _index_signals(df: pd.DataFrame) -> dict:
         return {}
     c = df["close"].astype(float)
 
+    # len(df) < 6 은 위에서 걸러졌으므로 이하 c 는 항상 6행 이상이다.
     r1 = _safe_float(c.iloc[-1] / c.iloc[-2] - 1)
-    r5 = _safe_float(c.iloc[-1] / c.iloc[-6] - 1) if len(c) >= 6 else None
+    r5 = _safe_float(c.iloc[-1] / c.iloc[-6] - 1)
 
     dd60: float | None = None
-    if len(c) >= 2:
-        hi = c.tail(60).max()
-        if hi > 0:
-            dd60 = _safe_float(c.iloc[-1] / hi - 1)
+    hi = c.tail(60).max()
+    if hi > 0:
+        dd60 = _safe_float(c.iloc[-1] / hi - 1)
 
     vr: float | None = None
     if "trading_value" in df.columns and len(df) >= 22:

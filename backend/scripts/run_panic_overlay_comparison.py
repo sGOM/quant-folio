@@ -16,7 +16,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import date
 
-import numpy as np
 import pandas as pd
 
 from app.api.routes.backtests import (
@@ -96,13 +95,6 @@ def _make_b(cfg23: dict) -> dict:
     cfg["regime_filter"] = {**(cfg.get("regime_filter") or {}), "enabled": False}
     cfg["panic_overlay"] = dict(OVERLAY_B)
     return cfg
-
-
-def _corr_and_stats(rets: pd.Series | None, label: str) -> None:
-    if rets is None or rets.empty:
-        print(f"  {label}: 일별수익 없음", flush=True)
-        return
-    print(f"  {label}: n={len(rets)} mean/day={rets.mean()*100:.4f}% std/day={rets.std()*100:.4f}%", flush=True)
 
 
 async def main() -> None:
