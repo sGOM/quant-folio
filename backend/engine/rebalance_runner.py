@@ -10,8 +10,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import pandas as pd
@@ -24,7 +25,7 @@ from app.services.data.loader import (
     load_ohlcv,
     upsert_price_ticks,
 )
-from app.services.market import is_market_open, now_kst
+from app.services.market import is_business_day, is_market_open, now_kst
 from app.services.metrics import (
     _approx_start,
     _fetch_index_ohlcv,
@@ -44,6 +45,7 @@ logger = logging.getLogger("engine.rebalance_runner")
 
 _LAST_PREFIX = "rebalance:last:"
 _REGIME_PREFIX = "rebalance:regime:"  # 직전 레짐 상태(risk-off 여부) 보관
+_MDD_PREFIX = "rebalance:mdd:"  # MDD 킬스위치 상태(고점 HWM·발동 여부·발동일)
 _LAST_TTL = 60 * 60 * 24 * 90  # 90일(휴장 등 대비 여유)
 
 # pykrx 종합지수 티커(레짐 필터 기준지수). 백테스트 라우트와 동일 규약.
@@ -93,6 +95,25 @@ class RebalanceRunner(BaseRunner):
             "전략 %d 틱 시작 (now=%s, regime_enabled=%s, market_open=%s)",
             self.strategy_id, now.isoformat(), regime_enabled, is_market_open(now),
         )
+
+        # MDD 킬스위치(파국 백스톱) — 레짐/정기 리밸런싱보다 절대 우선(역할 분리: 레짐=추세
+        # 오버레이, 킬스위치=고점 대비 낙폭 서킷브레이커). 장중에만 자산가치를 평가·청산한다.
+        # 발동/쿨다운 중이면 레짐·cadence 로직을 건너뛰고 즉시 청산·현금 대피만 수행한다.
+        risk = self._cfg.get("risk_layer") or {}
+        mdd_kill_pct = risk.get("mdd_kill_pct")
+        if mdd_kill_pct and is_market_open(now):
+            killed = await self._evaluate_mdd_kill(
+                float(mdd_kill_pct), int(risk.get("mdd_rearm_days", 20) or 20)
+            )
+            if killed:
+                logger.info(
+                    "리밸런싱 전략 %d MDD 킬스위치 활성 — 즉시 청산·현금 대피(쿨다운 유지)",
+                    self.strategy_id,
+                )
+                await self._rebalance_once(
+                    now, risk_off=True, bar_tag="mdd", liq_kind="mdd"
+                )
+                return
 
         risk_off = False
         reentry = False
@@ -183,6 +204,146 @@ class RebalanceRunner(BaseRunner):
             positions = await self._holdings(db, pool)
         return bool(positions)
 
+    # ───────────────────── MDD 킬스위치 상태(고점 HWM·발동) ─────────────────────
+    #
+    # 백테스트(app.services.backtest.portfolio)는 bar-by-bar 로 계좌 자산가치를 추적해
+    # 고점(HWM) 대비 낙폭이 mdd_kill_pct 를 넘으면 전량 청산하고 mdd_rearm_days 거래일
+    # 쿨다운 후 고점 기준선을 리셋해 재가동한다. 라이브 러너는 그 상태(HWM·발동 여부·
+    # 발동일)를 틱 사이에 계속 들고 있어야 하므로 Redis 에 영속화한다(레짐/마지막 실행일과
+    # 동일 prefix·TTL 규약). Redis 유실 시 상태가 초기화되어 HWM 이 현재 자산가치로
+    # 재설정되므로 데이터 오류로 인한 오발동(전량 청산)은 발생하지 않는다(안전측: 새 낙폭이
+    # 임계에 도달해야만 발동). 이는 레짐/마지막 실행일 상태와 동일한 내구성 특성이다.
+    def _mdd_key(self) -> str:
+        return f"{_MDD_PREFIX}{self.strategy_id}"
+
+    async def _get_mdd_state(self) -> dict | None:
+        """저장된 MDD 상태(hwm·killed·kill_date). 미기록/손상 시 None."""
+        raw = await self.redis.get(self._mdd_key())
+        if not raw:
+            return None
+        try:
+            state = json.loads(raw)
+            if not isinstance(state, dict) or "hwm" not in state:
+                return None
+            return state
+        except (ValueError, TypeError):
+            return None
+
+    async def _set_mdd_state(
+        self, hwm: float, killed: bool, kill_date: date | None
+    ) -> None:
+        state = {
+            "hwm": float(hwm),
+            "killed": bool(killed),
+            "kill_date": kill_date.isoformat() if kill_date else None,
+        }
+        await self.redis.set(self._mdd_key(), json.dumps(state), ex=_LAST_TTL)
+
+    async def _live_equity(self) -> float:
+        """라이브 계좌 자산가치 근사 = 배정자본 + 보유 종목 미실현손익.
+
+        라이브에는 별도의 현금 잔고 원장이 없다(리밸런싱은 config.capital 대비 목표비중으로
+        수량을 정한다). 그래서 자산가치를 '배정자본(capital) + 보유 종목의 미실현손익
+        (Σ 수량×(현재가−평단))' 으로 근사한다. 이는 다음과 동치다:
+
+            equity ≈ (capital − Σ 수량×평단[투입원가])  +  Σ 수량×현재가[시가평가]
+                   = capital + Σ 수량×(현재가 − 평단)
+
+        즉 '미투자 현금분은 capital 잔여로, 투자분은 시가평가로' 본다. 완전 투자 상태에서
+        시장 급락 시 미실현손익이 크게 음(−)이 되어 자산가치가 하락하고 HWM 대비 낙폭이
+        커지므로 킬스위치가 겨냥하는 파국(시장 붕괴)을 정확히 포착한다.
+
+        한계: 과거 라운드트립에서 확정된 실현손익은 반영되지 않는다(현재 보유 장부의 시가
+        평가만 추적). 정밀 회계보다 파국 방어(안전장치)가 우선이라는 과제 원칙에 따른 절충이며,
+        시세 조회 실패 종목은 손익 0(평단 평가)으로 보수 처리해 데이터 결손이 오발동을
+        유발하지 않게 한다.
+        """
+        capital = float(self._cfg.get("capital", 10_000_000))
+        pool = await self._resolve_universe(_last_business_day())
+        async with AsyncSessionLocal() as db:
+            rows = await db.scalars(
+                select(Position).where(
+                    Position.user_id == self._user_id,
+                    Position.qty > 0,
+                    Position.symbol.in_(pool),
+                )
+            )
+            positions = list(rows)
+        if not positions:
+            return capital
+        prices = await self._quotes({p.symbol for p in positions})
+        unrealized = 0.0
+        for p in positions:
+            price = prices.get(p.symbol)
+            if price is None:  # 시세 조회 실패 → 손익 0(평단 평가)으로 보수 처리
+                continue
+            unrealized += float(p.qty) * (float(price) - float(p.avg_price))
+        return capital + unrealized
+
+    def _business_days_since(self, start: date, end: date) -> int:
+        """start(제외)~end(포함) 사이 영업일 수. 백테스트의 (i − kill_idx) 와 동일 의미.
+
+        킬 발동일 다음 거래일부터 카운트해, mdd_rearm_days 거래일이 경과하면 재가동한다.
+        """
+        if end <= start:
+            return 0
+        count = 0
+        d = start + timedelta(days=1)
+        while d <= end:
+            if is_business_day(d):
+                count += 1
+            d += timedelta(days=1)
+        return count
+
+    async def _evaluate_mdd_kill(self, mdd_kill_pct: float, rearm_days: int) -> bool:
+        """MDD 킬스위치 상태를 갱신하고 현재 '발동(현금 대피)' 여부를 반환한다.
+
+        백테스트(portfolio.py)와 동일 규약·순서:
+          1) 고점(HWM) 갱신: 현재 자산가치가 HWM 을 넘으면 상향.
+          2) 쿨다운 재가동: 발동 상태에서 발동일 이후 rearm_days 거래일 경과 시 재가동
+             (killed=False) + 고점 기준선을 현재 자산가치로 리셋.
+          3) 발동 판정: 미발동 상태에서 고점 대비 낙폭이 −mdd_kill_pct 이하이면 발동
+             (killed=True, 발동일=오늘).
+        재진입 자체는 이 함수가 아니라 기존 레짐/cadence 게이팅이 담당한다(역할 분리).
+        """
+        equity = await self._live_equity()
+        today = now_kst().date()
+        state = await self._get_mdd_state()
+        if state is None:  # 최초/유실 → 현재 자산가치를 고점으로 초기화(안전측: 오발동 방지)
+            hwm, killed, kill_date = equity, False, None
+        else:
+            hwm = float(state["hwm"])
+            killed = bool(state.get("killed"))
+            kd = state.get("kill_date")
+            kill_date = date.fromisoformat(kd) if kd else None
+
+        if equity > hwm:
+            hwm = equity
+        # 쿨다운 경과 → 재가동(고점 기준선 리셋)
+        if killed and kill_date is not None and (
+            self._business_days_since(kill_date, today) >= rearm_days
+        ):
+            killed = False
+            kill_date = None
+            hwm = equity
+            logger.info(
+                "리밸런싱 전략 %d MDD 킬스위치 쿨다운 경과 — 재가동(고점 리셋 %.0f)",
+                self.strategy_id, hwm,
+            )
+        # 발동 판정(미발동 상태에서만)
+        if not killed and hwm > 0 and equity / hwm - 1.0 <= -mdd_kill_pct:
+            killed = True
+            kill_date = today
+            logger.warning(
+                "리밸런싱 전략 %d MDD 킬스위치 발동 — 자산가치 %.0f / 고점 %.0f "
+                "(낙폭 %.2f%% ≤ −%.2f%%) → 전량 청산·현금 대피",
+                self.strategy_id, equity, hwm,
+                (equity / hwm - 1.0) * 100, mdd_kill_pct * 100,
+            )
+
+        await self._set_mdd_state(hwm, killed, kill_date)
+        return killed
+
     # ───────────────────── 목표비중 산정(주문 I/O 없음) ─────────────────────
     async def _compute_plan(
         self, as_of, risk_off: bool
@@ -256,7 +417,7 @@ class RebalanceRunner(BaseRunner):
         logger.info("전략 %d 목표비중 산정 완료: %d종목", self.strategy_id, len(targets))
         # 리스크 레이어(P1-2): 종목 집중 한도·변동성 타겟팅을 목표비중에 적용(백테스트
         # _targets_at 와 동일 로직 재사용). MDD 킬스위치는 계좌 고점(HWM) 상태 지속이
-        # 필요해 백테스트 전용이다(러너 미적용 — 후속 과제).
+        # 필요해 _tick_once 상단에서 별도로 평가·청산한다(_evaluate_mdd_kill).
         if risk and targets:
             from app.services.backtest.portfolio import _apply_risk_caps
 
@@ -301,14 +462,18 @@ class RebalanceRunner(BaseRunner):
 
     # ───────────────────── 리밸런싱 1회 ─────────────────────
     async def _rebalance_once(
-        self, now: datetime, risk_off: bool | None = None, bar_tag: str = "rebal"
+        self, now: datetime, risk_off: bool | None = None, bar_tag: str = "rebal",
+        liq_kind: str = "regime",
     ) -> None:
         """리밸런싱 1회 실행.
 
         :param risk_off: 레짐 판정 결과를 호출부에서 미리 계산해 주입(중복 지수조회 회피).
             None 이면 이 함수가 _is_risk_off 로 직접 판정한다.
         :param bar_tag: 멱등성 키에 들어가는 봉 태그. 같은 거래일에 정기 리밸런싱("rebal")과
-            레짐 액션("regime")이 서로 다른 키를 갖도록 구분해 중복주문을 방지·허용한다.
+            레짐 액션("regime"), MDD 킬스위치("mdd")가 서로 다른 키를 갖도록 구분해
+            중복주문을 방지·허용한다.
+        :param liq_kind: 청산 사유 종류("regime"=레짐 현금화, "mdd"=MDD 킬스위치). 감사
+            로그 매도 사유 문구 결정에만 쓴다.
         """
         as_of = _last_business_day()
         # 현금화 오버레이(레짐 필터): 위험회피 국면이면 목표를 빈 dict 로 두어 보유를
@@ -353,18 +518,26 @@ class RebalanceRunner(BaseRunner):
             return
 
         bar_ts = f"{now.date().isoformat()}:{bar_tag}"
-        await self._execute_orders(orders, prices, positions, bar_ts, targets, risk_off)
+        await self._execute_orders(
+            orders, prices, positions, bar_ts, targets, risk_off, liq_kind
+        )
 
     def _sell_reason(
-        self, sym: str, targets: dict[str, float], risk_off: bool, sell_qty: int
+        self, sym: str, targets: dict[str, float], risk_off: bool, sell_qty: int,
+        liq_kind: str = "regime",
     ) -> str:
         """리밸런싱 매도 사유 문장(감사 로그용).
 
+        - MDD 킬스위치: 고점 대비 낙폭 임계 초과로 파국 방어 전량 청산.
         - 레짐 위험회피: 현금화 전량 청산.
         - 선정 제외(목표비중 0): 후보에서 탈락해 전량 청산.
         - 비중 축소: 드리프트 밴드 초과분만 부분 매도.
         """
         if risk_off:
+            if liq_kind == "mdd":
+                return (
+                    f"MDD 킬스위치 발동(고점 대비 낙폭 임계 초과): {sell_qty:,}주 전량 청산·현금 대피"
+                )
             return f"레짐 위험회피(현금화): {sell_qty:,}주 전량 청산"
         weight = targets.get(sym, 0.0)
         if weight <= 0:
@@ -564,11 +737,13 @@ class RebalanceRunner(BaseRunner):
         bar_ts: str,
         targets: dict[str, float] | None = None,
         risk_off: bool = False,
+        liq_kind: str = "regime",
     ) -> None:
         """매도 우선 정렬된 주문 목록을 순차 실행한다(매수는 리스크 검증 후).
 
         :param targets: 종목→목표비중. 감사 로그 사유(편입 순위·목표비중) 생성에 쓴다.
         :param risk_off: 레짐 위험회피(현금화) 국면 여부(청산 사유 문구 결정).
+        :param liq_kind: 청산 사유 종류("regime"/"mdd") — 매도 사유 문구 결정.
         """
         targets = targets or {}
         # 목표비중 내림차순 편입 순위(1위=최대비중). 사유 문장의 "N/M위"에 쓴다.
@@ -614,7 +789,10 @@ class RebalanceRunner(BaseRunner):
                                 sym, sell_qty, price, pos.avg_price, float(pnl) * 100,
                             )
                             pnl_txt = f" · 평단 {float(pos.avg_price):,.0f} 대비 손익 {float(pnl) * 100:+.2f}%"
-                        reason = self._sell_reason(sym, targets, risk_off, sell_qty) + pnl_txt
+                        reason = (
+                            self._sell_reason(sym, targets, risk_off, sell_qty, liq_kind)
+                            + pnl_txt
+                        )
                         await self._place(db, sym, "sell", sell_qty, price, bar_ts, reason)
                     else:  # buy
                         if not buys_allowed:
