@@ -80,3 +80,48 @@ class StocksOut(BaseModel):
     as_of: date
     count: int
     items: list[StockMetric]
+
+
+# ─────────────────────────── 패닉셀(투매) 지표 ───────────────────────────
+
+
+class PanicSignal(BaseModel):
+    """패닉셀 구성 시그널 1건.
+
+    value는 원시 측정값(수익률·비율·배율 등, 시그널마다 단위가 다름),
+    subscore는 경계(warn)=0·패닉(panic)=100으로 선형 보간한 0~100 점수.
+    weight가 0이면 종합점수에 들어가지 않는 참고/하드트리거용 신호.
+    """
+
+    key: str
+    label: str
+    value: Optional[float] = None      # 원시 측정값(시그널별 단위 상이)
+    subscore: Optional[float] = None   # 0~100 (경계 0 · 패닉 100)
+    weight: float                       # 종합점수 가중(0=비가중 참고)
+    warn: Optional[float] = None       # 경계 임계값
+    panic: Optional[float] = None      # 패닉 임계값
+
+
+class PanicMarket(BaseModel):
+    """시장 1개(KOSPI 또는 KOSDAQ)의 패닉셀 판정."""
+
+    market: str                        # "KOSPI" | "KOSDAQ"
+    score: float                       # 0~100 (dd60 국면 보정·클램프 후)
+    level: str                         # "normal"|"caution"|"warning"|"panic"
+    gated: bool                        # 패닉 게이팅 충족(가격급락+거래폭증/브레드스)
+    hard_trigger: bool                 # 하드트리거 발동(극단값 → 즉시 패닉)
+    price_sub: Optional[float] = None    # 가격축 서브스코어(0~100)
+    breadth_sub: Optional[float] = None  # 브레드스축 서브스코어(0~100)
+    dd60: Optional[float] = None       # 60일 고점대비 낙폭(음수 소수, 국면 참고)
+    universe: int                      # 브레드스 유효 종목 수(거래정지 제외)
+    signals: list[PanicSignal]
+
+
+class PanicOut(BaseModel):
+    """패닉셀 지표 응답(시장별 목록)."""
+
+    as_of: date
+    items: list[PanicMarket]
+    # 조회/데이터 부족으로 계산하지 못한 시장 목록(예: ["KOSDAQ"]).
+    # items에서 조용히 누락되는 대신 여기에 명시해 "정상"과 "계산 불가"를 구분한다.
+    unavailable: list[str] = []

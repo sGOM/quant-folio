@@ -23,6 +23,15 @@
   재진입한다(cadence 를 기다리지 않는다). V자 반등 초기 수익을 놓치지 않기 위함이다.
 - **거래 로그**: 매수·매도 1건마다 체결가·거래대금과 '그 순간'의 포트폴리오 누적수익률,
   매도 시 해당 포지션의 보유수익률(원가 대비)을 trades 로 남겨 사후 전략 개선에 활용한다.
+- **패닉 오버레이(P2)**: config.panic_overlay 가 켜져 있으면 regime_filter 위에 추가로
+  Arm(자본항복 후보 감지)→Confirm(재진입 확인)→Fill(익일 종가 체결) 상태기계가 동작한다.
+  `app.services.metrics.panic.compute_panic_series` 로 만든 KOSPI 종합지수 롤링 패닉
+  지표가 warning/panic 라벨(또는 hard_trigger)을 찍은 날 Arm 되고, 이후 arm_window 거래일
+  내 지수가 그날 종가를 상회+당일 등락률(+)로 반등하면 Confirm 되어 목표 노출을
+  base_exposure→panic_exposure 로 확대(강제 재진입, regime_exit 보다 우선)한다.
+  손절(knife_stop_pct, 자본항복일 저가 대비)·익절(profit_reclaim_pct, 낙폭 되돌림)·
+  시간청산(hold_days) 중 먼저 도래하는 조건에 오버레이를 해제한다. 자세한 설계 의도는
+  app.schemas.strategy.PanicOverlay 문서 참고.
 
 알려진 한계(실거래와의 차이)
 --------------------------
@@ -239,6 +248,18 @@ def _dynamic_universe(hist: pd.DataFrame, pool: list[str], rule: dict) -> list[s
     return ranked[:pick]
 
 
+def _scale_targets(weights: dict[str, float], exposure: float) -> dict[str, float]:
+    """목표비중 딕셔너리를 총투자비중(exposure)으로 스케일한다(패닉 오버레이 P2).
+
+    exposure<1.0 이면 나머지는 자연히 현금으로 남는다(_apply_rebalance 가 targets 에
+    없는 비중을 현금으로 취급). exposure>=1.0(부동소수 오차 포함)이면 원본을 그대로 쓴다.
+    """
+    if not weights or exposure >= 1.0 - 1e-9:
+        return weights
+    exposure = max(0.0, exposure)
+    return {s: w * exposure for s, w in weights.items()}
+
+
 def _targets_at(
     d: pd.Timestamp,
     panel: pd.DataFrame,
@@ -247,6 +268,7 @@ def _targets_at(
     pool_provider=None,
     *,
     score_out: list | None = None,
+    exposure: float = 1.0,
 ) -> dict[str, float]:
     """리밸런싱일 d 의 목표비중을 산정한다(d 종가까지의 데이터만 사용).
 
@@ -255,6 +277,8 @@ def _targets_at(
         None 이면 config.universe(고정)를 후보풀로 쓴다.
     :param score_out: method="score" 일 때, (d, 팩터점수 DataFrame)을 append 한다.
         성과귀속·팩터 IC/IR(P1-1) 산출용 스냅샷. None 이면 수집하지 않는다.
+    :param exposure: 목표 총투자비중(0~1). 1.0(기본)이면 미적용. 패닉 오버레이(P2)의
+        base_exposure/panic_exposure 스케일링에 사용한다(리스크 레이어 적용 이후 스케일).
     """
     from app.services.metrics import _compute_stock_scores  # 지연(순환 회피)
 
@@ -312,13 +336,15 @@ def _targets_at(
                 if not is_nan(v)
             }
         weights = compute_target_weights({}, config, scores=scores, vols=vols)
-        return _apply_risk_caps(weights, hist, config.get("risk_layer") or {})
+        weights = _apply_risk_caps(weights, hist, config.get("risk_layer") or {})
+        return _scale_targets(weights, exposure)
 
     price_history = {
         sym: hist[sym].dropna() for sym in universe if sym in hist.columns
     }
     weights = compute_target_weights(price_history, config)
-    return _apply_risk_caps(weights, hist, config.get("risk_layer") or {})
+    weights = _apply_risk_caps(weights, hist, config.get("risk_layer") or {})
+    return _scale_targets(weights, exposure)
 
 
 def _trade_rec(
@@ -469,6 +495,7 @@ def run_rebalance_backtest(
     regime_series: pd.Series | None = None,
     pool_provider=None,
     benchmark_series: pd.Series | None = None,
+    panic_series: pd.DataFrame | None = None,
 ) -> dict:
     """리밸런싱 전략을 일별 시뮬레이션한다.
 
@@ -488,13 +515,19 @@ def run_rebalance_backtest(
         상대 지표(alpha·beta·IR·tracking_error·benchmark_return·excess_return)를 산출한다.
         None 이면 해당 지표는 None 으로 반환된다. Sharpe·Sortino 는 config.risk_free_rate(연)
         초과 기준으로 산출한다(기본 rf=0).
+    :param panic_series: 패닉 오버레이(config.panic_overlay)용 롤링 패닉 지표(워밍업 포함).
+        `app.services.metrics.panic.compute_panic_series` 로 만든 DataFrame(index=날짜,
+        columns=[score, level, gated, hard_trigger, close, low, dd60])을 기대한다. None 이거나
+        config.panic_overlay 가 비활성이면 오버레이 미적용(레짐 필터만 동작).
     :return: {total_return, mdd, sharpe, sortino, cagr, alpha, beta, information_ratio,
         tracking_error, benchmark_return, excess_return, win_rate, num_trades,
-        num_rebalances, num_kills, factor_ic, avg_turnover, equity_curve, markers,
-        holdings, trades} — JSON. num_kills 는 MDD 킬스위치(risk_layer) 발동 횟수. 리스크
-        레이어(집중 한도·변동성 타겟팅)는 목표비중에 반영되며 markers 에 'mdd_exit' 로
-        킬스위치 청산이 남는다. factor_ic 는 method="score" 전략의 팩터별 IC·IR·롱숏수익
-        (성과귀속, P1-1)이며 그 외 방식에선 {} 이다.
+        num_rebalances, num_kills, num_panic_events, factor_ic, avg_turnover, equity_curve,
+        markers, holdings, trades} — JSON. num_kills 는 MDD 킬스위치(risk_layer) 발동 횟수.
+        num_panic_events 는 패닉 오버레이 Confirm(재진입) 발동 횟수(P2). 리스크 레이어
+        (집중 한도·변동성 타겟팅)는 목표비중에 반영되며 markers 에 'mdd_exit' 로 킬스위치
+        청산이, 'panic_confirm'/'panic_scale_full'/'panic_exit_*' 로 오버레이 이벤트가
+        남는다. factor_ic 는 method="score" 전략의 팩터별 IC·IR·롱숏수익(성과귀속, P1-1)
+        이며 그 외 방식에선 {} 이다.
     """
     # 상장폐지(장기 결측) 처리: 무한 ffill 은 폐지 종목의 마지막 종가를 이후 전 구간
     # 동결시켜 폐지 손실이 평가액·매도에 전혀 반영되지 않아 성과를 상방 편향시킨다.
@@ -564,6 +597,65 @@ def run_rebalance_backtest(
             logger.warning(
                 "레짐 필터가 켜져 있으나 기준지수 시세를 확보하지 못해 오버레이를 적용하지 않는다."
             )
+
+    # 패닉 오버레이(P2, 대표안 A "패닉 재진입 가속기" / event_only=True 면 대조군 B).
+    # Arm(자본항복 후보 감지) → Confirm(재진입 확인) → Fill(익일 종가 체결, 기존 defer
+    # 규약 재사용) 상태기계. panic_series 를 패널 거래일에 정렬(ffill)해 지수 종가/저가·
+    # 라벨을 매일 참조한다. 미래참조 없음: panic_series 자체가 각 날짜까지의 확정
+    # 데이터로 산출되었고(compute_panic_series), 여기서는 그 시점 값만 읽는다.
+    po = config.get("panic_overlay") or {}
+    panic_ps: pd.DataFrame | None = None
+    if po.get("enabled"):
+        if panic_series is not None and not panic_series.empty:
+            ps = panic_series.copy()
+            pidx = ps.index
+            if isinstance(pidx, pd.DatetimeIndex) and pidx.tz is not None:
+                pidx = pidx.tz_localize(None)
+            ps.index = pd.DatetimeIndex(pidx).normalize()
+            ps = ps[~ps.index.duplicated(keep="last")].sort_index()
+            ps = ps.reindex(panel.index).ffill()
+            if not ps["close"].isna().all():
+                panic_ps = ps
+        if panic_ps is None:
+            logger.warning(
+                "패닉 오버레이가 켜져 있으나 유효한 패닉 시계열을 확보하지 못해 오버레이를 적용하지 않는다."
+            )
+
+    panic_on = panic_ps is not None
+    _LEVEL_RANK = {"normal": 0, "caution": 1, "warning": 2, "panic": 3}
+    arm_level = str(po.get("arm_level") or "warning")
+    arm_rank = _LEVEL_RANK.get(arm_level, 2)
+    arm_window = int(po.get("arm_window") or 5)
+    hold_days_ov = int(po.get("hold_days") or 20)
+
+    def _pof(key: str, default: float) -> float:
+        # 0.0 이 유효값이므로 `or` 대신 None 여부로만 기본값 대체(단일 .get()).
+        v = po.get(key)
+        return float(v) if v is not None else default
+
+    profit_reclaim_pct = _pof("profit_reclaim_pct", 0.5)
+    knife_stop_pct = _pof("knife_stop_pct", 0.05)
+    base_exposure_ov = _pof("base_exposure", 0.70)
+    panic_exposure_ov = _pof("panic_exposure", 1.00)
+    scale_in_confirm = _pof("scale_in_confirm", 0.5)
+    ma_recovery_period = int(po.get("ma_recovery_period") or 20)
+    event_only = bool(po.get("event_only", False))
+
+    panic_ma: pd.Series | None = None
+    panic_prev_close: pd.Series | None = None
+    if panic_on:
+        min_p = max(5, ma_recovery_period // 2)
+        panic_ma = panic_ps["close"].rolling(ma_recovery_period, min_periods=min_p).mean()
+        panic_prev_close = panic_ps["close"].shift(1)  # 전일 종가(루프마다 재계산 방지)
+
+    # 상태기계: idle → armed → confirmed_half → confirmed_full (A) / confirmed (B, event_only)
+    panic_state = "idle"
+    arm_deadline_idx = -1        # armed 상태에서 Confirm 을 기다리는 마지막 sim_dates 인덱스
+    capit_close: float | None = None   # 자본항복(Arm)일 지수 종가(Confirm 판정 기준)
+    capit_low: float | None = None     # 자본항복일 지수 저가(손절 기준)
+    capit_drop: float | None = None    # 자본항복일 낙폭(전일종가-당일종가, 양수=하락)
+    confirm_idx = -1              # Confirm 발생 sim_dates 인덱스(hold_days 카운트 기준)
+    num_panic_events = 0          # Confirm(재진입) 발동 횟수
 
     cash = 1.0            # 정규화 총자산(=capital 배율)
     val: dict[str, float] = {}    # 종목→평가액
@@ -665,30 +757,145 @@ def run_rebalance_backtest(
                 hwm = cur_equity
                 just_rearmed = True
 
-        # 4) 당일 결정. 우선순위: 킬스위치 발동 → (쿨다운 중 대기) → 레짐 청산 →
-        #    정기 리밸런싱/재진입. 미래참조 방지: 선정·목표비중은 d 까지의 데이터
-        #    (_targets_at 의 panel.loc[:d])만 사용한다.
+        # 4) 당일 결정. 우선순위: 킬스위치 발동 → panic_override(패닉 오버레이) →
+        #    (쿨다운 중 대기) → 레짐 청산 → 정기 리밸런싱/재진입. 미래참조 방지: 선정·
+        #    목표비중·패닉 판정은 모두 d 까지의 데이터만 사용한다.
         risk_off = bool(regime_on is not None and not bool(regime_on.get(d, True)))
         decision: dict | None = None
-        if (mdd_kill_pct is not None and not killed
-                and hwm > 0 and cur_equity / hwm - 1.0 <= -mdd_kill_pct):
-            # 고점 대비 낙폭이 임계 초과 → 전량 청산·현금 대피(파국 백스톱).
+
+        # 킬스위치는 절대 최우선(파국 백스톱) — 오늘 새로 발동하는지 미리 판정해 패닉
+        # 오버레이보다 위에 둔다(오버레이 로직이 이 판정을 침범하지 않도록 가드).
+        mdd_trigger_today = bool(
+            mdd_kill_pct is not None and not killed
+            and hwm > 0 and cur_equity / hwm - 1.0 <= -mdd_kill_pct
+        )
+
+        # ── 패닉 오버레이(P2) 상태 갱신(Arm→Confirm→Fill) ──
+        # confirmed 상태(오버레이 활성)인 동안은 레짐 청산을 억제한다("레짐이 겁먹고
+        # 나간 시점에 자본항복이 확인되면 강제 재진입/유지"). armed/idle 은 아직 오버레이가
+        # 포지션을 만들지 않았으므로 레짐·정기 리밸런싱 로직을 그대로 따른다(아래 5번).
+        if panic_on and not killed and not mdd_trigger_today:
+            level_i = str(panic_ps["level"].get(d, "normal"))
+            hard_i = bool(panic_ps["hard_trigger"].get(d, False))
+            close_i = panic_ps["close"].get(d)
+            low_i = panic_ps["low"].get(d)
+            prev_close_i = panic_prev_close.get(d)
+            ma_i = panic_ma.get(d) if panic_ma is not None else None
+            has_close = close_i is not None and pd.notna(close_i)
+            has_prev = prev_close_i is not None and pd.notna(prev_close_i)
+
+            if panic_state == "idle":
+                if has_close and (_LEVEL_RANK.get(level_i, 0) >= arm_rank or hard_i):
+                    panic_state = "armed"
+                    arm_deadline_idx = i + arm_window
+                    capit_close = float(close_i)
+                    capit_low = float(low_i) if low_i is not None and pd.notna(low_i) else capit_close
+                    capit_drop = float(prev_close_i) - capit_close if has_prev else None
+                    markers.append({"t": d.isoformat(), "type": "panic_arm", "level": level_i})
+
+            elif panic_state == "armed":
+                if i > arm_deadline_idx:
+                    # Arm 이후 arm_window 내 미확인 → 포기(코어 방어 유지, "떨어지는 칼날" 회피).
+                    panic_state = "idle"
+                    capit_close = capit_low = capit_drop = None
+                    markers.append({"t": d.isoformat(), "type": "panic_arm_timeout"})
+                elif (
+                    has_close and has_prev and capit_close is not None
+                    and float(close_i) > capit_close and float(close_i) > float(prev_close_i)
+                ):
+                    # Confirm: 지수가 자본항복일 종가를 상회 + 당일 등락률 양(+).
+                    # Fill 은 기존 defer(next_close) 규약을 그대로 재사용(아래 pending 이월).
+                    exposure_fill = panic_exposure_ov if event_only else (
+                        base_exposure_ov + scale_in_confirm * (panic_exposure_ov - base_exposure_ov)
+                    )
+                    targets = _targets_at(
+                        d, panel, config, fundamentals_provider, pool_provider,
+                        score_out=score_snapshots, exposure=exposure_fill,
+                    )
+                    decision = {"kind": "rebalance", "targets": targets, "reason": "panic_confirm"}
+                    panic_state = "confirmed" if event_only else "confirmed_half"
+                    confirm_idx = i
+                    num_panic_events += 1
+                    markers.append({"t": d.isoformat(), "type": "panic_confirm"})
+
+            elif panic_state in ("confirmed_half", "confirmed_full", "confirmed"):
+                exit_reason: str | None = None
+                if (
+                    has_close and capit_low is not None
+                    and float(close_i) <= capit_low * (1.0 - knife_stop_pct)
+                ):
+                    exit_reason = "panic_exit_knife"  # 손절(필수) — 칼날 방어
+                elif (
+                    has_close and capit_close is not None
+                    and capit_drop is not None and capit_drop > 0
+                    and float(close_i) >= capit_close + profit_reclaim_pct * capit_drop
+                ):
+                    exit_reason = "panic_exit_profit"  # 익절 — 낙폭의 profit_reclaim_pct 되돌림
+                elif confirm_idx >= 0 and (i - confirm_idx) >= hold_days_ov:
+                    exit_reason = "panic_exit_hold"    # 시간청산
+
+                if exit_reason is not None:
+                    if event_only:
+                        # B(순수 이벤트): 전량 현금화.
+                        decision = {"kind": "liquidate", "reason": exit_reason}
+                    else:
+                        # A: 여전히 risk-off 면 regime 방어(현금화) 복귀, 아니면 base_exposure 로 복귀.
+                        if risk_off:
+                            decision = {"kind": "liquidate", "reason": exit_reason}
+                        else:
+                            targets = _targets_at(
+                                d, panel, config, fundamentals_provider, pool_provider,
+                                score_out=score_snapshots, exposure=base_exposure_ov,
+                            )
+                            decision = {"kind": "rebalance", "targets": targets, "reason": exit_reason}
+                    panic_state = "idle"
+                    capit_close = capit_low = capit_drop = None
+                    confirm_idx = -1
+                elif (
+                    not event_only and panic_state == "confirmed_half"
+                    and has_close and ma_i is not None and pd.notna(ma_i)
+                    and float(close_i) > float(ma_i)
+                ):
+                    # A 잔여 스케일인: 지수 ma_recovery_period 이평 회복 시 리저브 나머지 배치.
+                    targets = _targets_at(
+                        d, panel, config, fundamentals_provider, pool_provider,
+                        score_out=score_snapshots, exposure=panic_exposure_ov,
+                    )
+                    decision = {"kind": "rebalance", "targets": targets, "reason": "panic_scale_full"}
+                    panic_state = "confirmed_full"
+                    markers.append({"t": d.isoformat(), "type": "panic_scale_full"})
+
+        if mdd_trigger_today:
+            # 고점 대비 낙폭이 임계 초과 → 전량 청산·현금 대피(파국 백스톱). 패닉 오버레이가
+            # 이미 만든 결정(위에서 mdd_trigger_today 가드로 원천 차단됨)보다 항상 우선한다.
             killed = True
             kill_idx = i
             num_kills += 1
+            if panic_on and panic_state != "idle":
+                # 킬스위치가 오버레이보다 우선 — 진행 중이던 Arm/Confirm 상태를 강제 리셋.
+                panic_state = "idle"
+                capit_close = capit_low = capit_drop = None
+                confirm_idx = -1
             if val:
                 decision = {"kind": "liquidate", "reason": "mdd_kill"}
+        elif decision is not None:
+            pass  # 패닉 오버레이가 이번 결정을 확정했다(킬스위치 다음 최우선, panic_override).
         elif killed:
             pass  # 쿨다운 중 — 신규 매수·재진입 없음(현금 대피 유지)
+        elif panic_state in ("confirmed_half", "confirmed_full", "confirmed"):
+            pass  # 오버레이 유지 중 — 레짐 청산·정기 리밸런싱 억제(강제 보유, panic_override)
         elif risk_off and val:
             decision = {"kind": "liquidate", "reason": "regime_exit"}
         elif not risk_off:
             # 정기 리밸런싱일이거나, 레짐 회복 재진입이거나, 킬스위치 재가동 직후(현금)면 진입.
+            # event_only(B)는 상시 core 가 없으므로 정기 리밸런싱 자체를 스킵한다.
             regime_reentry = bool(regime_on is not None and prev_risk_off and not val)
-            if d in rebal_dates or regime_reentry or (just_rearmed and not val):
+            due = d in rebal_dates or regime_reentry or (just_rearmed and not val)
+            if due and not (panic_on and event_only):
                 targets = _targets_at(
                     d, panel, config, fundamentals_provider, pool_provider,
                     score_out=score_snapshots,
+                    exposure=(base_exposure_ov if panic_on else 1.0),
                 )
                 decision = {"kind": "rebalance", "targets": targets, "reason": "rebalance"}
 
@@ -768,6 +975,7 @@ def run_rebalance_backtest(
         "num_trades": len(trades),
         "num_rebalances": len(turnovers),
         "num_kills": num_kills,  # MDD 킬스위치 발동 횟수(P1-2)
+        "num_panic_events": num_panic_events,  # 패닉 오버레이 Confirm(재진입) 발동 횟수(P2)
         "factor_ic": factor_ic,  # 팩터별 IC·IR·롱숏수익(P1-1, score 전략만; 그 외 {})
         "avg_turnover": _safe(np.mean(turnovers)) if turnovers else 0.0,
         "equity_curve": equity_curve,

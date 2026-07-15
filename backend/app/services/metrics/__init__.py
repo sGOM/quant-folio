@@ -52,6 +52,10 @@ from app.services.metrics.fetch import (
     _get_index_name,
 )
 from app.services.metrics.names import _build_krx_name_map, _build_name_map
+from app.services.metrics.panic import (
+    PANIC_CACHE_TTL,
+    compute_panic,
+)
 from app.services.metrics.sectors import (
     SECTORS_CACHE_TTL,
     _KOSDAQ_REF_TICKER,
@@ -87,4 +91,6 @@ __all__ = [
     "_compute_tech_indicators", "compute_stocks",
     # names
     "_build_krx_name_map", "_build_name_map",
+    # panic
+    "PANIC_CACHE_TTL", "compute_panic",
 ]

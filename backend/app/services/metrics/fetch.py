@@ -165,7 +165,8 @@ def _fetch_index_ohlcv(start_ymd: str, end_ymd: str, ticker: str) -> pd.DataFram
         })
         return df
     except Exception:
-        logger.debug("업종지수 OHLCV 조회 실패 (%s)", ticker, exc_info=True)
+        # 패닉·섹터 지표의 핵심 입력이므로 원인 스택을 운영 로그(warning)에 남긴다.
+        logger.warning("업종지수 OHLCV 조회 실패 (%s)", ticker, exc_info=True)
         return None
 
 
