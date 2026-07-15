@@ -194,6 +194,22 @@ def test_max_opt():
     assert P._max_opt(None, None) is None
 
 
+def test_cr5_row_shows_own_subscore_not_combined(patch_fetch):
+    """cr5 표시 막대는 자기 램프(s6_cr5)여야 한다 — cr10 이 드라이버여도 오해 금지.
+
+    cr5=0.15(warn 경계 → s6_cr5=0), cr10=0.075(램프 중간 → s6_cr10≈50) 이면
+    종합점수 가중항은 s6=max=50 을 쓰지만, cr5 행 subscore 까지 50 을 쓰면
+    -5% 값(경계)과 어긋나 오해를 준다. cr5 행은 0, cr10 행은 50 이어야 한다."""
+    it = _run(
+        patch_fetch,
+        _index_df(r1=-0.02, r5=-0.03, dd60=-0.05, vr=1.2),
+        _breadth_df(bdr=0.60, cr5=0.15, cr10=0.075),
+    )
+    by_key = {s.key: s for s in it.signals}
+    assert by_key["cr5"].subscore == pytest.approx(0.0)
+    assert by_key["cr10"].subscore == pytest.approx(50.0)
+
+
 # ─────────────────────── 롤링 시계열 브레드스 캐시 ───────────────────────
 
 
