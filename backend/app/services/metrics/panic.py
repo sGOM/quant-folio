@@ -352,6 +352,11 @@ def _compute_one_market(
 # 거래일 수만큼 호출이 필요하다 — 재실행 시 재조회를 피하려고 파일로 영속화한다.
 _BREADTH_CACHE_DIR = Path(__file__).resolve().parents[3] / ".cache"
 
+# 롤링 시계열에서 매 거래일 _index_signals 에 넘길 과거 윈도우 길이. _index_signals 가
+# 참조하는 최장 과거는 dd60(60봉)이므로 그보다 넉넉히 잡으면(65) 전체 이력을 넘길
+# 때와 결과가 동일하면서 매 반복 비용이 O(창길이)로 상한 → 전체 O(n²)→O(n).
+_SERIES_LOOKBACK = 65
+
 
 def _breadth_cache_path(mkt: str, cache_dir: str | None) -> Path:
     base = Path(cache_dir) if cache_dir else _BREADTH_CACHE_DIR
@@ -428,7 +433,7 @@ def compute_panic_series(
         d = df.index[i]
         if d.date() < start or d.date() > end:
             continue
-        window = df.iloc[: i + 1]
+        window = df.iloc[max(0, i - _SERIES_LOOKBACK + 1) : i + 1]
         sig = _index_signals(window)
         if not sig:
             continue
@@ -443,14 +448,19 @@ def compute_panic_series(
                 logger.warning("패닉 시계열: 브레드스 조회 실패 (%s)", d_ymd, exc_info=True)
                 pc = None
             breadth = _breadth_signals(pc)
-            cache[d_ymd] = breadth
-            cache_dirty = True
             fetched += 1
-            # 장시간(수십 분) 소요될 수 있는 구간이므로 중간 실패(세션 만료·네트워크 단절)로
-            # 앞선 조회가 전부 유실되지 않도록 일정 주기로 캐시를 중간 저장한다.
-            if fetched % 20 == 0:
-                _save_breadth_cache(mkt, cache_dir, cache)
-                cache_dirty = False
+            # 조회 실패(universe=0)는 캐시에 굳히지 않는다 — 굳히면 일시적 네트워크·세션
+            # 실패가 그날 브레드스를 영구 결측으로 만들어(자가복구 불가) 패닉 점수를
+            # 지수신호만으로 저평가시킨다. 유효 표본일 때만 저장하고, 실패일은 다음
+            # 실행에서 재시도한다(거래일이면 브레드스 universe 는 항상 >0).
+            if breadth.get("universe", 0) > 0:
+                cache[d_ymd] = breadth
+                cache_dirty = True
+                # 장시간(수십 분) 소요될 수 있는 구간이므로 중간 실패(세션 만료·네트워크
+                # 단절)로 앞선 조회가 전부 유실되지 않도록 일정 주기로 캐시를 중간 저장한다.
+                if len(cache) % 20 == 0:
+                    _save_breadth_cache(mkt, cache_dir, cache)
+                    cache_dirty = False
             if progress_every and fetched % progress_every == 0:
                 logger.info("패닉 시계열 진행: %s (%d/%d)", d_ymd, i, n_days)
         else:

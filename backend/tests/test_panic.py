@@ -4,6 +4,7 @@
 (거래폭증 vr≥1.5 OR 브레드스축≥60))해 단순 조정 오탐을 막는다. 아래 시나리오는
 그 게이팅과 하드트리거·라벨 임계가 의도대로 동작하는지 확인한다.
 """
+import json
 from datetime import date
 
 import numpy as np
@@ -191,3 +192,79 @@ def test_max_opt():
     assert P._max_opt(5.0, None) == 5.0
     assert P._max_opt(3.0, 7.0) == 7.0
     assert P._max_opt(None, None) is None
+
+
+# ─────────────────────── 롤링 시계열 브레드스 캐시 ───────────────────────
+
+
+def _flat_index_df(n: int = 40) -> pd.DataFrame:
+    """평평한 지수 OHLCV n봉(브레드스 캐시 동작 검증용, 값 자체는 무의미)."""
+    idx = pd.date_range("2024-01-01", periods=n, freq="B")
+    close = np.full(n, 1000.0)
+    return pd.DataFrame(
+        {"open": close, "high": close, "low": close, "close": close,
+         "volume": np.ones(n), "trading_value": np.full(n, 1e12)},
+        index=idx,
+    )
+
+
+def test_series_failed_breadth_not_cached(tmp_path, monkeypatch):
+    """브레드스 조회 실패(universe=0)는 캐시에 굳지 않아야 한다 — 굳으면 일시적 실패가
+    그날 지표를 영구 결측으로 만들어 자가복구가 불가능해진다(리뷰 High)."""
+    index_df = _flat_index_df(40)
+    monkeypatch.setattr(P, "_fetch_index_ohlcv", lambda *a, **k: index_df)
+    monkeypatch.setattr(P, "_fetch_price_change", lambda *a, **k: None)  # 항상 실패
+
+    start, end = index_df.index[10].date(), index_df.index[20].date()
+    P.compute_panic_series("KOSPI", start, end, cache_dir=str(tmp_path))
+
+    cache_file = tmp_path / "panic_breadth_KOSPI.json"
+    cached = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.exists() else {}
+    assert cached == {}, "실패한 브레드스 조회는 캐시에 저장되지 않아야 한다"
+
+    # 다음 실행에서 조회가 성공하면 그때 캐시에 저장된다(정상 표본만 영속화).
+    def _ok(*a, **k):
+        return pd.DataFrame({"등락률": [-1.0, -6.0, 1.0], "거래량": [1, 1, 1]})
+
+    monkeypatch.setattr(P, "_fetch_price_change", _ok)
+    P.compute_panic_series("KOSPI", start, end, cache_dir=str(tmp_path))
+    cached2 = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.exists() else {}
+    assert cached2, "유효한 브레드스는 캐시에 저장돼 재실행 시 재조회를 피한다"
+
+
+def _walk_index_df(n: int = 150) -> pd.DataFrame:
+    """변동 있는 지수 OHLCV n봉(랜덤워크). 윈도우 슬라이싱 동등성 검증용."""
+    rng = np.random.default_rng(7)
+    close = 1000 * np.cumprod(1 + rng.normal(0, 0.012, n))
+    idx = pd.date_range("2024-01-01", periods=n, freq="B")
+    hi = close * 1.01
+    lo = close * 0.99
+    tv = np.full(n, 1e12) * (1 + rng.normal(0, 0.3, n)).clip(0.2, None)
+    return pd.DataFrame(
+        {"open": close, "high": hi, "low": lo, "close": close,
+         "volume": np.ones(n), "trading_value": tv},
+        index=idx,
+    )
+
+
+def test_series_lookback_window_matches_full_history(tmp_path, monkeypatch):
+    """확장윈도우 슬라이싱(O(n))이 전체 이력 계산(O(n²))과 결과가 완전히 동일해야 한다.
+
+    _index_signals 는 최장 60봉(dd60)만 참조하므로 마지막 _SERIES_LOOKBACK(65)봉만
+    넘겨도 전체를 넘길 때와 동일하다. _SERIES_LOOKBACK 을 매우 크게(전체 이력) 바꾼
+    실행과 비교해 이 동치가 유지되는지(윈도우가 값을 바꾸지 않는지) 못박는다."""
+    df = _walk_index_df(150)
+    monkeypatch.setattr(P, "_fetch_index_ohlcv", lambda *a, **k: df)
+    # 브레드스는 두 실행에서 동일한 결정적 값(동등성 비교는 지수신호 윈도잉이 핵심).
+    monkeypatch.setattr(
+        P, "_fetch_price_change",
+        lambda *a, **k: pd.DataFrame({"등락률": [-1.0, -6.0, 0.5], "거래량": [1, 1, 1]}),
+    )
+    start, end = df.index[70].date(), df.index[140].date()
+
+    windowed = P.compute_panic_series("KOSPI", start, end, cache_dir=str(tmp_path / "w"))
+    monkeypatch.setattr(P, "_SERIES_LOOKBACK", 10_000)  # 사실상 전체 이력
+    full = P.compute_panic_series("KOSPI", start, end, cache_dir=str(tmp_path / "f"))
+
+    assert not windowed.empty and len(windowed) == len(full)
+    pd.testing.assert_frame_equal(windowed, full)
