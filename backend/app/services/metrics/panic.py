@@ -275,7 +275,7 @@ def _score_and_label(mkt: str, sig: dict) -> dict:
     return dict(
         score=score, level=level, gated=gated, hard_trigger=hard_trigger,
         price_sub=price_sub, breadth_sub=breadth_sub,
-        s1=s1, s2=s2, s4=s4, s5=s5, s6=s6, s6_cr10=s6_cr10, s7=s7, s8=s8,
+        s1=s1, s2=s2, s4=s4, s5=s5, s6=s6, s6_cr5=s6_cr5, s6_cr10=s6_cr10, s7=s7, s8=s8,
     )
 
 
@@ -318,7 +318,10 @@ def _compute_one_market(
                     weight=_W["s4"], warn=_TH_COMMON["vr"][0], panic=_TH_COMMON["vr"][1]),
         PanicSignal(key="bdr", label="하락종목 비율", value=sig.get("bdr"), subscore=res["s5"],
                     weight=_W["s5"], warn=_TH_COMMON["bdr"][0], panic=_TH_COMMON["bdr"][1]),
-        PanicSignal(key="cr5", label="급락종목 비율(-5%)", value=sig.get("cr5"), subscore=res["s6"],
+        # cr5 행은 -5% 램프 자체 서브스코어(s6_cr5)를 표시한다. 종합점수 가중항은
+        # s6=max(s6_cr5, s6_cr10) 를 쓰지만(weight=_W["s6"]), 표시 막대까지 max 를
+        # 쓰면 cr10 이 드라이버일 때 -5% 값과 어긋나 오해를 준다 → 표시는 자기 값 기준.
+        PanicSignal(key="cr5", label="급락종목 비율(-5%)", value=sig.get("cr5"), subscore=res["s6_cr5"],
                     weight=_W["s6"], warn=_TH_COMMON["cr5"][0], panic=_TH_COMMON["cr5"][1]),
         PanicSignal(key="z", label="변동성 z-score", value=sig.get("z"), subscore=res["s7"],
                     weight=_W["s7"], warn=_TH[mkt]["z"][0], panic=_TH[mkt]["z"][1]),
