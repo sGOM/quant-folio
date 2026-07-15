@@ -9,6 +9,7 @@ import pytest
 from app.services.backtest.portfolio import (
     _apply_risk_caps,
     _cap_position_weights,
+    _cap_sector_weights,
     _dynamic_universe,
     _factor_attribution,
     _portfolio_vol_ann,
@@ -1208,6 +1209,53 @@ def test_cap_position_weights_excess_to_cash_when_no_room():
     capped = _cap_position_weights({"A": 0.5, "B": 0.5}, 0.3)
     assert all(v <= 0.3 + 1e-9 for v in capped.values())
     assert sum(capped.values()) < 1.0 - 1e-9
+
+
+def test_cap_sector_weights_caps_sector_and_redistributes():
+    """한 섹터 합이 상한 초과 → 섹터 내 비례 축소 + 초과분을 여력 섹터로 재분배."""
+    smap = {"A": "반도체", "B": "반도체", "C": "은행"}
+    # 반도체 합 0.8(>0.5) → 0.5 로 축소(A·B 5:3 비례 유지), 초과 0.3 은 C(은행)로.
+    capped = _cap_sector_weights({"A": 0.5, "B": 0.3, "C": 0.2}, smap, 0.5)
+    assert abs((capped["A"] + capped["B"]) - 0.5) < 1e-9   # 반도체 섹터 = 상한
+    assert abs(capped["A"] / capped["B"] - 5 / 3) < 1e-9   # 섹터 내 비례 유지
+    assert abs(capped["C"] - 0.5) < 1e-9                   # 은행이 초과분 흡수
+    assert abs(sum(capped.values()) - 1.0) < 1e-9
+
+
+def test_cap_sector_weights_excess_to_cash_when_no_room():
+    """모든 종목이 한 섹터 → 재분배 여력 없어 초과분은 현금(합<1)."""
+    smap = {"A": "은행", "B": "은행", "C": "은행"}
+    capped = _cap_sector_weights({"A": 0.4, "B": 0.4, "C": 0.2}, smap, 0.6)
+    assert abs(sum(capped.values()) - 0.6) < 1e-9  # 섹터 합이 상한, 나머지 현금
+
+
+def test_cap_sector_weights_unclassified_treated_independently():
+    """미분류 종목은 독립 섹터로 취급 — 서로 합산되지 않고 여력 대상엔 포함."""
+    smap = {"A": "반도체", "B": "반도체"}  # C 는 미분류
+    capped = _cap_sector_weights({"A": 0.4, "B": 0.4, "C": 0.2}, smap, 0.5)
+    assert abs((capped["A"] + capped["B"]) - 0.5) < 1e-9   # 반도체 캡
+    assert capped["C"] > 0.2 - 1e-12                        # 미분류 C 가 초과분 흡수
+    assert abs(sum(capped.values()) - 1.0) < 1e-9
+
+
+def test_cap_sector_weights_noop_when_within_cap():
+    """모든 섹터가 상한 이하이면 원본 그대로."""
+    smap = {"A": "반도체", "B": "은행"}
+    tgt = {"A": 0.5, "B": 0.5}
+    assert _cap_sector_weights(tgt, smap, 0.6) == tgt
+
+
+def test_apply_risk_caps_sector_cap_wired(monkeypatch):
+    """_apply_risk_caps 가 max_sector_pct + sector_map 을 받아 섹터 캡을 적용한다."""
+    idx = pd.bdate_range("2023-01-01", periods=30)
+    hist = pd.DataFrame({"A": 1.0, "B": 1.0, "C": 1.0}, index=idx)
+    smap = {"A": "반도체", "B": "반도체", "C": "은행"}
+    risk = {"max_sector_pct": 0.5}
+    out = _apply_risk_caps({"A": 0.5, "B": 0.3, "C": 0.2}, hist, risk, smap)
+    assert abs((out["A"] + out["B"]) - 0.5) < 1e-9
+    # 맵이 없으면 섹터 캡은 미적용(원본 유지).
+    out2 = _apply_risk_caps({"A": 0.5, "B": 0.3, "C": 0.2}, hist, risk, None)
+    assert abs((out2["A"] + out2["B"]) - 0.8) < 1e-9
 
 
 def test_portfolio_vol_ann_orders_by_risk():
