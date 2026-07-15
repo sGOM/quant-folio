@@ -704,6 +704,57 @@ export interface StocksOut {
   items: StockMetric[];
 }
 
+// ─────────────────────────── 패닉셀(투매) 지표 타입 ───────────────────────────
+
+/** 패닉셀 경보 단계. */
+export type PanicLevel = "normal" | "caution" | "warning" | "panic";
+
+/** 패닉셀 구성 시그널 1건. */
+export interface PanicSignal {
+  key: string;
+  label: string;
+  /** 원시 측정값(시그널별 단위 상이: 수익률·비율·배율 등). */
+  value: number | null;
+  /** 0~100 서브스코어(경계 0 · 패닉 100). */
+  subscore: number | null;
+  /** 종합점수 가중(0=비가중 참고 신호). */
+  weight: number;
+  /** 경계 임계값. */
+  warn: number | null;
+  /** 패닉 임계값. */
+  panic: number | null;
+}
+
+/** 시장 1개(KOSPI/KOSDAQ)의 패닉셀 판정. */
+export interface PanicMarket {
+  market: string;
+  /** 0~100 종합점수(dd60 국면 보정 후). */
+  score: number;
+  level: PanicLevel;
+  /** 패닉 게이팅 충족 여부(가격급락+거래폭증/브레드스). */
+  gated: boolean;
+  /** 하드트리거 발동 여부(극단값 → 즉시 패닉). */
+  hard_trigger: boolean;
+  /** 가격축 서브스코어(0~100). */
+  price_sub: number | null;
+  /** 브레드스축 서브스코어(0~100). */
+  breadth_sub: number | null;
+  /** 60일 고점대비 낙폭(음수 소수). */
+  dd60: number | null;
+  /** 브레드스 유효 종목 수(거래정지 제외). */
+  universe: number;
+  signals: PanicSignal[];
+}
+
+/** 패닉셀 지표 응답 래퍼(백엔드 /api/metrics/panic). */
+export interface PanicOut {
+  /** 기준일(YYYY-MM-DD). */
+  as_of: string;
+  items: PanicMarket[];
+  /** 조회/데이터 부족으로 계산하지 못한 시장 목록(예: ["KOSDAQ"]). */
+  unavailable: string[];
+}
+
 /** 소형주 턴어라운드 스크리너 후보 1건(백엔드 /api/screener/turnaround). */
 export interface TurnaroundCandidate {
   code: string;
@@ -1094,6 +1145,15 @@ export const api = {
     if (params.limit != null) sp.set("limit", String(params.limit));
     const qs = sp.toString();
     return request<StocksOut>(`/api/metrics/stocks${qs ? `?${qs}` : ""}`);
+  },
+
+  /**
+   * 패닉셀(투매) 시장 지표를 조회한다.
+   * @param market ALL|KOSPI|KOSDAQ (ALL이면 KOSPI·KOSDAQ 둘 다 반환)
+   */
+  getPanic: (market: MetricMarket = "ALL") => {
+    const sp = new URLSearchParams({ market });
+    return request<PanicOut>(`/api/metrics/panic?${sp.toString()}`);
   },
 
   /**

@@ -24,11 +24,19 @@ from redis.asyncio import Redis
 from app.api.deps import get_current_user
 from app.core.redis import get_redis
 from app.models import User
-from app.schemas.metrics import SectorMetric, SectorsOut, StockMetric, StocksOut
+from app.schemas.metrics import (
+    PanicOut,
+    SectorMetric,
+    SectorsOut,
+    StockMetric,
+    StocksOut,
+)
 from app.services.metrics import (
+    PANIC_CACHE_TTL,
     SECTORS_CACHE_TTL,
     STOCKS_CACHE_TTL,
     _last_business_day,
+    compute_panic,
     compute_sectors,
     compute_stocks,
 )
@@ -224,3 +232,63 @@ async def list_stocks(
     items = items[:limit]
 
     return StocksOut(as_of=data.as_of, count=len(items), items=items)
+
+
+# ─────────────────────── 패닉셀 엔드포인트 ───────────────────────
+
+
+@router.get(
+    "/panic",
+    response_model=PanicOut,
+    summary="패닉셀(투매) 지표 조회",
+    description=(
+        "시장(KOSPI/KOSDAQ) 레벨 패닉셀(자본항복) 판정을 반환한다. "
+        "지수 급락·거래대금 폭증·브레드스 붕괴·변동성 급등을 결합해 0~100 점수와 "
+        "'정상/주의/경계/패닉' 라벨을 산출한다(게이팅으로 단순 조정 오탐 억제). "
+        "직전 확정 영업일(as_of) 종가 기준이며 장중 실시간 신호가 아니다. "
+        "결과는 as_of + market 기준으로 Redis에 캐시된다(TTL 6h)."
+    ),
+)
+async def get_panic(
+    market: Annotated[MarketParam, Query(description="시장 구분(ALL/KOSPI/KOSDAQ)")] = "ALL",
+    _: User = Depends(get_current_user),
+    redis: Redis = Depends(get_redis),
+) -> PanicOut:
+    """패닉셀 시장 지표를 반환한다.
+
+    - 캐시 미스 시 pykrx로 지수 OHLCV·전 종목 등락률을 조회해 계산한다(블로킹 → 스레드풀).
+    - 빈 결과(조회 실패)는 캐시하지 않아 일시적 실패가 TTL 동안 굳는 것을 방지한다.
+    """
+    as_of = await asyncio.to_thread(_last_business_day)
+    cache_key = f"metrics:panic:{market}:{as_of.isoformat()}"
+
+    try:
+        cached = await redis.get(cache_key)
+    except Exception:
+        logger.warning("Redis get 실패 (key=%s)", cache_key, exc_info=True)
+        cached = None
+
+    if cached:
+        try:
+            return PanicOut.model_validate_json(cached)
+        except Exception:
+            logger.warning("패닉 캐시 역직렬화 실패, 재계산", exc_info=True)
+
+    try:
+        data = await asyncio.to_thread(compute_panic, market, as_of)
+    except Exception as exc:
+        logger.error("패닉 지표 계산 실패: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="패닉셀 지표 계산 중 오류가 발생했습니다.",
+        ) from exc
+
+    if data.items:
+        try:
+            await redis.setex(cache_key, PANIC_CACHE_TTL, data.model_dump_json())
+        except Exception:
+            logger.warning("패닉 캐시 저장 실패", exc_info=True)
+    else:
+        logger.warning("패닉 계산 결과가 비어 캐시를 건너뜀 (as_of=%s market=%s)", as_of, market)
+
+    return data

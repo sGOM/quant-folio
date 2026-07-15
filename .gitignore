@@ -57,3 +57,6 @@ data/
 
 # 셸 크래시 덤프(MSYS/Cygwin bash) — 커밋 금지
 *.stackdump
+
+# 패닉 오버레이 검증용 breadth 로컬 캐시(재생성 가능, 커밋 금지)
+backend/.cache/
