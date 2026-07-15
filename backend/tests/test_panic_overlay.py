@@ -182,6 +182,92 @@ def test_event_only_control_group_no_core_position():
     assert hold_exits, "시간청산(panic_exit_hold) 거래가 있어야 한다"
 
 
+def test_panic_exit_profit_reclaim():
+    """Confirm 이후 지수가 자본항복일 낙폭의 profit_reclaim_pct 만큼 되돌리면 익절 청산된다.
+
+    자본항복일 종가 940(=1000×(1-6%)), 낙폭 60. profit_reclaim_pct=0.5 이면 익절 임계는
+    940+0.5×60=970. profit_idx 에서 종가를 1000(≥970)으로 올려 익절을 유발한다.
+    """
+    panel = _panel(60)
+    dates = panel.index
+    capit_idx, confirm_idx, profit_idx = 20, 21, 26
+    ps = _panic_series(
+        dates, capit_idx=capit_idx, r1=-0.06,
+        overrides={
+            confirm_idx: 1000.0 * 0.94 * 1.02,   # Confirm(958.8): 이후 profit_idx 까지 flat
+            profit_idx: 1000.0,                   # 낙폭 60 의 0.5 되돌림(임계 970) 초과 → 익절
+        },
+    )
+    cfg = _cfg(profit_reclaim_pct=0.5, knife_stop_pct=0.5, hold_days=200)
+
+    res = run_rebalance_backtest(panel, cfg, dates[10], dates[-1], panic_series=ps)
+
+    assert res["num_panic_events"] >= 1
+    assert [t for t in res["trades"] if t["reason"] == "panic_confirm"]
+    profit_exits = [t for t in res["trades"] if t["reason"] == "panic_exit_profit"]
+    assert profit_exits, "익절(panic_exit_profit) 거래가 있어야 한다"
+
+
+def test_panic_scale_in_full_on_ma_recovery():
+    """A(scale_in_confirm<1): Confirm 시 리저브 일부만 배치(confirmed_half)했다가 지수가
+    ma_recovery_period 이평을 회복하면 잔여를 마저 배치(confirmed_full)한다."""
+    panel = _panel(60)
+    dates = panel.index
+    capit_idx, confirm_idx = 20, 24
+    ps = _panic_series(
+        dates, capit_idx=capit_idx, r1=-0.06,
+        overrides={confirm_idx: 1000.0 * 0.94 * 1.02},  # 958.8: 이후 flat → 이평 하회분 회복
+    )
+    # scale_in_confirm=0.5 로 확인 즉시 절반만(confirmed_half), 익절 임계는 높게(0.99)·손절은
+    # 느슨하게(0.5) 두어 스케일인 전에 청산되지 않게 한다.
+    cfg = _cfg(scale_in_confirm=0.5, ma_recovery_period=5,
+               hold_days=200, profit_reclaim_pct=0.99, knife_stop_pct=0.5)
+
+    res = run_rebalance_backtest(panel, cfg, dates[10], dates[-1], panic_series=ps)
+
+    assert res["num_panic_events"] >= 1
+    assert [m for m in res["markers"] if m["type"] == "panic_confirm"]
+    assert [m for m in res["markers"] if m["type"] == "panic_scale_full"], \
+        "잔여 스케일인(panic_scale_full) 이벤트가 있어야 한다"
+    assert [t for t in res["trades"] if t["reason"] == "panic_scale_full"]
+
+
+def _panel_crash(n=60, *, crash_idx: int, pre: float = 100.0, crash_frac: float = 0.30):
+    """crash_idx 이전엔 완만한 상승, 이후엔 crash_frac 만큼 급락해 유지되는 패널."""
+    dates = pd.bdate_range("2024-01-01", periods=n)
+    vals = [
+        pre * (1.0 + 0.0005 * i) if i < crash_idx else pre * (1.0 - crash_frac)
+        for i in range(n)
+    ]
+    return pd.DataFrame({"AAAAAA": vals, "BBBBBB": vals}, index=dates)
+
+
+def test_mdd_killswitch_overrides_active_overlay():
+    """오버레이가 활성(confirmed)인 상태에서 자산 낙폭이 MDD 킬 임계를 넘으면 킬스위치가
+    오버레이를 강제 해제·전량 청산한다(킬스위치 최우선)."""
+    n = 60
+    capit_idx, confirm_idx, crash_idx = 20, 21, 32
+    panel = _panel_crash(n, crash_idx=crash_idx, crash_frac=0.30)
+    dates = panel.index
+    ps = _panic_series(
+        dates, capit_idx=capit_idx, r1=-0.06,
+        overrides={confirm_idx: 1000.0 * 0.94 * 1.02},  # Confirm 후 지수는 flat(오버레이 유지)
+    )
+    # scale_in_confirm=1.0 로 확인 시 전액 편입(confirmed_full) → 자산이 종목 급락에 그대로
+    # 노출. 손절은 느슨(지수 기준이라 자산 급락과 무관)·hold 는 길게 두어 청산 원인이
+    # 오직 MDD 킬스위치가 되게 한다.
+    cfg = _cfg(scale_in_confirm=1.0, hold_days=200,
+               profit_reclaim_pct=0.99, knife_stop_pct=0.9)
+    cfg["risk_layer"] = {"mdd_kill_pct": 0.2, "mdd_rearm_days": 100}
+
+    res = run_rebalance_backtest(panel, cfg, dates[10], dates[-1], panic_series=ps)
+
+    assert res["num_panic_events"] >= 1          # 오버레이가 먼저 활성화됐고
+    assert res["num_kills"] >= 1                  # 킬스위치가 발동했으며
+    assert [m for m in res["markers"] if m["type"] == "mdd_exit"], \
+        "MDD 청산(mdd_exit) 마커가 있어야 한다"
+
+
 def test_panic_overlay_disabled_no_effect():
     """panic_overlay 가 없으면 기존 동작과 완전히 동일하다(회귀 안전)."""
     panel = _panel(40)
