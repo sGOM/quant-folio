@@ -768,6 +768,7 @@ function RebalanceFields({
   const narrowing = pitSource && uniRule.type === "momentum";
   function changeUniverseSource(source: UniverseRule["source"]) {
     if (source === "fixed") {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const { universe_rule: _drop, ...rest } = config.selection;
       patch({ selection: rest } as Partial<StrategyConfig>);
     } else {
