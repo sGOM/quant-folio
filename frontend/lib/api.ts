@@ -358,6 +358,8 @@ export interface RegimeFilter {
 export interface RiskLayer {
   /** 단일 종목 목표비중 상한(0~1). 초과분은 상한 미만 종목에 비례 재분배(여력 없으면 현금). drift_band 보다 커야 함. */
   max_position_pct?: number | null;
+  /** 섹터(업종) 합산 목표비중 상한(0~1). 섹터 매핑 조회 실패 시 조용히 미적용. */
+  max_sector_pct?: number | null;
   /** 목표 연율 변동성(예: 0.15=15%). 실현변동성이 넘으면 총투자비중 디레버리징. */
   target_vol?: number | null;
   /** 변동성 타겟팅용 실현변동성 측정 거래일. */
