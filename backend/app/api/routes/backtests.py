@@ -16,7 +16,11 @@ from app.api.routes.strategies import _get_owned
 from app.core.database import get_db
 from app.models import Backtest, Strategy, StrategyStatus, User
 from app.schemas.strategy import BacktestOut, BacktestRequest
-from app.services.backtest import run_backtest, run_rebalance_backtest
+from app.services.backtest import (
+    analyze_backtest_dsr,
+    run_backtest,
+    run_rebalance_backtest,
+)
 from app.services.backtest.signals import requires_ohlc
 from app.services.data import load_ohlcv, upsert_price_ticks
 from app.services.data.loader import get_close_series, get_ohlcv_frame
@@ -428,3 +432,49 @@ async def get_backtest(
     if bt is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "백테스트를 찾을 수 없습니다.")
     return bt
+
+
+@router.get("/backtests/{backtest_id}/dsr")
+async def get_backtest_dsr(
+    backtest_id: int,
+    current: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """백테스트 1건의 Deflated Sharpe Ratio(DSR)를 온디맨드 계산해 반환한다.
+
+    과최적화(다중검정 selection bias) 방어 사후 분석(Bailey & López de Prado 2014).
+    동질 시행 집합 = 같은 strategy_id + 같은 period_start/period_end 의 Backtest 이력
+    (파라미터 탐색 시행들)로 N·V·N_eff 를 추정한다. 계산은 CPU 성 순수함수라 매우
+    가볍지만, 일관성을 위해 스레드풀에서 실행한다. 전략 소유자 본인만 접근 가능.
+    """
+    bt = await db.scalar(
+        select(Backtest)
+        .join(Strategy, Strategy.id == Backtest.strategy_id)
+        .where(Backtest.id == backtest_id, Strategy.user_id == current.id)
+    )
+    if bt is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "백테스트를 찾을 수 없습니다.")
+    if not bt.result:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "백테스트 결과 데이터가 없습니다."
+        )
+
+    # 동질 집합: 같은 전략 + 같은 기간(period_start/period_end)의 모든 백테스트 이력.
+    # (result 에 유니버스 식별 정보가 없어 기간 동일성으로만 필터한다 — 방법론 한계.)
+    rows = await db.scalars(
+        select(Backtest).where(
+            Backtest.strategy_id == bt.strategy_id,
+            Backtest.period_start == bt.period_start,
+            Backtest.period_end == bt.period_end,
+        )
+    )
+    homogeneous = [r.result for r in rows if r.result]
+
+    analysis = await run_in_threadpool(analyze_backtest_dsr, bt.result, homogeneous)
+    return {
+        "backtest_id": bt.id,
+        "strategy_id": bt.strategy_id,
+        "period_start": bt.period_start,
+        "period_end": bt.period_end,
+        **analysis,
+    }
