@@ -10,47 +10,7 @@ import pytest
 
 from app.core.channels import FAILURE_ALERT_THRESHOLD, engine_health_key
 from engine.base_runner import BaseRunner
-
-
-class _FakeRedis:
-    """set/get/publish 만 지원하는 인메모리 Redis 대역(발행 기록 보관)."""
-
-    def __init__(self):
-        self.store: dict[str, str] = {}
-        self.published: list[tuple[str, str]] = []
-
-    async def get(self, k):
-        return self.store.get(k)
-
-    async def set(self, k, v, ex=None, nx=False):
-        if nx and k in self.store:
-            return None
-        self.store[k] = v
-        return True
-
-    async def delete(self, k):
-        self.store.pop(k, None)
-
-    async def publish(self, channel, data):
-        self.published.append((channel, data))
-        return 1
-
-    def alerts(self) -> list[dict]:
-        # publish_event 는 사용자별 채널 + 공용 채널 양쪽에 발행하므로, 중복 카운트를
-        # 피하려 공용 채널("engine:events")만 집계한다.
-        from app.core.channels import ENGINE_EVENTS_CHANNEL
-
-        out = []
-        for ch, data in self.published:
-            if ch != ENGINE_EVENTS_CHANNEL:
-                continue
-            try:
-                payload = json.loads(data)
-            except (ValueError, TypeError):
-                continue
-            if payload.get("type") == "alert":
-                out.append(payload)
-        return out
+from tests.conftest import FakeRedis as _FakeRedis  # 공용 대역 재사용(중복 정의 제거)
 
 
 class _Runner(BaseRunner):
