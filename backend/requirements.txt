@@ -18,6 +18,7 @@ email-validator==2.2.0
 setuptools==75.8.0  # pykrx 가 import 하는 pkg_resources 제공 (Python 3.12 에 미번들)
 pandas==2.2.3
 numpy==2.2.1
+scipy==1.18.0  # DSR(과최적화 방어) 통계·vectorbt 의존; norm/skew/kurtosis 직접 사용
 vectorbt==0.27.2
 pykrx==1.2.8  # 1.2.x 는 KRX 데이터 포털 로그인(KRX_ID/KRX_PW 환경변수) 필요
 finance-datareader==0.9.96
