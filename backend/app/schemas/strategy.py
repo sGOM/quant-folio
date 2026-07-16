@@ -653,6 +653,20 @@ class RebalanceConfig(BaseModel):
     slippage_vol_scale: float = Field(
         default=0.0, ge=0, le=5, description="변동성 비례 슬리피지 스케일(0=고정 bps)"
     )
+    # 체결 정밀도(P2-2) — A-1 정수주.
+    integer_shares: bool = Field(
+        default=True,
+        description="정수주 체결. True(기본)면 목표 거래대금을 floor(금액/가격) 주 단위로"
+        " 절사해 실거래(compute_rebalance_orders)와 동일 규약을 따른다. 잔여 소수점 금액은"
+        " 현금으로 이월된다(매매 없음). False 면 구 동작(연속 비중) 유지.",
+    )
+    # 체결 정밀도(P2-2) — A-2 ADV(일평균거래대금) 참여율 캡.
+    adv_participation_cap: float | None = Field(
+        default=None, ge=0, le=1,
+        description="종목별 20일 ADV(거래대금) 대비 1일 참여율 상한(예 0.08=8%). 초과분은"
+        " 절사(미체결, 다음 리밸런싱에서 재평가)한다. None(기본)이면 유동성 무제한(구 동작)."
+        " 백테스트 호출자가 거래량 패널(volume_panel)을 공급하지 않으면 설정돼 있어도 미적용.",
+    )
     # 벤치마크 상대성과(alpha·beta·IR)용 지수. 위험조정지표 무위험수익률(연).
     benchmark_index: Literal["KOSPI200", "KOSPI", "KOSDAQ"] = Field(
         default="KOSPI200", description="벤치마크 상대성과 산출용 지수"
