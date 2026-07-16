@@ -27,6 +27,8 @@ _SECRET_FILE_FIELDS = (
     "KRX_ID",
     "KRX_PW",
     "OPENDART_API_KEY",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
 )
 
 
@@ -116,6 +118,14 @@ class Settings(BaseSettings):
     # 발급: https://opendart.fss.or.kr (일 20,000건). 배선 계획: docs/opendart-integration.md
     OPENDART_API_KEY: str = ""
     OPENDART_BASE_URL: str = "https://opendart.fss.or.kr/api"
+
+    # --- 텔레그램 크리티컬 알림 ---
+    # 24h 무인 자동매매에서 MDD 킬스위치·러너 연속실패 등 critical 알림을 앱 미접속
+    # 시에도 받기 위한 외부 채널. 봇 생성: @BotFather. 시크릿 파일(secrets/telegram_bot_token.txt,
+    # secrets/telegram_chat_id.txt)로 주입. 둘 다 비어있지 않을 때만 활성화되고, 미설정이면
+    # 기존 앱 내(WS) 알림만 동작(영향 없음).
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
 
     # --- CORS ---
     FRONTEND_ORIGIN: str = "http://localhost:3000"
@@ -228,6 +238,11 @@ class Settings(BaseSettings):
     def has_opendart(self) -> bool:
         """OpenDART API 키가 주입되어 재무 데이터 조회가 가능한지 여부."""
         return bool(self.OPENDART_API_KEY.strip())
+
+    @property
+    def has_telegram(self) -> bool:
+        """텔레그램 봇 토큰·채팅ID 가 모두 주입되어 외부 알림 발송이 가능한지 여부."""
+        return bool(self.TELEGRAM_BOT_TOKEN.strip() and self.TELEGRAM_CHAT_ID.strip())
 
 
 @lru_cache
