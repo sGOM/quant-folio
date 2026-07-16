@@ -31,6 +31,12 @@ celery_app.conf.beat_schedule = {
         "task": "worker.ingest_daily_ohlcv",
         "schedule": crontab(hour=18, minute=30),
     },
+    # 체결 정합 정기 점검(B-2) — 주간(월요일 아침). 슬리피지 실측이 서서히 벌어지는
+    # 종류의 이슈라 일 단위로 돌 필요는 없다.
+    "check-fill-quality-drift": {
+        "task": "worker.check_fill_quality_drift",
+        "schedule": crontab(day_of_week="mon", hour=9, minute=0),
+    },
 }
 
 

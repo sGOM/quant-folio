@@ -161,12 +161,6 @@ async def get_fill_quality(
     if d_from > d_to:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "시작일이 종료일보다 늦습니다.")
 
-    start_dt = datetime.combine(d_from, time(0, 0, 0), tzinfo=KST)
-    end_dt = datetime.combine(d_to, time(23, 59, 59), tzinfo=KST)
-
-    # 슬리피지 가정: 전략 지정 시 그 config 값, 아니면 기본(5bp, 고정).
-    slip_bps = DEFAULT_SLIP_BPS
-    slip_vol_scale = 0.0
     if strategy_id is not None:
         strat = await db.scalar(
             select(Strategy).where(
@@ -175,9 +169,46 @@ async def get_fill_quality(
         )
         if strat is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "전략을 찾을 수 없습니다.")
-        cfg = strat.config or {}
-        slip_bps = float(cfg.get("slippage_bps", DEFAULT_SLIP_BPS) or DEFAULT_SLIP_BPS)
-        slip_vol_scale = float(cfg.get("slippage_vol_scale", 0.0) or 0.0)
+
+    return await compute_fill_quality_report(
+        db, current.id,
+        d_from=d_from, d_to=d_to, strategy_id=strategy_id,
+        annual_turnover=annual_turnover, capital=capital,
+        min_sample=min_sample, detail=detail,
+    )
+
+
+async def compute_fill_quality_report(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    d_from: date,
+    d_to: date,
+    strategy_id: int | None = None,
+    annual_turnover: float | None = None,
+    capital: float | None = None,
+    min_sample: int = DEFAULT_MIN_SAMPLE,
+    detail: bool = False,
+) -> dict[str, Any]:
+    """정합 실측 리포트 산출(HTTP 비의존) — 라우트와 Celery 주간 배치(B-2)가 공유한다.
+
+    호출자가 전략 소유권을 이미 확인했다고 가정한다(라우트는 404 처리를, 배치는
+    Order.user_id 로 조회하므로 자연히 본인 소유만 잡힌다).
+    """
+    start_dt = datetime.combine(d_from, time(0, 0, 0), tzinfo=KST)
+    end_dt = datetime.combine(d_to, time(23, 59, 59), tzinfo=KST)
+
+    # 슬리피지 가정: 전략 지정 시 그 config 값, 아니면 기본(5bp, 고정).
+    slip_bps = DEFAULT_SLIP_BPS
+    slip_vol_scale = 0.0
+    if strategy_id is not None:
+        strat = await db.scalar(
+            select(Strategy).where(Strategy.id == strategy_id, Strategy.user_id == user_id)
+        )
+        if strat is not None:
+            cfg = strat.config or {}
+            slip_bps = float(cfg.get("slippage_bps", DEFAULT_SLIP_BPS) or DEFAULT_SLIP_BPS)
+            slip_vol_scale = float(cfg.get("slippage_vol_scale", 0.0) or 0.0)
     slip_base = max(0.0, slip_bps / 1e4)
 
     # 대상 주문 조회: 본인·전략 리밸런싱·체결분(부분/전량).
@@ -185,7 +216,7 @@ async def get_fill_quality(
         select(Order)
         .options(selectinload(Order.executions))
         .where(
-            Order.user_id == current.id,
+            Order.user_id == user_id,
             Order.strategy_id.is_not(None),
             Order.status.in_(_FILLED_STATUSES),
             Order.created_at >= start_dt,
