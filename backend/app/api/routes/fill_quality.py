@@ -22,6 +22,7 @@ from typing import Annotated, Any
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -35,6 +36,7 @@ from app.services.backtest.fill_quality import (
     DEFAULT_SLIP_BPS,
     compute_fill_quality,
 )
+from app.services.backtest.slippage_calibration import propose_slippage_calibration
 from app.services.data.loader import load_ohlcv
 from app.services.market import KST
 
@@ -176,6 +178,108 @@ async def get_fill_quality(
         annual_turnover=annual_turnover, capital=capital,
         min_sample=min_sample, detail=detail,
     )
+
+
+# 캘리브레이션 제안 산출 시 되돌아보는 창(일). B-2 배치·GET 리포트 기본과 맞춘다.
+_CALIB_WINDOW_DAYS = 90
+# 요청 제안값과 서버 재계산 제안값의 허용 오차(bp). 반올림(2자리) 여유.
+_CALIB_MATCH_TOL_BPS = 0.5
+
+
+class SlippageCalibrationApply(BaseModel):
+    """슬리피지 캘리브레이션 승인 요청 바디."""
+
+    proposed_bps: float = Field(
+        ..., ge=0, le=1000, description="반영할 slippage_bps(서버가 재계산한 제안값과 대조 검증)"
+    )
+
+
+@router.post(
+    "/slippage-calibration/{strategy_id}/apply",
+    summary="슬리피지 캘리브레이션 제안 승인·반영",
+    description=(
+        "체결 정합 실측(M1)을 근거로 산출한 slippage_bps 제안을 사람이 승인해 전략 config 에 "
+        "반영한다. 자동 반영은 없다. 서버가 최신 리포트로 제안값을 재계산해 요청값과 대조하며, "
+        "제안이 없거나(표본 부족·유의 변화 없음) 값이 불일치하면 409 로 거절한다."
+    ),
+)
+async def apply_slippage_calibration_route(
+    strategy_id: int,
+    payload: SlippageCalibrationApply,
+    current: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """제안을 승인해 전략 config 의 slippage_bps 를 갱신한다(본인 소유만)."""
+    return await apply_slippage_calibration(
+        db, current.id,
+        strategy_id=strategy_id,
+        proposed_bps=payload.proposed_bps,
+        actor=current.email,
+    )
+
+
+async def apply_slippage_calibration(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    strategy_id: int,
+    proposed_bps: float,
+    actor: str,
+    window_days: int = _CALIB_WINDOW_DAYS,
+) -> dict[str, Any]:
+    """슬리피지 캘리브레이션 제안을 검증·반영한다(HTTP 비의존, 라우트가 위임).
+
+    최신 정합 리포트로 제안을 재계산해(사람이 오래된/조작된 값을 밀어 넣지 못하도록) 요청
+    값과 대조한 뒤, 일치하면 Strategy.config 의 slippage_bps 를 갱신하고 감사 로그를 남긴다.
+    """
+    strat = await db.scalar(
+        select(Strategy).where(Strategy.id == strategy_id, Strategy.user_id == user_id)
+    )
+    if strat is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "전략을 찾을 수 없습니다.")
+
+    d_to = datetime.now(KST).date()
+    d_from = d_to - timedelta(days=window_days)
+    report = await compute_fill_quality_report(
+        db, user_id, d_from=d_from, d_to=d_to, strategy_id=strategy_id,
+    )
+    proposal = propose_slippage_calibration(report)
+    if proposal is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "현재 반영할 슬리피지 캘리브레이션 제안이 없습니다(표본 부족 또는 유의 변화 없음).",
+        )
+    if abs(proposal.proposed_bps - float(proposed_bps)) > _CALIB_MATCH_TOL_BPS:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"제안값 불일치: 최신 제안은 {proposal.proposed_bps}bp 입니다"
+            f"(요청 {proposed_bps}bp). 다시 확인 후 승인하세요.",
+        )
+
+    cfg = dict(strat.config or {})
+    old_bps = float(cfg.get("slippage_bps", DEFAULT_SLIP_BPS) or DEFAULT_SLIP_BPS)
+    # JSONB 는 새 dict 재할당으로 변경을 추적하게 한다(전략 수정 API 와 동일 패턴).
+    cfg["slippage_bps"] = proposal.proposed_bps
+    strat.config = cfg
+    await db.commit()
+    await db.refresh(strat)
+
+    # 감사 로그: 이전값→신규값·승인자·근거(실측 중앙값·표본)를 남긴다.
+    logger.info(
+        "슬리피지 캘리브레이션 반영: 전략 %s slippage_bps %.2f→%.2f "
+        "(승인자=%s, 실측 중앙값 %.2fbp, 표본 %d, 클램프=%s)",
+        strategy_id, old_bps, proposal.proposed_bps, actor,
+        proposal.observed_median_bps, proposal.sample_size, proposal.clamped,
+    )
+    return {
+        "strategy_id": strategy_id,
+        "previous_bps": old_bps,
+        "applied_bps": proposal.proposed_bps,
+        "observed_median_bps": proposal.observed_median_bps,
+        "sample_size": proposal.sample_size,
+        "clamped": proposal.clamped,
+        "reason": proposal.reason,
+    }
 
 
 async def compute_fill_quality_report(
