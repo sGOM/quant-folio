@@ -1,5 +1,11 @@
+from app.services.backtest.deflated_sharpe import analyze_backtest_dsr
 from app.services.backtest.engine import run_backtest
 from app.services.backtest.portfolio import run_rebalance_backtest
 from app.services.backtest.signals import sma_crossover_signals
 
-__all__ = ["run_backtest", "run_rebalance_backtest", "sma_crossover_signals"]
+__all__ = [
+    "run_backtest",
+    "run_rebalance_backtest",
+    "sma_crossover_signals",
+    "analyze_backtest_dsr",
+]
