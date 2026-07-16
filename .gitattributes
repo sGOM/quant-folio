@@ -1,0 +1,2 @@
+# 셸 스크립트는 Windows 체크아웃에서도 항상 LF 유지(CRLF면 셔뱅 라인이 깨져 Linux/cron에서 실행 실패).
+*.sh text eol=lf
