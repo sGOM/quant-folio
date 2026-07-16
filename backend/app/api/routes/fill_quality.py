@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from datetime import date, datetime, time, timedelta
 from typing import Annotated, Any
 
@@ -172,12 +173,16 @@ async def get_fill_quality(
         if strat is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "전략을 찾을 수 없습니다.")
 
-    return await compute_fill_quality_report(
+    report = await compute_fill_quality_report(
         db, current.id,
         d_from=d_from, d_to=d_to, strategy_id=strategy_id,
         annual_turnover=annual_turnover, capital=capital,
         min_sample=min_sample, detail=detail,
     )
+    # 읽기 전용 제안: config 는 변경하지 않는다(실제 반영은 apply 라우트만).
+    proposal = propose_slippage_calibration(report, min_sample=min_sample)
+    report["calibration"] = asdict(proposal) if proposal is not None else None
+    return report
 
 
 # 캘리브레이션 제안 산출 시 되돌아보는 창(일). B-2 배치·GET 리포트 기본과 맞춘다.

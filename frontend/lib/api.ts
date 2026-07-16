@@ -9,6 +9,20 @@ const API_BASE =
 export const API_BASE_URL = API_BASE;
 
 /**
+ * HTTP 상태 코드를 보존하는 에러. 대부분의 호출부는 `.message` 만 보면 되지만,
+ * 409(충돌) 처럼 상태 코드로 분기해야 하는 흐름(예: 슬리피지 캘리브레이션 승인 시
+ * 리포트가 그새 갱신돼 제안이 달라진 경우)에서 `instanceof ApiError` 로 구분한다.
+ */
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+/**
  * FastAPI 에러 응답(detail)을 사람이 읽을 수 있는 메시지로 변환한다.
  * 422 검증 오류는 detail 이 [{loc, msg, ...}] 배열이므로 msg 들을 결합한다.
  * @param detail 응답 본문의 detail 필드(문자열 또는 검증오류 배열)
@@ -49,7 +63,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (res.status === 204) return undefined as T;
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(formatError(body?.detail, res.status));
+    throw new ApiError(formatError(body?.detail, res.status), res.status);
   }
   return res.json() as Promise<T>;
 }
@@ -956,6 +970,38 @@ export interface FillQualityReport {
     strategy_id: number | null;
     turnover_estimated: boolean;
   };
+  /**
+   * 사람이 승인 가능한 slippage_bps 재조정 제안(읽기 전용, config 는 자동 변경되지
+   * 않는다). 표본 부족·유의 변화 없음이면 null — UI 는 이 경우 섹션 자체를 숨긴다.
+   */
+  calibration: CalibrationProposal | null;
+}
+
+/** GET /api/backtest/fill-quality 응답에 포함되는 슬리피지 캘리브레이션 제안. */
+export interface CalibrationProposal {
+  /** 전략 config 에 현재 반영돼 있는 slippage_bps. */
+  current_bps: number;
+  /** 실측 근거로 산출한 신규 제안 bps(클램프 적용 후 값). */
+  proposed_bps: number;
+  /** 실측 M1 실행 슬리피지 중앙값(bp). */
+  observed_median_bps: number;
+  /** 제안 산출에 쓰인 표본 수(방향별 min_sample 이상). */
+  sample_size: number;
+  /** 극단값 방지 클램프가 적용됐는지 여부. */
+  clamped: boolean;
+  /** 제안 근거·클램프 사유 등 설명 문구. */
+  reason: string;
+}
+
+/** POST /api/backtest/slippage-calibration/{strategy_id}/apply 응답. */
+export interface SlippageCalibrationApplyResult {
+  strategy_id: number;
+  previous_bps: number;
+  applied_bps: number;
+  observed_median_bps: number;
+  sample_size: number;
+  clamped: boolean;
+  reason: string;
 }
 
 export interface OrderRow {
@@ -1257,6 +1303,24 @@ export const api = {
       `/api/backtest/fill-quality?days=${days}${
         strategyId !== undefined ? `&strategy_id=${strategyId}` : ""
       }`,
+    ),
+
+  /**
+   * 체결 정합 실측을 근거로 산출된 슬리피지 캘리브레이션 제안을 승인·반영한다.
+   * 서버가 최신 리포트로 제안값을 재계산해 대조하므로, 화면에 보이던 값이 오래돼
+   * 최신 제안과 어긋나면(리포트가 그새 갱신됨) 409 를 던진다 — 이 경우 리포트를
+   * 다시 불러온 뒤 재시도해야 한다.
+   * @param strategyId  반영 대상 전략 id
+   * @param proposedBps 승인할 slippage_bps(리포트의 calibration.proposed_bps)
+   * @throws Error 전략 미존재(404) 또는 제안 불일치·표본 부족(409) 시
+   */
+  applySlippageCalibration: (strategyId: number, proposedBps: number) =>
+    request<SlippageCalibrationApplyResult>(
+      `/api/backtest/slippage-calibration/${strategyId}/apply`,
+      {
+        method: "POST",
+        body: JSON.stringify({ proposed_bps: proposedBps }),
+      },
     ),
 
   // --- 종목 검색 ---

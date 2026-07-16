@@ -17,12 +17,14 @@ import {
 } from "lucide-react";
 import {
   api,
+  ApiError,
   Strategy,
   BROKER_INFO,
   type Broker,
   type OrderRow,
   type StrategyHealth,
   type FillQualityReport,
+  type CalibrationProposal,
 } from "@/lib/api";
 import { Nav } from "@/components/Nav";
 import { RequireAuth } from "@/components/RequireAuth";
@@ -120,6 +122,11 @@ function MonitorContent() {
   const qc = useQueryClient();
   const [log, setLog] = useState<LogEntry[]>([]);
   const logSeq = useRef(0);
+  // 체결 정합 리포트 대상 전략. undefined="전체"(계정 통합) — 슬리피지 캘리브레이션은
+  // 전략별 config 를 바꾸는 조치라, 특정 전략을 골랐을 때만 승인 UI 를 노출한다.
+  const [fillQualityStrategyId, setFillQualityStrategyId] = useState<number | undefined>(
+    undefined,
+  );
 
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const strategies = useQuery({ queryKey: ["strategies"], queryFn: api.listStrategies });
@@ -163,8 +170,8 @@ function MonitorContent() {
   // 체결 정합 실측(P2-3, D-2) — 최근 90일 실거래 체결이 백테스트 슬리피지 가정과
   // 얼마나 어긋나는지. 매매가 드문 계정은 표본 부족(INSUFFICIENT)이 정상 경로.
   const fillQuality = useQuery({
-    queryKey: ["fill-quality"],
-    queryFn: () => api.getFillQuality(90),
+    queryKey: ["fill-quality", fillQualityStrategyId ?? "all"],
+    queryFn: () => api.getFillQuality(90, fillQualityStrategyId),
     staleTime: 5 * 60 * 1000,
   });
 
@@ -289,13 +296,35 @@ function MonitorContent() {
         </section>
 
         <section className="mt-8">
-          <h2 className="mb-2 text-sm font-medium text-muted-foreground">
-            체결 정합 실측 (최근 90일)
-          </h2>
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-medium text-muted-foreground">
+              체결 정합 실측 (최근 90일)
+            </h2>
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              대상 전략
+              <select
+                value={fillQualityStrategyId ?? "all"}
+                onChange={(e) =>
+                  setFillQualityStrategyId(
+                    e.target.value === "all" ? undefined : Number(e.target.value),
+                  )
+                }
+                className="h-8 rounded-md border border-input bg-transparent px-2 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              >
+                <option value="all">전체(계정 통합)</option>
+                {strategies.data?.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
           <FillQualityPanel
             data={fillQuality.data}
             isLoading={fillQuality.isLoading}
             isError={fillQuality.isError}
+            strategyId={fillQualityStrategyId}
           />
         </section>
 
@@ -794,10 +823,13 @@ function FillQualityPanel({
   data,
   isLoading,
   isError,
+  strategyId,
 }: {
   data?: FillQualityReport;
   isLoading: boolean;
   isError: boolean;
+  /** 선택된 전략(전체 보기면 undefined) — 슬리피지 캘리브레이션 승인 대상. */
+  strategyId?: number;
 }) {
   if (isLoading) {
     return <p className="text-sm text-muted-foreground">체결 정합 조회 중…</p>;
@@ -857,7 +889,95 @@ function FillQualityPanel({
         표본이 {data.sample.min_sample}건 미만인 방향은 &quot;표본 부족&quot;으로 판정을
         보류한다 — 과최적화 방어 통계와 같은 원칙(보일 때만 행동을 바꾼다).
       </p>
+      {data.calibration && (
+        <SlippageCalibrationBanner calibration={data.calibration} strategyId={strategyId} />
+      )}
     </Card>
+  );
+}
+
+/**
+ * 슬리피지 캘리브레이션 승인 배너. 실측 중앙값 기반 제안(bp)을 보여주고, 사람이
+ * 확인 후 승인하면 전략 config 의 slippage_bps 를 갱신한다(자동 반영 없음).
+ * 전체 보기(strategyId undefined)에서는 반영 대상 전략이 모호하므로 승인 버튼을
+ * 숨기고 "전략을 선택하라"는 안내만 보여준다.
+ */
+function SlippageCalibrationBanner({
+  calibration,
+  strategyId,
+}: {
+  calibration: CalibrationProposal;
+  strategyId?: number;
+}) {
+  const qc = useQueryClient();
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const apply = useMutation({
+    mutationFn: () => {
+      if (strategyId === undefined) {
+        throw new Error("전략을 선택한 뒤 승인할 수 있습니다.");
+      }
+      return api.applySlippageCalibration(strategyId, calibration.proposed_bps);
+    },
+    onSuccess: (res) => {
+      setNotice(
+        `반영 완료: slippage_bps ${res.previous_bps}bp → ${res.applied_bps}bp (표본 ${res.sample_size}건)`,
+      );
+      qc.invalidateQueries({ queryKey: ["fill-quality"] });
+      qc.invalidateQueries({ queryKey: ["strategies"] });
+    },
+    onError: (err) => {
+      if (err instanceof ApiError && err.status === 409) {
+        setNotice("리포트가 갱신되어 제안이 달라졌습니다. 새로고침 후 다시 시도하세요.");
+        qc.invalidateQueries({ queryKey: ["fill-quality"] });
+        return;
+      }
+      setNotice(err instanceof Error ? err.message : "반영에 실패했습니다.");
+    },
+  });
+
+  const handleApply = () => {
+    if (strategyId === undefined) return;
+    const ok = window.confirm(
+      `전략의 slippage_bps 를 ${calibration.current_bps}bp → ${calibration.proposed_bps}bp 로 ` +
+        `변경합니다(실측 중앙값 ${calibration.observed_median_bps.toFixed(1)}bp, 표본 ` +
+        `${calibration.sample_size}건). 계속하시겠습니까?`,
+    );
+    if (!ok) return;
+    setNotice(null);
+    apply.mutate();
+  };
+
+  return (
+    <div className="rounded-md border border-dashed border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+      <p className="font-medium text-foreground">
+        슬리피지 캘리브레이션 제안: 현재 {calibration.current_bps}bp → 제안{" "}
+        {calibration.proposed_bps}bp (표본 {calibration.sample_size}건)
+        {calibration.clamped && " · 클램프 적용됨"}
+      </p>
+      <p className="mt-1 text-muted-foreground">{calibration.reason}</p>
+      {strategyId === undefined ? (
+        <p className="mt-2 text-muted-foreground">
+          승인하려면 위 &quot;대상 전략&quot;에서 특정 전략을 선택하세요.
+        </p>
+      ) : (
+        <div className="mt-2 flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleApply}
+            disabled={apply.isPending}
+          >
+            {apply.isPending ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              "제안 적용"
+            )}
+          </Button>
+        </div>
+      )}
+      {notice && <p className="mt-2 text-foreground">{notice}</p>}
+    </div>
   );
 }
 
