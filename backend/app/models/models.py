@@ -223,6 +223,11 @@ class Execution(Base):
     order_id: Mapped[int] = mapped_column(
         ForeignKey("orders.id", ondelete="CASCADE"), index=True, nullable=False
     )
+    # 비정규화 컬럼 — 전략별 체결 이력을 order 조인 없이 직접 조회하기 위한 것.
+    # 쓰기 시 order.strategy_id 에서 그대로 채운다(전략 삭제 시 SET NULL).
+    strategy_id: Mapped[int | None] = mapped_column(
+        ForeignKey("strategies.id", ondelete="SET NULL"), index=True, nullable=True
+    )
     filled_qty: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
     filled_price: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
     fee: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0"), nullable=False)
@@ -256,12 +261,24 @@ class PriceTick(Base):
 class Position(Base):
     __tablename__ = "positions"
     __table_args__ = (
-        UniqueConstraint("user_id", "symbol", name="uq_positions_user_symbol"),
+        # 다중 전략 포지션 분리: 같은 종목을 두 전략이 동시에 보유해도 포지션이 섞이지
+        # 않도록 (user_id, strategy_id, symbol) 단위로 유일성을 강제한다.
+        # 주의: Postgres 는 nullable 컬럼을 포함한 UNIQUE 제약에서 NULL 을 서로 다른
+        # 값으로 취급한다(NULL != NULL). 즉 strategy_id=NULL 인 비귀속(레거시·수동)
+        # 포지션은 동일 (user_id, symbol) 에 대해 여러 행이 존재할 수 있으며, 이는
+        # 의도된 동작이다 — 자동매매 엔진이 소유하지 않는 포지션은 사람이 직접 관리한다.
+        UniqueConstraint(
+            "user_id", "strategy_id", "symbol", name="uq_positions_user_strategy_symbol"
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    # 이 포지션을 소유한 전략(자동매매 러너). 수동·레거시 포지션은 NULL(비귀속).
+    strategy_id: Mapped[int | None] = mapped_column(
+        ForeignKey("strategies.id", ondelete="SET NULL"), index=True, nullable=True
     )
     symbol: Mapped[str] = mapped_column(String(20), nullable=False)
     qty: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0"), nullable=False)
