@@ -99,6 +99,7 @@ async def execute_signal(
         try:
             res = await broker.place_order(symbol, side, qty, price=0, order_type="market")
             order.kis_order_id = res.order_id
+            order.kis_order_org_no = res.order_org_no
             order.status = OrderStatus.SUBMITTED
         except BrokerError as e:
             order.status = OrderStatus.REJECTED

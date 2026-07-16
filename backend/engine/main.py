@@ -27,6 +27,7 @@ from app.models import Strategy, StrategyStatus, User
 from app.services.broker import resolve_credentials
 from app.services.live_gate import evaluate_live_gate
 from engine.alerts import publish_alert
+from engine.fill_notice import FillNoticeManager
 from engine.price_feed import PriceFeedManager
 from engine.rebalance_runner import RebalanceRunner
 from engine.runner import StrategyRunner
@@ -47,6 +48,7 @@ socket.setdefaulttimeout(30)
 _shutdown = asyncio.Event()           # 그레이스풀 셧다운 신호
 _runners: dict[int, dict] = {}        # strategy_id -> {task, stop} 실행 중 전략 러너
 _feed_mgr = PriceFeedManager(redis_client)  # 사용자별 실시간 시세 피드 관리자
+_fill_notice_mgr = FillNoticeManager(redis_client)  # 사용자별 실시간 체결통보 리스너
 
 
 def _handle_signal(*_args) -> None:
@@ -119,6 +121,7 @@ async def _start_strategy(strategy_id: int) -> None:
     await redis_client.sadd(ACTIVE_STRATEGIES_KEY, strategy_id)
     logger.info("전략 %d start", strategy_id)
     await _sync_feeds()
+    await _sync_fill_notices()
 
 
 async def _stop_strategy(strategy_id: int) -> None:
@@ -136,6 +139,7 @@ async def _stop_strategy(strategy_id: int) -> None:
     await redis_client.srem(ACTIVE_STRATEGIES_KEY, strategy_id)
     logger.info("전략 %d stop", strategy_id)
     await _sync_feeds()
+    await _sync_fill_notices()
 
 
 async def _sync_feeds() -> None:
@@ -174,6 +178,46 @@ async def _sync_feeds() -> None:
             await _feed_mgr.ensure(uid, info["app_key"], info["app_secret"], info["symbols"])
         except Exception:  # noqa: BLE001
             logger.exception("PriceFeed ensure 실패 user=%d", uid)
+
+
+async def _sync_fill_notices() -> None:
+    """활성 전략을 가진 사용자(계좌) 집합에 맞춰 체결통보 리스너를 동기화한다.
+
+    체결통보는 종목이 아니라 계좌 단위 구독이므로, 같은 사용자가 여러 전략을
+    동시에 live 로 돌려도 구독은 1개만 유지한다(PriceFeedManager 의 사용자별 1피드
+    구조와 동일한 아이디어 — 여기서는 종목 집합 대신 '해당 사용자가 여전히 live
+    전략을 가지고 있는가'만 본다).
+    """
+    if not _runners:
+        await _fill_notice_mgr.shutdown()
+        return
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(Strategy, User)
+            .join(User, User.id == Strategy.user_id)
+            .where(Strategy.id.in_(list(_runners.keys())))
+        )
+        user_creds: dict[int, tuple[str, str]] = {}
+        for strategy, user in rows.all():
+            resolved = resolve_credentials(user)  # DB 우선, .env 폴백
+            if resolved is None:
+                continue
+            broker, app_key, app_secret, _account = resolved
+            # 토스 등 체결통보 WS 미지원 브로커는 구독하지 않는다.
+            if broker != "kis":
+                continue
+            user_creds[user.id] = (app_key, app_secret)
+
+    desired = set(user_creds)
+    current = _fill_notice_mgr.active_users()
+    for uid in current - desired:
+        await _fill_notice_mgr.remove(uid)
+    for uid in desired - current:
+        app_key, app_secret = user_creds[uid]
+        try:
+            await _fill_notice_mgr.ensure(uid, app_key, app_secret)
+        except Exception:  # noqa: BLE001
+            logger.exception("FillNotice ensure 실패 user=%d", uid)
 
 
 async def _control_loop() -> None:
@@ -247,6 +291,26 @@ async def _reconcile_loop() -> None:
             pass
 
 
+_FILL_NOTICE_RESYNC_INTERVAL = 60  # 초 — _start_strategy/_stop_strategy 즉시 동기화의 안전망
+
+
+async def _fill_notice_loop() -> None:
+    """체결통보 리스너 구독 상태를 주기적으로 재동기화한다(자기 치유 안전망).
+
+    _start_strategy/_stop_strategy 가 즉시 _sync_fill_notices 를 호출하지만,
+    자격증명 갱신 등으로 어긋난 경우를 대비해 주기적으로도 맞춘다.
+    """
+    while not _shutdown.is_set():
+        try:
+            await _sync_fill_notices()
+        except Exception:  # noqa: BLE001
+            logger.exception("체결통보 재동기화 루프 오류")
+        try:
+            await asyncio.wait_for(_shutdown.wait(), timeout=_FILL_NOTICE_RESYNC_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def main() -> None:
     """엔진 메인 루프 — 신호 핸들러 등록, live 전략 복구, 제어/하트비트 태스크 구동 후
     종료 신호를 받으면 전략·피드를 정리하고 종료한다."""
@@ -266,6 +330,7 @@ async def main() -> None:
         asyncio.create_task(_control_loop()),
         asyncio.create_task(_heartbeat_loop()),
         asyncio.create_task(_reconcile_loop()),
+        asyncio.create_task(_fill_notice_loop()),
     ]
     await _shutdown.wait()
 
@@ -273,6 +338,7 @@ async def main() -> None:
     for sid in list(_runners.keys()):
         await _stop_strategy(sid)
     await _feed_mgr.shutdown()
+    await _fill_notice_mgr.shutdown()
     for t in tasks:
         t.cancel()
     await redis_client.aclose()
