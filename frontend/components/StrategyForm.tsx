@@ -839,12 +839,12 @@ function RebalanceFields({
     patch({ risk_layer: { ...risk, ...p } } as Partial<StrategyConfig>);
   }
   /** 리스크 레이어의 optional 비율(0~1) 필드를 퍼센트 문자열로. 미설정이면 "". */
-  function riskPct(key: "max_position_pct" | "target_vol" | "mdd_kill_pct"): string {
+  function riskPct(key: "max_position_pct" | "max_sector_pct" | "target_vol" | "mdd_kill_pct"): string {
     const v = risk?.[key];
     return v === null || v === undefined ? "" : String(Number((v * 100).toFixed(4)));
   }
   /** 퍼센트 입력 → 비율(0~1) 저장. 빈 값이면 null(해당 통제 비활성). */
-  function setRiskPct(key: "max_position_pct" | "target_vol" | "mdd_kill_pct", raw: string) {
+  function setRiskPct(key: "max_position_pct" | "max_sector_pct" | "target_vol" | "mdd_kill_pct", raw: string) {
     if (raw.trim() === "") {
       patchRisk({ [key]: null } as Partial<NonNullable<RebalanceConfig["risk_layer"]>>);
       return;
@@ -1267,6 +1267,11 @@ function RebalanceFields({
                 onChange={(v) => setRiskPct("max_position_pct", v)}
               />
               <PctField
+                label="섹터 집중 한도 %"
+                value={riskPct("max_sector_pct")}
+                onChange={(v) => setRiskPct("max_sector_pct", v)}
+              />
+              <PctField
                 label="목표 변동성 % (연)"
                 value={riskPct("target_vol")}
                 onChange={(v) => setRiskPct("target_vol", v)}
@@ -1306,8 +1311,10 @@ function RebalanceFields({
               )}
             </div>
             <p className="text-[11px] leading-relaxed text-muted-foreground">
-              <b className="text-muted-foreground">집중 한도</b>는 드리프트 밴드(
+              <b className="text-muted-foreground">종목 집중 한도</b>는 드리프트 밴드(
               {Number((config.drift_band_pct * 100).toFixed(2))}%)보다 커야 진입이 발생합니다.
+              <b className="text-muted-foreground"> 섹터 집중 한도</b>는 업종 합산 비중을 제한하며
+              (KRX 업종 매핑 조회 실패 시 조용히 미적용),
               <b className="text-muted-foreground"> 변동성 타겟팅</b>은 실현변동성이 목표를 넘으면
               투자비중을 줄이며(차입 없음, 확대는 안 함), <b className="text-muted-foreground">킬스위치</b>는
               고점 대비 낙폭이 임계를 넘으면 전량 청산 후 쿨다운 뒤 재가동합니다.
