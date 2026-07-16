@@ -5,15 +5,16 @@
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import socket
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -229,3 +230,46 @@ async def get_volume_series(
     return pd.Series(
         [float(r[1]) if r[1] is not None else 0.0 for r in rows], index=idx, name=symbol
     )
+
+
+# 주말·공휴일 등으로 인접 거래일이 며칠 비어도 '진짜 결측'으로 오판하지 않기 위한 여유.
+# 최장 연휴(설·추석 등)를 감안해 5일로 잡는다.
+_COVERAGE_GRACE_DAYS = 5
+
+
+async def ensure_ohlcv_coverage(
+    db: AsyncSession, symbol: str, start: datetime, end: datetime
+) -> None:
+    """price_ticks 가 [start,end] 구간을 커버하도록 부족분만 외부 소스로 보충한다(C-1).
+
+    데이터가 아예 없으면 전체 구간을, 있으면 머리(더 과거로 확장된 백테스트 구간)·꼬리
+    (야간 배치 이후 새로 생긴 최근 거래일)만 골라 채운다 — 매번 전체 구간을 재조회하던
+    기존 방식보다 훨씬 가볍고, 반복 백테스트가 이미 적재된 로컬 데이터를 그대로 재사용하게
+    한다. 외부 조회 실패는 로그만 남기고 조용히 넘어간다(호출자는 이후 조회에서 있는 만큼만
+    쓰게 되며, 완전 실패 시 기존 '해당 기간 시세가 없습니다' 422 로 자연스럽게 이어진다).
+    """
+    result = await db.execute(
+        select(func.min(PriceTick.time), func.max(PriceTick.time))
+        .where(PriceTick.symbol == symbol)
+        .where(PriceTick.time >= start)
+        .where(PriceTick.time <= end)
+    )
+    mn, mx = result.one()
+
+    grace = timedelta(days=_COVERAGE_GRACE_DAYS)
+    gaps: list[tuple[date, date]] = []
+    if mn is None:
+        gaps.append((start.date(), end.date()))
+    else:
+        if mn.date() > start.date() + grace:
+            gaps.append((start.date(), mn.date()))
+        if mx.date() < end.date() - grace:
+            gaps.append((mx.date(), end.date()))
+
+    for gap_start, gap_end in gaps:
+        try:
+            df = await asyncio.to_thread(load_ohlcv, symbol, gap_start, gap_end)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("%s 구간 보충 실패(%s~%s): %s", symbol, gap_start, gap_end, e)
+            continue
+        await upsert_price_ticks(db, symbol, df)
