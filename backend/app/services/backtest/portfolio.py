@@ -681,6 +681,14 @@ def run_rebalance_backtest(
     # 섹터 집중 한도(max_sector_pct)용 종목→업종 매핑을 백테스트 전체에서 1회만 조회해
     # config 에 실어 _targets_at → _apply_risk_caps 로 흘려보낸다(업종 분류는 사실상 정적).
     # 소스 미확보(빈 dict)면 _apply_risk_caps 가 섹터 캡을 조용히 미적용한다.
+    #
+    # PIT 한계(C-2, 확인됨·미해결): KRX MDC 는 '현재 시점' 업종분류만 제공하고 과거 임의
+    # 시점의 분류를 조회하는 API 가 없다. 즉 이 매핑을 수년치 백테스트 전 구간에 동일하게
+    # 소급 적용하는 약한 look-ahead 가 있다(업종 재편·이전 상장 종목의 과거 실제 분류와
+    # 다를 수 있음). 섹터 '한도'(비중 상한) 용도라 왜곡은 제한적이고(전략 id 관리 규약의
+    # PIT 원칙은 종목 선정·팩터 계산에 적용되는 원칙이며 이 캡은 그 위에 얹는 보조 장치),
+    # 별도 과거 스냅샷 데이터 소스가 없어 근본 해결은 보류한다.
+
     if risk_layer.get("max_sector_pct") and not config.get("_sector_map"):
         from app.services.data.krx_index import sector_map as _sector_map_fn
 
