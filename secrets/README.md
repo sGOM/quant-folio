@@ -20,6 +20,8 @@ docker compose 가 이 파일들을 `/run/secrets/*`(tmpfs)로 마운트하고, 
 | `krx_id.txt` | (선택) KRX 데이터 포털 로그인 ID | 지표 화면용. 미사용 시 빈 파일 |
 | `krx_pw.txt` | (선택) KRX 데이터 포털 비밀번호 | 지표 화면용. 미사용 시 빈 파일 |
 | `opendart_api_key.txt` | (선택) OpenDART 인증키 | 재무데이터용(준비/미배선). 미사용 시 빈 파일 |
+| `telegram_bot_token.txt` | (선택) 텔레그램 봇 토큰 | critical 알림 외부 발송용. 미사용 시 빈 파일 |
+| `telegram_chat_id.txt` | (선택) 텔레그램 채팅 ID | 봇 토큰과 함께 둘 다 설정해야 활성화. 미사용 시 빈 파일 |
 
 브로커 키 폴백을 쓰지 않고 앱(웹 UI)에서 사용자별로 등록한다면 브로커 파일들은
 빈 파일로 두면 됩니다(파일 자체는 존재해야 compose 가 기동됩니다).
@@ -37,6 +39,9 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 : > secrets/krx_id.txt; : > secrets/krx_pw.txt
 # OpenDART 재무데이터(준비/미배선). 무료 발급 https://opendart.fss.or.kr — 미사용 시 빈 파일
 : > secrets/opendart_api_key.txt
+# 텔레그램 critical 알림(선택). @BotFather 로 봇 생성 후 토큰 발급, 채팅 ID는
+# 봇과 대화 시작 후 https://api.telegram.org/bot<TOKEN>/getUpdates 로 확인 — 미사용 시 빈 파일
+: > secrets/telegram_bot_token.txt; : > secrets/telegram_chat_id.txt
 ```
 
 > 🔁 `credential_enc_key.txt` 를 교체하면 기존에 암호화 저장된 DB 자격증명을

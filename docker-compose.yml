@@ -14,6 +14,8 @@ x-backend-secret-env: &backend-secret-env
   KRX_ID_FILE: /run/secrets/krx_id
   KRX_PW_FILE: /run/secrets/krx_pw
   OPENDART_API_KEY_FILE: /run/secrets/opendart_api_key
+  TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+  TELEGRAM_CHAT_ID_FILE: /run/secrets/telegram_chat_id
 
 x-backend-secrets: &backend-secrets
   - secret_key
@@ -25,6 +27,8 @@ x-backend-secrets: &backend-secrets
   - krx_id
   - krx_pw
   - opendart_api_key
+  - telegram_bot_token
+  - telegram_chat_id
 
 services:
   db:
@@ -181,6 +185,10 @@ secrets:
     file: ./secrets/krx_pw.txt
   opendart_api_key:
     file: ./secrets/opendart_api_key.txt
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token.txt
+  telegram_chat_id:
+    file: ./secrets/telegram_chat_id.txt
 
 volumes:
   pgdata:
