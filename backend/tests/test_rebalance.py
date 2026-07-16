@@ -1623,3 +1623,172 @@ async def test_mdd_sell_reason_labels_kill(monkeypatch):
     assert "MDD 킬스위치" in kill
     regime = r._sell_reason("A", {}, risk_off=True, sell_qty=3, liq_kind="regime")
     assert "레짐 위험회피" in regime
+
+
+# ───────────────────── 체결 정밀도(P2-2): A-1 정수주 ─────────────────────
+
+
+def test_floor_to_shares_snaps_to_integer_quantity():
+    from app.services.backtest.portfolio import _floor_to_shares
+
+    prices = pd.Series({"A": 3000.0})
+    # 목표금액 10,000 원, 가격 3,000 원 → 3주(9,000원), 나머지 1,000원은 절사.
+    amt_norm = 10_000.0 / 1_000_000.0  # capital=1,000,000 기준 정규화 금액
+    aligned = _floor_to_shares(amt_norm, "A", prices, capital=1_000_000.0)
+    assert aligned == pytest.approx(9_000.0 / 1_000_000.0)
+
+
+def test_floor_to_shares_below_one_share_rounds_to_zero():
+    from app.services.backtest.portfolio import _floor_to_shares
+
+    prices = pd.Series({"A": 100_000.0})  # 고가주
+    amt_norm = 50_000.0 / 1_000_000.0  # 0.5주 분량 — 1주 미만
+    aligned = _floor_to_shares(amt_norm, "A", prices, capital=1_000_000.0)
+    assert aligned == 0.0
+
+
+def test_floor_to_shares_missing_price_passthrough():
+    from app.services.backtest.portfolio import _floor_to_shares
+
+    aligned = _floor_to_shares(0.1, "A", pd.Series({"B": 100.0}), capital=1_000_000.0)
+    assert aligned == 0.1  # 가격 없음 — 원본 그대로(방어적 폴백)
+
+
+def test_integer_shares_default_true_snaps_backtest_trades_to_whole_shares():
+    """소액 capital·고가주에서 기본(integer_shares=True) 백테스트는 거래대금이 정확히
+    정수주×가격이어야 한다(회귀: 연속 비중이면 임의의 소수점 금액이 나옴)."""
+    dates = pd.bdate_range("2024-01-01", periods=10)
+    # 고가주(30만원)와 저가주(1만원) 혼합 — 등비중 50% 씩, capital 100만원.
+    panel = pd.DataFrame({"HIGH": 300_000.0, "LOW": 10_000.0}, index=dates)
+    cfg = {
+        "universe": ["HIGH", "LOW"],
+        "selection": {"method": "all"},
+        "cadence": "monthly",
+        "rebalance_dom": 1,
+        "capital": 1_000_000,
+        "drift_band_pct": 0.0,
+        "fill_mode": "same_close",
+        "fees": 0.0,
+        "tax": 0.0,
+        "slippage_bps": 0.0,
+    }
+    res = run_rebalance_backtest(panel, cfg, dates[0], dates[-1])
+    buys = [t for t in res["trades"] if t["side"] == "buy"]
+    assert buys  # 최초 매수가 있어야 함
+    for t in buys:
+        price = 300_000.0 if t["symbol"] == "HIGH" else 10_000.0
+        qty = t["amount"] / price
+        assert qty == pytest.approx(round(qty), abs=1e-6), (
+            f"{t['symbol']} 거래대금 {t['amount']} 이 정수주 배수가 아님(가격 {price})"
+        )
+
+
+def test_integer_shares_false_allows_fractional_amounts():
+    """integer_shares=False(구 동작)면 연속 비중이라 정수주 제약이 없다."""
+    dates = pd.bdate_range("2024-01-01", periods=10)
+    panel = pd.DataFrame({"HIGH": 333_333.0, "LOW": 10_000.0}, index=dates)
+    cfg = {
+        "universe": ["HIGH", "LOW"],
+        "selection": {"method": "all"},
+        "cadence": "monthly",
+        "rebalance_dom": 1,
+        "capital": 1_000_000,
+        "drift_band_pct": 0.0,
+        "fill_mode": "same_close",
+        "fees": 0.0,
+        "tax": 0.0,
+        "slippage_bps": 0.0,
+        "integer_shares": False,
+    }
+    res = run_rebalance_backtest(panel, cfg, dates[0], dates[-1])
+    buys = [t for t in res["trades"] if t["symbol"] == "HIGH" and t["side"] == "buy"]
+    assert buys
+    qty = buys[0]["amount"] / 333_333.0
+    assert abs(qty - round(qty)) > 1e-6  # 정수주가 아님 — 연속비중 그대로
+
+
+# ───────────────────── 체결 정밀도(P2-2): A-2 ADV 참여율 캡 ─────────────────────
+
+
+def test_apply_adv_cap_limits_to_participation_fraction():
+    from app.services.backtest.portfolio import _apply_adv_cap
+
+    adv_map = pd.Series({"A": 1_000_000.0})  # ADV 100만원
+    capital = 1_000_000.0
+    # 목표 거래대금 50만원(정규화 0.5), 참여율 10% → 상한 10만원(정규화 0.1).
+    capped = _apply_adv_cap(0.5, "A", adv_map, adv_cap_frac=0.10, capital=capital)
+    assert capped == pytest.approx(100_000.0 / capital)
+
+
+def test_apply_adv_cap_no_effect_when_under_cap():
+    from app.services.backtest.portfolio import _apply_adv_cap
+
+    adv_map = pd.Series({"A": 10_000_000.0})
+    capped = _apply_adv_cap(0.05, "A", adv_map, adv_cap_frac=0.10, capital=1_000_000.0)
+    assert capped == pytest.approx(0.05)  # 상한(100만원) 미만이라 그대로
+
+
+def test_apply_adv_cap_missing_symbol_passthrough():
+    from app.services.backtest.portfolio import _apply_adv_cap
+
+    capped = _apply_adv_cap(0.3, "MISSING", pd.Series({"A": 1.0}), adv_cap_frac=0.1, capital=1e6)
+    assert capped == 0.3  # ADV 미확보 종목은 캡 미적용
+
+
+def test_run_rebalance_backtest_adv_cap_throttles_illiquid_entry():
+    """유동성 부족(ADV 낮음) 종목의 신규 편입이 참여율 캡으로 여러 날에 걸쳐 분할된다.
+
+    20일 ADV rolling(min_periods=10)이 확정되기 전(예: 첫 거래일)에는 ADV 신호가 없어
+    캡이 적용되지 않는다(알려진 한계) — 그래서 sim_start 를 30 거래일 지난 시점으로 두어
+    첫 리밸런싱 시점에 이미 ADV 가 확정돼 있게 한다.
+    """
+    dates = pd.bdate_range("2024-01-01", periods=60)
+    price = pd.Series(10_000.0, index=dates)
+    panel = pd.DataFrame({"THIN": price, "CASH_PROXY": price})
+    # THIN 은 거래량이 극히 낮아(하루 10주=10만원) ADV 캡이 걸리고,
+    # CASH_PROXY 는 유동성 풍부(하루 100만주).
+    volume_panel = pd.DataFrame(
+        {"THIN": 10.0, "CASH_PROXY": 1_000_000.0}, index=dates
+    )
+    cfg = {
+        "universe": ["THIN", "CASH_PROXY"],
+        "selection": {"method": "all"},
+        "cadence": "monthly",
+        "rebalance_dom": 1,
+        "capital": 10_000_000,
+        "drift_band_pct": 0.0,
+        "fill_mode": "same_close",
+        "fees": 0.0,
+        "tax": 0.0,
+        "slippage_bps": 0.0,
+        "integer_shares": False,  # 정수주 절사와 분리해서 ADV 캡 효과만 본다
+        "adv_participation_cap": 0.10,  # ADV 10% 상한
+    }
+    res = run_rebalance_backtest(
+        panel, cfg, dates[30], dates[-1], volume_panel=volume_panel
+    )
+    thin_buys = [t for t in res["trades"] if t["symbol"] == "THIN" and t["side"] == "buy"]
+    assert thin_buys
+    # 목표 거래대금은 5,000,000원(등비중 절반)이지만, ADV(약 100,000원)의 10%=10,000원
+    # 로 캡돼 있어야 한다(대략적 근사 — rolling 평균이라 정확히 10,000은 아닐 수 있음).
+    assert thin_buys[0]["amount"] < 50_000.0
+
+
+def test_run_rebalance_backtest_adv_cap_noop_without_volume_panel(caplog):
+    """adv_participation_cap 이 설정돼도 volume_panel 이 없으면 경고만 남기고 미적용."""
+    dates = pd.bdate_range("2024-01-01", periods=10)
+    panel = pd.DataFrame({"A": 10_000.0, "B": 10_000.0}, index=dates)
+    cfg = {
+        "universe": ["A", "B"],
+        "selection": {"method": "all"},
+        "cadence": "monthly",
+        "rebalance_dom": 1,
+        "capital": 1_000_000,
+        "drift_band_pct": 0.0,
+        "fill_mode": "same_close",
+        "adv_participation_cap": 0.05,
+    }
+    with caplog.at_level("WARNING"):
+        res = run_rebalance_backtest(panel, cfg, dates[0], dates[-1])
+    assert "ADV" in caplog.text or "거래량" in caplog.text
+    assert res["num_trades"] > 0  # 캡 없이 정상 체결됨(미적용 확인)
