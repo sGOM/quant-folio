@@ -210,7 +210,9 @@ class BaseRunner:
         """현재 보유 수량을 반환한다(포지션 없으면 0)."""
         pos = await db.scalar(
             select(Position).where(
-                Position.user_id == self._user_id, Position.symbol == symbol
+                Position.user_id == self._user_id,
+                Position.strategy_id == self.strategy_id,
+                Position.symbol == symbol,
             )
         )
         return pos.qty if pos else Decimal("0")

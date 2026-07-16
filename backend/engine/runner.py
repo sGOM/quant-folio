@@ -233,7 +233,9 @@ class StrategyRunner(BaseRunner):
         """
         pos = await db.scalar(
             select(Position).where(
-                Position.user_id == self._user_id, Position.symbol == self._symbol
+                Position.user_id == self._user_id,
+                Position.strategy_id == self.strategy_id,
+                Position.symbol == self._symbol,
             )
         )
         if pos is None or pos.qty <= 0 or pos.avg_price <= 0:
@@ -282,7 +284,9 @@ class StrategyRunner(BaseRunner):
         """리스크 한도(RiskLimit.stop_loss_pct) 손절의 감사 로그 사유를 만든다."""
         pos = await db.scalar(
             select(Position).where(
-                Position.user_id == self._user_id, Position.symbol == self._symbol
+                Position.user_id == self._user_id,
+                Position.strategy_id == self.strategy_id,
+                Position.symbol == self._symbol,
             )
         )
         if pos and pos.avg_price and pos.avg_price > 0:

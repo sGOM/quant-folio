@@ -35,7 +35,11 @@ class OrderOut(BaseModel):
 
 
 async def _db_positions(db: AsyncSession, user_id: int) -> list[PositionOut]:
-    """로컬 DB(Position) 그림자 잔고. 브로커 조회 실패 시의 폴백."""
+    """로컬 DB(Position) 그림자 잔고. 브로커 조회 실패 시의 폴백.
+
+    사용자에게 보여줄 계좌 잔고는 전략에 무관한 전체 합산 뷰이므로 strategy_id 로
+    좁히지 않는다(다중 전략 분리는 엔진 내부 포지션 회계에만 적용).
+    """
     rows = await db.scalars(
         select(Position).where(Position.user_id == user_id, Position.qty > 0)
     )
