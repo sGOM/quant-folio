@@ -25,9 +25,11 @@ from app.core.channels import (
     engine_health_key,
     position_lock_key,
 )
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models import Position, Strategy, User
 from app.services.broker import BrokerClient, make_broker_for_user, user_has_credentials
+from app.services.live_gate import evaluate_live_gate
 from app.services.market import now_kst
 from engine.alerts import publish_alert
 from engine.executor import execute_signal, make_idempotency_key
@@ -221,6 +223,31 @@ class BaseRunner:
 
         :param reason: 감사 로그용 주문 사유(Order.reason 에 기록).
         """
+        # 실전(prod) 하드 게이트 — 실제 자금이 나가기 직전 마지막 방어. prod 일 때만
+        # 강제하고, 실패하면 주문을 막고 critical 알림을 보낸다(vts 는 게이트가 로깅만).
+        if not settings.is_paper_trading:
+            gate = await evaluate_live_gate(
+                db, self._user_id, self.strategy_id,
+                order_notional=Decimal(str(qty)) * price,
+            )
+            if not gate.passed:
+                self._logger.error(
+                    "실전 게이트 차단 — 주문 거부 %s %s %d주: %s",
+                    symbol, side, qty, "; ".join(gate.reasons),
+                )
+                await publish_alert(
+                    self.redis,
+                    user_id=self._user_id,
+                    strategy_id=self.strategy_id,
+                    severity="critical",
+                    code="live_gate_blocked",
+                    message=(
+                        f"실전 게이트 차단 — {symbol} {side} {qty:,}주 주문 거부. "
+                        f"사유: {'; '.join(gate.reasons)}"
+                    ),
+                )
+                return
+
         await execute_signal(
             db, self.redis, self._broker,
             user_id=self._user_id, strategy_id=self.strategy_id,
