@@ -31,6 +31,8 @@ docker compose logs -f web              # 로그
 
 # ⚠️ web/engine/worker는 코드 변경 시 자동 리로드 안 됨 → 재시작 필수
 docker compose restart web
+# 개발 중엔 docker-compose.override.yml 이 자동 병합되어 web 이 --reload 로 뜬다.
+# (운영 배포는 docker compose -f docker-compose.yml up -d --build 로 override 제외)
 
 # 백엔드 테스트 (컨테이너 안에서)
 docker compose exec web pytest

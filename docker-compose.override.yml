@@ -1,0 +1,12 @@
+# 개발 편의용 오버라이드 — docker compose 가 docker-compose.yml 과 자동 병합한다.
+#
+# 목적: web 코드를 고칠 때마다 `docker compose restart web` 을 반복하지 않도록
+# uvicorn --reload 를 켠다. 운영(24시간 자동매매) 프로파일은 파일 변경으로 인한
+# 의도치 않은 재시작을 막기 위해 --reload 를 쓰지 않으므로(docker-compose.yml:81
+# 주석 참고) 이 오버라이드로 개발 환경에서만 덮어쓴다.
+#
+# 운영 배포 시에는 이 파일이 자동 병합되지 않도록 `-f docker-compose.yml` 로
+# 파일을 명시해서 기동할 것(`docker compose -f docker-compose.yml up -d --build`).
+services:
+  web:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
