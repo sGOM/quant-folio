@@ -22,8 +22,12 @@ from app.services.backtest import (
     run_rebalance_backtest,
 )
 from app.services.backtest.signals import requires_ohlc
-from app.services.data import load_ohlcv, upsert_price_ticks
-from app.services.data.loader import get_close_series, get_ohlcv_frame, get_volume_series
+from app.services.data.loader import (
+    ensure_ohlcv_coverage,
+    get_close_series,
+    get_ohlcv_frame,
+    get_volume_series,
+)
 from app.services.market import KST
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,17 +59,9 @@ async def _run_single_symbol_backtest(
             return await get_ohlcv_frame(db, symbol, start_dt, end_dt)
         return await get_close_series(db, symbol, start_dt, end_dt)
 
-    # 1) price_ticks 확인, 없으면 적재
+    # 1) price_ticks 커버리지 확인, 부족한 만큼만 외부 소스로 보충(C-1 — 로컬 우선).
+    await ensure_ohlcv_coverage(db, symbol, start_dt, end_dt)
     series = await _fetch()
-    if series.empty:
-        try:
-            df = await run_in_threadpool(
-                load_ohlcv, symbol, req.period_start, req.period_end
-            )
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"데이터 적재 실패: {e}")
-        await upsert_price_ticks(db, symbol, df)
-        series = await _fetch()
 
     if series.empty:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "해당 기간 시세가 없습니다.")
@@ -241,17 +237,12 @@ async def _run_rebalance_backtest(
 
     warmup_dt = _to_dt(warmup_start)
 
-    # 각 종목 종가 시드(없으면 외부 적재 후 재조회)
+    # 각 종목 종가 시드 — price_ticks 커버리지 확인 후 부족한 만큼만 외부 소스로 보충
+    # (C-1 — 야간 배치로 이미 적재돼 있으면 외부 조회를 건너뛰어 반복 백테스트가 빨라진다).
     columns: dict[str, pd.Series] = {}
     for sym in universe:
+        await ensure_ohlcv_coverage(db, sym, warmup_dt, end_dt)
         series = await get_close_series(db, sym, warmup_dt, end_dt)
-        if series.empty:
-            try:
-                df = await run_in_threadpool(load_ohlcv, sym, warmup_start, req.period_end)
-                await upsert_price_ticks(db, sym, df)
-                series = await get_close_series(db, sym, warmup_dt, end_dt)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("리밸런싱 백테스트 %s 시세 적재 실패: %s", sym, e)
         if not series.empty:
             columns[sym] = series
 
