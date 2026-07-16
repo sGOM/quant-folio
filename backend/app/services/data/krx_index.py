@@ -224,6 +224,10 @@ def sector_map(as_of: date | None = None) -> dict[str, str]:
 
     :param as_of: 조회 기준일(기본 today). 휴장일이면 최대 9일 소급해 직전 영업일로 스냅.
         업종 분류 자체는 시점 의존이 낮으므로 정확한 PIT 는 요구하지 않는다.
+
+    한계(C-2, 확인됨): KRX MDC 는 '현재' 분류만 제공하고 과거 임의 시점의 분류를 조회하는
+    API 가 없다. 여러 해에 걸친 백테스트에서 이 매핑을 쓰면 현재 분류를 과거 구간에
+    소급 적용하는 약한 look-ahead 가 생긴다(호출부: portfolio.py 의 섹터 캡 로딩 참고).
     """
     global _SECTOR_CACHE
     if _SECTOR_CACHE is not None:

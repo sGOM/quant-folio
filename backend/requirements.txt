@@ -26,3 +26,4 @@ finance-datareader==0.9.96
 # 개발/테스트
 pytest==8.3.4
 pytest-asyncio==0.25.2
+pytest-cov==6.0.0
