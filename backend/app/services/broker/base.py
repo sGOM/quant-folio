@@ -45,6 +45,9 @@ class OrderResult:
     """주문 접수 결과."""
 
     order_id: str | None
+    # KIS 주문조직번호(KRX_FWDG_ORD_ORGNO). 체결통보 매칭 정확도를 높이기 위해 보존한다.
+    # 증권사가 제공하지 않으면(토스 등) None.
+    order_org_no: str | None = None
     raw: dict = field(default_factory=dict)
 
 

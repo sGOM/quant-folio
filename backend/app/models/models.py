@@ -195,6 +195,8 @@ class Order(Base):
     price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
     order_type: Mapped[str] = mapped_column(String(20), default="limit", nullable=False)
     kis_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # KIS 주문조직번호(KRX_FWDG_ORD_ORGNO). 체결통보 매칭 정확도 보강용(선택적).
+    kis_order_org_no: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[OrderStatus] = mapped_column(
         String(16), default=OrderStatus.PENDING, nullable=False
     )

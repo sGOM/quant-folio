@@ -303,7 +303,11 @@ class KisClient:
         if data.get("rt_cd") != "0":
             raise KisError(f"주문 거부: {data.get('msg1', data)}")
         out = data.get("output", {})
-        return OrderResult(order_id=out.get("ODNO"), raw=data)
+        return OrderResult(
+            order_id=out.get("ODNO"),
+            order_org_no=out.get("KRX_FWDG_ORD_ORGNO"),
+            raw=data,
+        )
 
     async def get_order_execution(self, kis_order_id: str, symbol: str | None = None) -> Fill:
         """당일 주문체결 조회로 실제 체결수량·평균체결가를 조회한다.
