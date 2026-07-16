@@ -121,7 +121,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    command: celery -A worker.celery_app.celery_app worker --loglevel=info
+    # -B: beat 스케줄러를 워커 프로세스에 내장(단일 워커 replica 전제 — 여러 개면 중복 스케줄 위험).
+    command: celery -A worker.celery_app.celery_app worker --loglevel=info -B
     volumes:
       - ./backend:/app
 
