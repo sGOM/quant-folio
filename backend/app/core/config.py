@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     KIS_APP_KEY: str = ""
     KIS_APP_SECRET: str = ""
     KIS_ACCOUNT_NO: str = ""  # 'CANO-PRDT' 형식 (예: 50012345-01)
+    # 실시간 체결통보(H0STCNI0/H0STCNI9) 구독의 tr_key. KIS 계좌의 HTS ID(로그인 ID).
+    # 미설정이면 체결통보 리스너(engine/fill_notice.py)는 안전하게 비활성(no-op)된다.
+    KIS_HTS_ID: str | None = None
 
     # --- 실전(prod) 전환 안전 게이트 ---
     # KIS_ENV=prod(실전) 는 실제 자금이 즉시 나가므로, 실수로 켜지는 사고를 구조적으로

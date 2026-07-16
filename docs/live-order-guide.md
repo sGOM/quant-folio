@@ -94,6 +94,48 @@ docker compose run --rm web python scripts/paper_rebalance.py --strategy 23 --ex
   - `COOKIE_SECURE=true` 아니면 **부팅 거부**(토큰 탈취 방지).
 - [ ] 전략 config 의 `capital`·`drift_band_pct`·리스크 한도(`RiskLimit`)를 실계좌 규모에 맞게 재확인.
 - [ ] 모의(vts)에서 동일 전략을 충분히 검증 완료.
+- [ ] **실시간 체결통보(`engine/fill_notice.py`) 전환 체크리스트** — 아래 2-1-A 절 참고.
+
+### 2-1-A. 실시간 체결통보(fill_notice) 실계정 전환 체크리스트
+
+`engine/fill_notice.py` 는 KIS 체결통보(H0STCNI0/H0STCNI9) WS 를 사용자(계좌)당 1개
+구독해 체결을 실시간 반영하는 골격이다. **실계정이 없어 종단(라이브 접속) 검증을
+하지 못한 상태로 구현**되었으므로, 실전 전환 전 반드시 아래를 모의투자 계좌로 먼저
+검증한다.
+
+- [ ] **`KIS_HTS_ID` 설정** — 체결통보 구독의 tr_key(HTS 로그인 ID). 미설정이면
+  `FillNoticeManager` 가 로그만 남기고 아무 것도 구독하지 않는다(안전한 기본값이지만,
+  이 상태로는 체결통보 경로 자체가 비활성이라 executor 즉시체결 + reconcile 폴링
+  2중 경로에만 의존하게 된다).
+- [ ] **모의투자(vts)로 먼저 검증** — `KIS_ENV=vts`, `KIS_HTS_ID` 설정 후 실시탭으로
+  전략을 켜고, `docker compose logs -f engine | grep 체결통보` 로 구독·수신·반영
+  로그가 정상적으로 찍히는지 확인한다.
+- [ ] **CNTG_QTY(체결수량) 필드가 누적값인지 증분값인지 실제 로그로 확인** —
+  `engine/fill_notice.py` 는 이 필드를 "해당 주문의 누적 체결수량"으로 가정해
+  `reconcile.py._order_recorded_qty` 와 동일한 델타 방식을 적용한다. 부분체결이
+  여러 번 나는 주문으로 실제 프레임을 로깅해, 회차별 CNTG_QTY 값이 매번 늘어나는
+  누적값인지 매번 이번 회차분만 담긴 증분값인지 반드시 확인할 것. 증분값으로
+  밝혀지면 `parse_fill_notice`/`apply_fill_notice` 의 델타 계산 로직을 증분 합산
+  방식으로 변경해야 한다(현재 구현은 누적 가정으로 델타=notice.qty−already 계산).
+- [ ] **tr_id 실전 전환 확인** — `settings.is_paper_trading` 에 따라 자동으로
+  모의(`H0STCNI9`) ↔ 실전(`H0STCNI0`) 이 분기되므로 별도 설정은 필요 없지만,
+  `KIS_ENV=prod` 전환 직후 엔진 로그에서 `tr_id=H0STCNI0` 로 구독됐는지 확인한다.
+- [ ] **ORGNO 매칭 확인** — REST 주문 응답의 `KRX_FWDG_ORD_ORGNO` 는
+  `Order.kis_order_org_no` 로 저장되지만(2026-07 추가), 조사한 바로는 KIS 체결통보
+  WS 프레임의 표준 필드셋에 ORGNO 가 노출되지 않아 현재 매칭은 `kis_order_id`
+  (ODNO)만으로 이뤄진다. 실계정 프레임을 받아보고 ORGNO 에 해당하는 필드가
+  실제로 존재하면 `parse_fill_notice`/매칭 쿼리를 갱신해 이중 확인하도록
+  보강할 것.
+- [ ] **3중 경로 멱등 확인** — 체결은 ① executor(주문 직후 1회 조회) ② reconcile
+  (주기 폴링) ③ fill_notice(실시간 통보) 세 경로가 동시에 존재한다. 세 경로 모두
+  `engine/fills.py::record_fill` 을 단일 진입점으로 쓰고, reconcile·fill_notice
+  는 "이미 기록된 누적 체결수량(executions 합)" 대비 델타만 반영하므로 정상적으로는
+  중복 기록되지 않는다. 실계정 전환 후 `executions` 테이블에서 같은 주문(order_id)에
+  대해 합계가 `orders.qty` 를 초과하지 않는지(과다 체결 기록 없음) 반드시 점검한다.
+- [ ] **필드 인덱스 재검증** — `parse_fill_notice` 의 필드 순서(23개)는 KIS 공식
+  샘플 순서를 따른 것으로, 실계정 프레임으로 종단 검증되지 않았다. 실계정에서 받은
+  원본 평문(복호화 직후, 로그에는 남기지 말고 임시로만 확인)과 필드 인덱스가
+  일치하는지 최초 1회 반드시 대조한다.
 
 ### 2-2. 실전 전환 절차
 
