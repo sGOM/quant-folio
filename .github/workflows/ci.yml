@@ -58,11 +58,35 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://quant:quant@localhost:5432/quant
         run: alembic upgrade head
 
-      - name: Run pytest
+      - name: Run pytest (with coverage)
         env:
           DATABASE_URL: postgresql+asyncpg://quant:quant@localhost:5432/quant
           REDIS_URL: redis://localhost:6379/0
-        run: pytest
+        run: >
+          pytest
+          --cov=app --cov=engine --cov=worker
+          --cov-report=term-missing
+          --cov-report=xml
+
+      - name: Coverage summary (PR 체크 화면에 표시)
+        if: always()
+        continue-on-error: true
+        run: |
+          {
+            echo "### 백엔드 커버리지"
+            echo '```'
+            python -m coverage report || echo "(커버리지 데이터 없음 — pytest 가 조기 실패했을 수 있음)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+          retention-days: 14
+          if-no-files-found: warn
 
   frontend:
     name: frontend (lint / typecheck / build)
