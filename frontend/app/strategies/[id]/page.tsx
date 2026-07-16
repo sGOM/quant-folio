@@ -4,7 +4,7 @@ import { use, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, Backtest, FactorIC, StrategyConfig } from "@/lib/api";
+import { api, Backtest, DsrAnalysis, FactorIC, StrategyConfig } from "@/lib/api";
 import { Nav } from "@/components/Nav";
 import { LineChart } from "@/components/LineChart";
 import { RequireAuth } from "@/components/RequireAuth";
@@ -151,6 +151,13 @@ function StrategyDetailContent({ sid }: { sid: number }) {
   // 체결 로그 총 건수(클로저 안에서 안전하게 참조하기 위한 파생 상수).
   const tradeCount = latest?.result?.trades?.length ?? 0;
 
+  // DSR(Deflated Sharpe Ratio, P2-1) — 최신 백테스트에 한해 온디맨드 계산(가벼운 순수함수).
+  const dsr = useQuery({
+    queryKey: ["backtest-dsr", latest?.id],
+    queryFn: () => api.getBacktestDsr(latest!.id),
+    enabled: !!latest?.id,
+  });
+
   // 표시할 체결: 최근 tradeLimit 건을 창으로 잡고, 선택한 기준으로 정렬한다.
   // (limit=최근 몇 건을 볼지, sort=그 창 안의 정렬 순서 — 두 개념을 분리)
   const shownTrades = useMemo(() => {
@@ -295,6 +302,8 @@ function StrategyDetailContent({ sid }: { sid: number }) {
               )}
               <Metric label="소르티노" value={num(latest.result.sortino)} />
             </div>
+
+            {dsr.data && <DsrCard dsr={dsr.data} />}
 
             {isRebalance &&
               latest.result.benchmark_return !== null &&
@@ -579,6 +588,92 @@ function Metric({
       <p className={`mt-1 text-lg font-semibold ${accent ? "text-primary" : ""}`}>
         {value}
       </p>
+    </div>
+  );
+}
+
+/** DSR 등급 → (배지 라벨, 색상 클래스). */
+const DSR_GRADE_STYLE: Record<
+  string,
+  { label: string; className: string }
+> = {
+  strong: {
+    label: "강함(≥0.95)",
+    className:
+      "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300",
+  },
+  marginal: {
+    label: "경계(≥0.90)",
+    className:
+      "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300",
+  },
+  inconclusive: {
+    label: "불확실(≥0.50)",
+    className:
+      "bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300",
+  },
+  overfit_suspected: {
+    label: "과최적화 의심(<0.50)",
+    className: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
+  },
+  insufficient_trials: {
+    label: "시행 부족",
+    className:
+      "bg-muted text-muted-foreground",
+  },
+};
+
+/**
+ * DSR(Deflated Sharpe Ratio, P2-1) 카드 — 과최적화(다중검정 selection bias) 방어 지표.
+ * 같은 전략·같은 기간의 백테스트 이력(파라미터 탐색 시행들)이 쌓일수록 추정이
+ * 정교해진다(N/N_eff). dsr<0.95 면 등급 배지로 경고해 "보일 때만 행동을 바꾸는" 방어
+ * 통계의 취지를 살린다.
+ */
+function DsrCard({ dsr }: { dsr: DsrAnalysis }) {
+  const style = DSR_GRADE_STYLE[dsr.grade] ?? DSR_GRADE_STYLE.insufficient_trials;
+  const hasDsr = dsr.status === "ok" && dsr.dsr !== null && dsr.dsr !== undefined;
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <h2 className="text-sm text-muted-foreground">
+          Deflated Sharpe Ratio(DSR)
+        </h2>
+        <span
+          className={`rounded-full px-2 py-0.5 text-xs font-medium ${style.className}`}
+        >
+          {style.label}
+        </span>
+      </div>
+
+      {hasDsr ? (
+        <>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <Metric label="DSR" value={num(dsr.dsr, 3)} accent />
+            <Metric label="PSR0(미보정)" value={num(dsr.psr0, 3)} />
+            <Metric label="시행 수(N/N_eff)" value={`${dsr.N ?? "-"} / ${num(dsr.N_eff, 1)}`} />
+            <Metric label="시행간 상관(ρ̄)" value={num(dsr.rho_bar)} />
+          </div>
+          <p className="mt-3 text-xs text-muted-foreground">
+            DSR 은 같은 전략·기간의 파라미터 탐색 시행 수(N_eff)를 반영해 샤프비의
+            &quot;운&quot;에 의한 과대추정을 보정한 유의확률이다(Bailey &amp; López de
+            Prado 2014). 0.95 이상이면 강한 근거, 0.50 미만이면 과최적화 의심 — 시행
+            횟수가 많을수록(파라미터를 많이 튜닝했을수록) 기준이 엄격해진다.
+            {dsr.v_low_confidence && (
+              <span className="text-amber-600 dark:text-amber-400">
+                {" "}시행별 분산 추정의 표본이 적어 참고용으로만 볼 것.
+              </span>
+            )}
+          </p>
+        </>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          {dsr.reason ?? "DSR 을 계산할 수 없습니다."}
+          {dsr.psr0 !== null && dsr.psr0 !== undefined && (
+            <> (단일시행 기준 PSR0={num(dsr.psr0, 3)})</>
+          )}
+        </p>
+      )}
     </div>
   );
 }

@@ -587,6 +587,34 @@ export interface Backtest {
   created_at: string;
 }
 
+/**
+ * Deflated Sharpe Ratio(DSR, P2-1) 분석 결과. 같은 전략·같은 기간의 백테스트 이력
+ * (파라미터 탐색 시행들)을 동질 집합으로 삼아 다중검정(selection bias)을 보정한다.
+ * status="unavailable"이면 dsr 등 핵심 필드가 없고 reason 만 채워진다.
+ */
+export interface DsrAnalysis {
+  backtest_id: number;
+  strategy_id: number;
+  period_start: string;
+  period_end: string;
+  status: "ok" | "insufficient_trials" | "unavailable";
+  /** strong(≥0.95) / marginal(≥0.90) / inconclusive(≥0.50) / overfit_suspected(<0.50) / insufficient_trials. */
+  grade: "strong" | "marginal" | "inconclusive" | "overfit_suspected" | "insufficient_trials";
+  /** Deflated Sharpe Ratio(0~1). 유효 시행 수(N_eff)<2 면 정의되지 않아 null. */
+  dsr?: number | null;
+  /** 다중검정 미보정 유의성(단일 시행 가정). dsr 이 없어도 참고용으로 제공. */
+  psr0?: number | null;
+  sharpe_annual?: number | null;
+  /** 동질 집합에 잡힌 시행 수(원본/유효). */
+  N?: number;
+  N_eff?: number;
+  /** 시행 간 평균 상관(유효 시행 수 축소에 반영). */
+  rho_bar?: number | null;
+  /** 시행별 샤프 분산 추정의 표본 신뢰도가 낮으면 true(참고용 경고). */
+  v_low_confidence?: boolean;
+  reason?: string;
+}
+
 /** 종목 검색 결과 1건. */
 export interface SymbolHit {
   code: string;
@@ -1119,6 +1147,15 @@ export const api = {
   /** 전략의 백테스트 실행 이력을 조회한다. @param id 전략 ID */
   listBacktests: (id: number) =>
     request<Backtest[]>(`/api/strategies/${id}/backtests`),
+
+  /**
+   * 백테스트 1건의 DSR(Deflated Sharpe Ratio, P2-1)을 온디맨드 계산한다.
+   * 같은 전략·같은 기간의 다른 백테스트 이력이 쌓일수록(파라미터 탐색 시행) 추정이
+   * 정교해진다. 이력이 부족(N_eff<2)하면 status="insufficient_trials"로 dsr=null.
+   * @param backtestId 백테스트 ID
+   */
+  getBacktestDsr: (backtestId: number) =>
+    request<DsrAnalysis>(`/api/backtests/${backtestId}/dsr`),
 
   // --- 매매 엔진 제어 ---
   /** 전략을 라이브(자동매매)로 전환하도록 엔진에 시작 명령을 보낸다. @param id 전략 ID */
