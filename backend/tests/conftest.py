@@ -284,6 +284,11 @@ class FakeDB:
     async def rollback(self) -> None:
         return None
 
+    async def delete(self, obj) -> None:
+        rows = self._store.rows.get(type(obj))
+        if rows is not None and obj in rows:
+            rows.remove(obj)
+
     async def refresh(self, obj) -> None:
         return None
 
