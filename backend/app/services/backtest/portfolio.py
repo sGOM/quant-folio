@@ -33,15 +33,26 @@
   시간청산(hold_days) 중 먼저 도래하는 조건에 오버레이를 해제한다. 자세한 설계 의도는
   app.schemas.strategy.PanicOverlay 문서 참고.
 
+체결 정밀도(P2-2)
+=================
+- **정수주(A-1)**: config.integer_shares(기본 True)가 켜져 있으면 매수·매도 거래대금을
+  floor(금액/가격) 주 단위로 절사한다(실거래 compute_rebalance_orders 와 동일 규약).
+  전량 청산(포지션 정리)은 절사하지 않고 보유 전량을 그대로 정리한다(ADV 캡으로 줄어들지
+  않는 한 잔여주가 남지 않아야 하므로). 절사로 남는 소수점 금액은 자동으로 현금에 남는다
+  (val/cost 는 정수주 가치에 정확히 맞춰 갱신되므로 별도 이월 부기가 필요 없다).
+- **ADV 참여율 캡(A-2)**: config.adv_participation_cap(예 0.08)과 volume_panel 이 모두
+  주어지면, 종목별 20일 ADV(거래대금, rolling·미래참조 없음)의 그 비율을 하루 매매 상한으로
+  삼아 초과분을 절사한다(잔량은 다음 리밸런싱에서 재평가 — 이월 큐를 별도로 두지 않는
+  단순화된 모델). volume_panel 미공급 시 설정돼 있어도 경고 로그만 남기고 미적용.
+
 알려진 한계(실거래와의 차이)
 --------------------------
-- 비중은 분수(fractional)로 시뮬레이션한다(실거래 compute_rebalance_orders 는 정수 1주 단위).
-  대형주·충분한 capital 에서는 근사오차가 작으나, 고가주/소액 capital 에서는 실거래와
-  괴리가 있을 수 있다.
 - 목표비중은 '현재 포트폴리오 평가액'(복리) 기준으로 산정한다(실거래는 배정 capital 고정).
   백테스트는 복리 성장을 반영하는 것이 성과추정에 더 적절하다.
-- 슬리피지는 slippage_bps(변동성 스케일 옵션)로 반영한다. 부분체결·상하한가·호가단위는
-  아직 반영하지 않는다(보수적으로 비용을 별도 가산해 해석할 것).
+- 슬리피지는 slippage_bps(변동성 스케일 옵션)로 반영한다. 상하한가·호가단위는 아직
+  반영하지 않는다(슬리피지에 근사 흡수돼 있다고 보수적으로 해석할 것).
+- 회전율(turnover)·거래 로그의 거래대금은 ADV 캡·정수주 절사 '이전'(의도된 드리프트
+  보정치) 기준이다 — 실제 체결액은 그보다 작거나 같다(사후 분석 시 참고).
 - 생존편향: 가격 패널이 '현재 상장 종목' 기준이면 과거 성과가 상방 편향될 수 있다.
 - 레짐 필터는 일별로 판정한다. 청산은 risk-off 즉시, 재진입은 risk-on 회복 즉시 이뤄진다
   (실거래 러너와 동일 규약). 왕복 매매비용(fees+tax)은 _apply_rebalance 에서 그대로 차감된다.
@@ -49,6 +60,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 import pandas as pd
@@ -384,6 +396,38 @@ def _trade_rec(
     }
 
 
+def _floor_to_shares(amt: float, sym: str, prices: pd.Series | None, capital: float) -> float:
+    """정규화 거래대금을 KRX 정수주 단위로 절사한 정규화 거래대금으로 변환한다(A-1).
+
+    실거래 engine.rebalance.compute_rebalance_orders 와 동일하게 floor(금액/가격) 주로
+    맞춘다. 가격 정보가 없으면(호출부에서 이미 걸러지지만 방어적으로) 원본을 그대로 반환한다.
+    """
+    price = prices.get(sym) if prices is not None else None
+    if price is None or pd.isna(price) or price <= 0 or capital <= 0:
+        return amt
+    qty = math.floor(amt * capital / float(price))
+    if qty <= 0:
+        return 0.0
+    return qty * float(price) / capital
+
+
+def _apply_adv_cap(
+    amt: float, sym: str, adv_map: pd.Series | None, adv_cap_frac: float, capital: float
+) -> float:
+    """ADV(20일 평균 거래대금) 대비 참여율 상한으로 거래대금을 절사한다(A-2).
+
+    adv_map 은 그 리밸런싱일까지의 데이터로 산출된 ADV(KRW) 이므로 미래참조가 없다.
+    해당 종목의 ADV 를 확보하지 못하면(신규상장·결측) 캡을 적용하지 않는다.
+    """
+    if adv_map is None or capital <= 0:
+        return amt
+    adv_val = adv_map.get(sym) if hasattr(adv_map, "get") else None
+    if adv_val is None or not np.isfinite(adv_val) or adv_val <= 0:
+        return amt
+    cap_norm = (adv_cap_frac * float(adv_val)) / capital
+    return min(amt, cap_norm)
+
+
 def _apply_rebalance(
     val: dict[str, float],
     cost: dict[str, float],
@@ -401,6 +445,9 @@ def _apply_rebalance(
     reason: str = "rebalance",
     slip_base: float = 0.0,
     slip_map: dict[str, float] | None = None,
+    integer_shares: bool = True,
+    adv_cap_frac: float = 0.0,
+    adv_map: pd.Series | None = None,
 ) -> tuple[float, float]:
     """목표비중으로 리밸런싱하며 비용을 차감하고 거래 로그를 남긴다(매도 먼저 → 매수).
 
@@ -411,7 +458,10 @@ def _apply_rebalance(
     :param reason: 거래 로그의 사유 태그.
     :param slip_base: 편도 슬리피지(분수). 매수는 +slip, 매도는 −slip 로 체결가에 가산.
     :param slip_map: 종목별 슬리피지(분수) 오버라이드. 없으면 slip_base 를 쓴다(변동성 스케일용).
-    :return: (리밸런싱 후 cash, 회전율 turnover=Σ|Δw|).
+    :param integer_shares: True(기본)면 체결 거래대금을 정수주 단위로 절사(A-1).
+    :param adv_cap_frac: ADV 대비 1일 참여율 상한(0=미적용, A-2).
+    :param adv_map: 종목→ADV(KRW) Series. adv_cap_frac>0 일 때만 사용.
+    :return: (리밸런싱 후 cash, 회전율 turnover=Σ|Δw|, 의도된 드리프트 기준).
     """
     if equity <= 0:
         return 0.0, 0.0
@@ -449,12 +499,24 @@ def _apply_rebalance(
             else:
                 buys.append((sym, dev * equity))    # 매수 금액
 
+    # ADV 참여율 캡(A-2) — 유동성 상한을 초과하는 목표 거래대금을 사전 절사.
+    # turnover 는 위에서 이미 '의도된' 드리프트 기준으로 집계했으므로 그대로 둔다
+    # (실제 체결액은 그 이하 — 사후 분석 시 참고).
+    if adv_cap_frac > 0 and adv_map is not None:
+        sells = [(sym, _apply_adv_cap(amt, sym, adv_map, adv_cap_frac, capital)) for sym, amt in sells]
+        buys = [(sym, _apply_adv_cap(amt, sym, adv_map, adv_cap_frac, capital)) for sym, amt in buys]
+
     # 시작 현금 = equity - 보유평가액 합
     cash = equity - sum(val.values())
 
     # 매도 먼저 실행(현금 확보) — 포지션 원가 대비 수익률을 로그로 남긴다
     for sym, amt in sells:
         cur_val = val.get(sym, 0.0)
+        # 전량 청산(ADV 캡으로 amt 가 이미 줄었다면 '전량'이 아니므로 절사 대상이 된다) 만
+        # 정수주 절사를 건너뛴다 — 보유 전량을 정리하는 거래에 소수점 잔량을 남기지 않기 위함.
+        is_full_exit = amt >= cur_val - 1e-9
+        if integer_shares and not is_full_exit:
+            amt = _floor_to_shares(amt, sym, prices, capital)
         amt = min(amt, cur_val)
         if amt <= 1e-12:
             continue
@@ -472,7 +534,13 @@ def _apply_rebalance(
             _trade_rec(d, sym, "sell", amt, prices, capital, port_return, pos_ret, reason)
         )
 
-    # 매수: 현금 부족 시 비례 축소(음수 현금 방지)
+    # 매수: 정수주 절사(A-1) 먼저 적용한 뒤, 현금 부족 시 비례 축소(음수 현금 방지).
+    # 절사 후 축소이므로 축소가 다시 소수점 금액을 만들 수 있으나, floor 로 만든 금액은
+    # 이미 실제 정수주 가치이고 scale(<=1) 은 그 정수주 중 '몇 주를 못 산다'는 의미이므로
+    # 축소된 buy_cost 가 cash 를 넘지 않게만 하고 별도 재절사는 하지 않는다(과최적화 방지 —
+    # 근소한 초과 매수 방지가 목적이지 소수점 주수 재현이 목적이 아님).
+    if integer_shares:
+        buys = [(sym, _floor_to_shares(amt, sym, prices, capital)) for sym, amt in buys]
     total_buy_cost = sum(amt * (1.0 + fees + _slip(sym)) for sym, amt in buys)
     scale = 1.0
     if total_buy_cost > cash and total_buy_cost > 0:
@@ -502,6 +570,7 @@ def run_rebalance_backtest(
     pool_provider=None,
     benchmark_series: pd.Series | None = None,
     panic_series: pd.DataFrame | None = None,
+    volume_panel: pd.DataFrame | None = None,
 ) -> dict:
     """리밸런싱 전략을 일별 시뮬레이션한다.
 
@@ -525,6 +594,9 @@ def run_rebalance_backtest(
         `app.services.metrics.panic.compute_panic_series` 로 만든 DataFrame(index=날짜,
         columns=[score, level, gated, hard_trigger, close, low, dd60])을 기대한다. None 이거나
         config.panic_overlay 가 비활성이면 오버레이 미적용(레짐 필터만 동작).
+    :param volume_panel: close_panel 과 동일 shape(index=일자, columns=종목코드, 값=거래량(주)).
+        config.adv_participation_cap(A-2)이 설정돼 있을 때만 사용해 20일 ADV(거래대금)를
+        산출한다. None 이면 캡이 설정돼 있어도 미적용(경고 로그만).
     :return: {total_return, mdd, sharpe, sortino, cagr, alpha, beta, information_ratio,
         tracking_error, benchmark_return, excess_return, win_rate, num_trades,
         num_rebalances, num_kills, num_panic_events, factor_ic, avg_turnover, equity_curve,
@@ -582,6 +654,22 @@ def run_rebalance_backtest(
     slip_base = max(0.0, float(config.get("slippage_bps", 5.0) or 0.0) / 10_000.0)
     slip_vol_scale = max(0.0, float(config.get("slippage_vol_scale", 0.0) or 0.0))
     rf_annual = float(config.get("risk_free_rate", 0.0) or 0.0)  # 위험조정지표용 무위험수익률(연)
+
+    # 체결 정밀도(P2-2): A-1 정수주, A-2 ADV 참여율 캡.
+    integer_shares = bool(config.get("integer_shares", True))
+    adv_cap_frac = float(config.get("adv_participation_cap") or 0.0)
+    adv_frame: pd.DataFrame | None = None
+    if adv_cap_frac > 0:
+        if volume_panel is not None and not volume_panel.empty:
+            vol_norm = _normalize_index(volume_panel)
+            vol_norm = vol_norm.reindex(index=panel.index, columns=panel.columns).fillna(0.0)
+            # 거래대금 = 거래량×종가, 20일 이동평균(미래참조 없음 — d 시점은 그날까지 값만 씀).
+            adv_frame = (vol_norm * panel).rolling(20, min_periods=10).mean()
+        else:
+            logger.warning(
+                "adv_participation_cap 설정됨이나 거래량 패널(volume_panel) 미확보 —"
+                " ADV 캡을 적용하지 않는다."
+            )
 
     # 리스크 레이어(P1-2) — MDD 킬스위치 파라미터(집중 한도·변동성 타겟팅은 _targets_at
     # 에서 목표비중에 반영된다). mdd_kill_pct 가 None 이면 킬스위치 비활성.
@@ -700,6 +788,7 @@ def run_rebalance_backtest(
     def _run_decision(decision: dict, prices: pd.Series, d: pd.Timestamp, cash: float) -> float:
         """decision(청산/리밸런싱)을 d 종가로 체결한다(val/cost/trades 등 제자리 수정)."""
         equity = cash + sum(val.values())
+        adv_today = adv_frame.loc[d] if adv_frame is not None else None
         if decision["kind"] == "liquidate":
             if not val:
                 return cash
@@ -709,6 +798,7 @@ def run_rebalance_backtest(
                 drift_band, fees, tax, trades,
                 liquidate=True, reason=decision["reason"],
                 slip_base=slip_base, slip_map=slip_map,
+                integer_shares=integer_shares, adv_cap_frac=adv_cap_frac, adv_map=adv_today,
             )
             if turnover > 0:
                 turnovers.append(turnover)
@@ -728,6 +818,7 @@ def run_rebalance_backtest(
                     val, cost, targets, equity, prices, d, capital,
                     drift_band, fees, tax, trades, reason=decision["reason"],
                     slip_base=slip_base, slip_map=slip_map,
+                    integer_shares=integer_shares, adv_cap_frac=adv_cap_frac, adv_map=adv_today,
                 )
                 if turnover > 0:
                     turnovers.append(turnover)

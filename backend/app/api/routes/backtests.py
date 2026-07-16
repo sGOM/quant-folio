@@ -23,7 +23,7 @@ from app.services.backtest import (
 )
 from app.services.backtest.signals import requires_ohlc
 from app.services.data import load_ohlcv, upsert_price_ticks
-from app.services.data.loader import get_close_series, get_ohlcv_frame
+from app.services.data.loader import get_close_series, get_ohlcv_frame, get_volume_series
 from app.services.market import KST
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -261,6 +261,22 @@ async def _run_rebalance_backtest(
         )
 
     panel = pd.DataFrame(columns)
+
+    # 체결 정밀도(P2-2 A-2): ADV 참여율 캡이 설정돼 있으면 같은 종목들의 거래량도
+    # 적재해 20일 ADV(거래대금) 산출용 패널을 만든다. 미설정이면 조회 자체를 건너뛴다
+    # (기존 백테스트 성능·부하에 영향 없음).
+    volume_panel = None
+    if config.get("adv_participation_cap"):
+        vol_columns: dict[str, pd.Series] = {}
+        for sym in panel.columns:
+            vseries = await get_volume_series(db, sym, warmup_dt, end_dt)
+            if not vseries.empty:
+                vol_columns[sym] = vseries
+        if vol_columns:
+            volume_panel = pd.DataFrame(vol_columns)
+        else:
+            logger.warning("ADV 캡 설정됨이나 거래량 데이터를 확보하지 못했다(미적용).")
+
     method = config.get("selection", {}).get("method", "momentum")
     provider = _fundamentals_provider if method == "score" else None
     # 사이즈 중립화(P1-3): 시가총액(PIT)을 펀더멘털 프레임에 실어 스코어러가 각 팩터를
@@ -315,6 +331,7 @@ async def _run_rebalance_backtest(
             pool_provider,
             benchmark_series,
             panic_series,
+            volume_panel,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))

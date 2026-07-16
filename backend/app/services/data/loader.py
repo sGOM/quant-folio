@@ -206,3 +206,26 @@ async def get_ohlcv_frame(
         "volume": [float(r[5]) if r[5] is not None else 0.0 for r in rows],
     }
     return pd.DataFrame(data, index=idx)
+
+
+async def get_volume_series(
+    db: AsyncSession, symbol: str, start: datetime, end: datetime
+) -> pd.Series:
+    """price_ticks 에서 거래량(주) 시계열을 Series 로 반환 (index=time).
+
+    ADV(일평균거래대금) 캡(P2-2 A-2)용 — 종가 패널과 곱해 거래대금을 산출한다.
+    """
+    result = await db.execute(
+        select(PriceTick.time, PriceTick.volume)
+        .where(PriceTick.symbol == symbol)
+        .where(PriceTick.time >= start)
+        .where(PriceTick.time <= end)
+        .order_by(PriceTick.time)
+    )
+    rows = result.all()
+    if not rows:
+        return pd.Series(dtype="float64")
+    idx = pd.DatetimeIndex([r[0] for r in rows])
+    return pd.Series(
+        [float(r[1]) if r[1] is not None else 0.0 for r in rows], index=idx, name=symbol
+    )
