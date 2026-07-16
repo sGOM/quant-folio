@@ -12,8 +12,10 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.core.channels import ACTIVE_STRATEGIES_KEY
 from app.core.database import get_db
-from app.models import Backtest, Strategy, StrategyLike, StrategyStatus, User
+from app.core.redis import redis_client
+from app.models import Backtest, Position, Strategy, StrategyLike, StrategyStatus, User
 from app.schemas.strategy import (
     BacktestSummary,
     FeaturedBacktestIn,
@@ -391,7 +393,31 @@ async def delete_strategy(
     current: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """전략을 삭제한다(본인 소유만). 성공 시 204."""
+    """전략을 삭제한다(본인 소유만). 성공 시 204.
+
+    가동 중(DB status=LIVE 또는 엔진 활성 집합에 등록)이거나 미청산 포지션이 있으면
+    "유령 포지션"(아무도 관리하지 않는 미청산 포지션)이 남을 수 있어 409 로 거부한다.
+    """
     s = await _get_owned(db, current, strategy_id)
+    if s.status == StrategyStatus.LIVE:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "가동 중인 전략은 삭제할 수 없습니다. 먼저 중지하세요."
+        )
+    if await redis_client.sismember(ACTIVE_STRATEGIES_KEY, strategy_id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "엔진에서 실행 중인 전략입니다. 먼저 중지하세요."
+        )
+    open_position = await db.scalar(
+        select(Position).where(
+            Position.user_id == current.id,
+            Position.strategy_id == strategy_id,
+            Position.qty > 0,
+        )
+    )
+    if open_position is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "미청산 포지션이 있어 삭제할 수 없습니다. 먼저 청산하거나 다른 전략으로 이관하세요.",
+        )
     await db.delete(s)
     await db.commit()
