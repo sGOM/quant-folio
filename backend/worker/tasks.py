@@ -63,11 +63,13 @@ async def _check_fill_quality_drift_async() -> dict:
     from app.core.config import settings
     from app.core.database import AsyncSessionLocal
     from app.models import Order
+    from app.services.backtest.slippage_calibration import propose_slippage_calibration
 
     d_to = date.today()
     d_from = d_to - timedelta(days=_FILL_QUALITY_WINDOW_DAYS)
     checked: list[tuple[int, int]] = []
     alerted: list[int] = []
+    proposed: list[int] = []
 
     async with AsyncSessionLocal() as db:
         rows = await db.execute(
@@ -96,6 +98,16 @@ async def _check_fill_quality_drift_async() -> dict:
                     continue
 
                 grades = report.get("grades", {})
+                # 표본이 충분해지면 슬리피지 캘리브레이션 제안을 산출한다(자동 반영 X — 사람 승인
+                # 대기용). 표본 부족·유의변화 없음이면 None. 알림 문구에 함께 노출한다.
+                proposal = propose_slippage_calibration(report)
+                prop_txt = (
+                    f" 제안 slippage_bps={proposal.proposed_bps}"
+                    f"(실측 중앙값 {proposal.observed_median_bps:.1f}bp, 표본 {proposal.sample_size})"
+                    if proposal is not None
+                    else ""
+                )
+
                 # RED 등급 자체가 이미 가정 대비 큰 이탈(M1: 평균>15bp 또는 표준편차>3×가정,
                 # M3: 연환산 드래그차>1.5%p/yr — plan 이 말하는 "2배 임계"와 같은 급의 이탈)을
                 # 뜻하므로, 별도 배수 계산 없이 RED 를 그대로 외부 알림(B-1 텔레그램) 기준으로 쓴다.
@@ -108,6 +120,7 @@ async def _check_fill_quality_drift_async() -> dict:
                         f"M3(총 정합)={grades.get('m3_total')} 실측 {round(m1_mean, 1) if m1_mean is not None else '-'}bp "
                         f"vs 가정 {assumption}bp(최근 {_FILL_QUALITY_WINDOW_DAYS}일"
                         f"{f', 연환산 드래그차 {drag:.2f}%p/yr' if drag is not None else ''})."
+                        f"{prop_txt}"
                     )
                     # critical: RED 는 방치하면 실거래-백테스트 성과 추정이 계통적으로 어긋난다는
                     # 뜻이라 앱 미접속 중에도 알아야 한다 — B-1 텔레그램 채널로도 발송된다.
@@ -116,10 +129,24 @@ async def _check_fill_quality_drift_async() -> dict:
                         message=msg, code="fill_quality_drift",
                     )
                     alerted.append(strategy_id)
+                    if proposal is not None:
+                        proposed.append(strategy_id)
+                elif proposal is not None:
+                    # RED 는 아니지만 표본이 충분해 유의미한 캘리브레이션 제안이 나온 경우:
+                    # 정합이 위험 수준은 아니므로 warning(앱 내 WS)으로만 승인 대기를 알린다.
+                    await publish_alert(
+                        redis, user_id=user_id, strategy_id=strategy_id, severity="warning",
+                        message=(
+                            f"전략 {strategy_id} 슬리피지 캘리브레이션 제안 — "
+                            f"현재 {proposal.current_bps:.1f}bp →{prop_txt}. 승인 시 config 에 반영됩니다."
+                        ),
+                        code="slippage_calibration_proposed",
+                    )
+                    proposed.append(strategy_id)
         finally:
             await redis.aclose()
 
-    result = {"checked": len(checked), "alerted": alerted}
+    result = {"checked": len(checked), "alerted": alerted, "proposed": proposed}
     logger.info("체결 정합 정기 점검 완료: %s", result)
     return result
 
