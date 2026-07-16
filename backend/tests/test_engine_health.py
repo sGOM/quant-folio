@@ -168,3 +168,117 @@ async def test_publish_alert_targets_user_channel():
     channels = {ch for ch, _ in redis.published}
     assert engine_events_channel(9) in channels
     assert ENGINE_EVENTS_CHANNEL in channels
+
+
+class _FakeTelegramResponse:
+    def raise_for_status(self):
+        pass
+
+
+class _FakeTelegramClient:
+    """httpx.AsyncClient 대역 — sendMessage 호출을 기록한다."""
+
+    calls: list[tuple[str, dict]] = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, url, json):
+        _FakeTelegramClient.calls.append((url, json))
+        return _FakeTelegramResponse()
+
+
+async def test_publish_alert_sends_telegram_for_critical_when_configured(monkeypatch):
+    """critical 알림이고 텔레그램이 설정돼 있으면 봇 API 로 발송한다."""
+    from app.core.config import settings
+    from engine import alerts
+
+    _FakeTelegramClient.calls = []
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setattr(settings, "TELEGRAM_CHAT_ID", "12345")
+    monkeypatch.setattr(alerts.httpx, "AsyncClient", _FakeTelegramClient)
+
+    redis = _FakeRedis()
+    await alerts.publish_alert(
+        redis, user_id=9, strategy_id=1, severity="critical",
+        message="MDD 킬스위치 발동", code="mdd_kill",
+    )
+
+    assert len(_FakeTelegramClient.calls) == 1
+    url, payload = _FakeTelegramClient.calls[0]
+    assert url == "https://api.telegram.org/bottest-token/sendMessage"
+    assert payload["chat_id"] == "12345"
+    assert "MDD 킬스위치 발동" in payload["text"]
+
+
+async def test_publish_alert_skips_telegram_when_not_critical(monkeypatch):
+    from app.core.config import settings
+    from engine import alerts
+
+    _FakeTelegramClient.calls = []
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setattr(settings, "TELEGRAM_CHAT_ID", "12345")
+    monkeypatch.setattr(alerts.httpx, "AsyncClient", _FakeTelegramClient)
+
+    redis = _FakeRedis()
+    await alerts.publish_alert(
+        redis, user_id=9, strategy_id=1, severity="warning",
+        message="점검 필요", code="pit_fallback",
+    )
+
+    assert _FakeTelegramClient.calls == []
+
+
+async def test_publish_alert_skips_telegram_when_unconfigured(monkeypatch):
+    from app.core.config import settings
+    from engine import alerts
+
+    _FakeTelegramClient.calls = []
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setattr(settings, "TELEGRAM_CHAT_ID", "")
+    monkeypatch.setattr(alerts.httpx, "AsyncClient", _FakeTelegramClient)
+
+    redis = _FakeRedis()
+    await alerts.publish_alert(
+        redis, user_id=None, strategy_id=1, severity="critical",
+        message="MDD 킬스위치 발동", code="mdd_kill",
+    )
+
+    assert _FakeTelegramClient.calls == []
+
+
+async def test_publish_alert_swallows_telegram_send_failure(monkeypatch):
+    """텔레그램 발송이 실패해도 예외를 전파하지 않는다(앱 내 알림 흐름 보호)."""
+    from app.core.config import settings
+    from engine import alerts
+
+    class _BoomClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json):
+            raise RuntimeError("network boom")
+
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setattr(settings, "TELEGRAM_CHAT_ID", "12345")
+    monkeypatch.setattr(alerts.httpx, "AsyncClient", _BoomClient)
+
+    redis = _FakeRedis()
+    await alerts.publish_alert(
+        redis, user_id=9, strategy_id=1, severity="critical",
+        message="MDD 킬스위치 발동", code="mdd_kill",
+    )  # 예외 없이 완료돼야 함
+
+    assert len(redis.alerts()) == 1  # WS 알림은 정상 발행됨
