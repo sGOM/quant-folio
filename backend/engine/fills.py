@@ -26,23 +26,28 @@ async def record_fill(
     """Execution 기록 + Position 평균단가 갱신 + 주문 상태 갱신."""
     db.add(Execution(
         order_id=order.id,
+        strategy_id=order.strategy_id,  # 비정규화: 전략별 체결 직접 조회용
         filled_qty=Decimal(qty),
         filled_price=price,
         fee=Decimal("0"),
     ))
     order.status = OrderStatus.FILLED if fully_filled else OrderStatus.PARTIAL
 
+    # 포지션은 (user_id, strategy_id, symbol) 로 스코프한다 — 같은 종목을 여러 전략이
+    # 동시에 보유해도 포지션이 섞이지 않도록 소유 전략별로 분리 기록한다.
     pos = await db.scalar(
         select(Position).where(
-            Position.user_id == order.user_id, Position.symbol == order.symbol
+            Position.user_id == order.user_id,
+            Position.strategy_id == order.strategy_id,
+            Position.symbol == order.symbol,
         )
     )
     fill_qty = Decimal(qty)
     if order.side == OrderSide.BUY:
         if pos is None:
             db.add(Position(
-                user_id=order.user_id, symbol=order.symbol,
-                qty=fill_qty, avg_price=price,
+                user_id=order.user_id, strategy_id=order.strategy_id,
+                symbol=order.symbol, qty=fill_qty, avg_price=price,
             ))
         else:
             new_qty = pos.qty + fill_qty

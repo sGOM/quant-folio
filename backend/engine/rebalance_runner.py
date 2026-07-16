@@ -275,6 +275,7 @@ class RebalanceRunner(BaseRunner):
             rows = await db.scalars(
                 select(Position).where(
                     Position.user_id == self._user_id,
+                    Position.strategy_id == self.strategy_id,
                     Position.qty > 0,
                     Position.symbol.in_(pool),
                 )
@@ -786,16 +787,19 @@ class RebalanceRunner(BaseRunner):
         return history
 
     async def _holdings(self, db, universe: list[str]) -> dict[str, Decimal]:
-        """universe 종목의 보유 포지션을 dict(symbol→qty) 로 반환(수량>0).
+        """이 전략의 보유 포지션을 dict(symbol→qty) 로 반환(수량>0).
 
-        universe 밖의 보유(다른 전략 포지션 등)는 건드리지 않도록 제외한다.
-        선정에서 빠진 universe 종목은 목표 0 으로 평가되어 자연히 청산 대상이 된다.
+        strategy_id 로 직접 격리하므로 다른 전략의 포지션(같은 종목이라도)은 애초에
+        조회되지 않는다. universe 필터는 남겨 두어(이 전략이 과거 유니버스에서 편입했다가
+        빠진 종목 등) 관심 범위를 좁힌다. 선정에서 빠진 universe 종목은 목표 0 으로
+        평가되어 자연히 청산 대상이 된다.
         """
         if not universe:
             return {}
         rows = await db.scalars(
             select(Position).where(
                 Position.user_id == self._user_id,
+                Position.strategy_id == self.strategy_id,
                 Position.qty > 0,
                 Position.symbol.in_(universe),
             )
@@ -857,6 +861,7 @@ class RebalanceRunner(BaseRunner):
                         pos = await db.scalar(
                             select(Position).where(
                                 Position.user_id == self._user_id,
+                                Position.strategy_id == self.strategy_id,
                                 Position.symbol == sym,
                             )
                         )

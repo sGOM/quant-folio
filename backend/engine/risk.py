@@ -130,6 +130,8 @@ async def _daily_pnl(
             realized -= gross + ex.fee
 
     # 보유 포지션 평가손익(현재가 제공된 종목만).
+    # 의도적으로 strategy_id 로 좁히지 않는다 — 일일 손실 한도는 계좌 전체를 보호하는
+    # 하드 게이트이므로 모든 전략의 포지션을 합산해 판정한다(계좌 단위 리스크).
     unrealized = Decimal("0")
     positions = (
         await db.scalars(select(Position).where(Position.user_id == user_id))
@@ -177,7 +179,12 @@ async def _get_limit(db: AsyncSession, user_id: int, strategy_id: int) -> RiskLi
 
 
 async def _get_position(db: AsyncSession, user_id: int, symbol: str) -> Position | None:
-    """사용자의 특정 종목 포지션을 조회한다(없으면 None)."""
+    """사용자의 특정 종목 포지션을 조회한다(없으면 None).
+
+    계좌 단위 리스크 판정(손절 게이트)이므로 strategy_id 로 좁히지 않는다 — 같은 종목을
+    여러 전략이 보유하면 여러 행이 반환될 수 있으나, 여기서는 계좌 전체 익스포저 관점의
+    보수적 게이트로 첫 행을 사용한다.
+    """
     return await db.scalar(
         select(Position).where(Position.user_id == user_id, Position.symbol == symbol)
     )
