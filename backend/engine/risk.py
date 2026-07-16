@@ -16,6 +16,15 @@ from app.models import Execution, Order, OrderSide, Position, RiskLimit
 
 logger = logging.getLogger("engine.risk")
 
+# ─────────────────────────── 리스크 귀속 규칙(비귀속 포지션) ───────────────────────────
+# strategy_id=NULL 인 Position/Execution 은 "비귀속"이다: 전략 삭제(ondelete SET NULL)로
+# 소유 전략이 사라졌거나, 자동매매 엔진이 소유하지 않는 수동·레거시 포지션이다.
+# 리스크 계산에서의 취급을 아래 두 스코프로 명확히 구분한다.
+#   - 계좌 스코프(_daily_pnl(strategy_id=None)): 계좌 전체를 보호하는 하드 게이트이므로
+#     비귀속 포지션/체결도 모두 합산한다(계좌 단위 손실은 누가 소유하든 계좌를 위협한다).
+#   - 전략 스코프(_daily_pnl(strategy_id=X)): 정확히 X 에 귀속된 것만 합산하며,
+#     비귀속(strategy_id=NULL) Position/Execution 은 제외된다(특정 전략의 손실이 아니다).
+
 
 @dataclass
 class RiskDecision:
@@ -80,18 +89,51 @@ async def check_daily_loss_limit(
     당일 손익 = 당일 체결의 실현 현금흐름(매도수익 − 매수비용 − 수수료)
               + 현재 보유 포지션의 평가손익(현재가 기준).
     한도(daily_loss_limit)는 양수(허용 최대 손실액)이며, 손익 ≤ −한도이면 차단한다.
-    """
-    limit = await _get_limit(db, user_id, strategy_id)
-    if not limit or limit.daily_loss_limit is None:
-        return RiskDecision(True, 0, "")
 
-    pnl = await _daily_pnl(db, user_id, current_prices)
-    if pnl <= -limit.daily_loss_limit:
-        logger.warning(
-            "일일 손실 한도 초과: 손익 %s <= -%s — 신규 진입 차단",
-            pnl, limit.daily_loss_limit,
-        )
-        return RiskDecision(False, 0, "일일 손실 한도 초과")
+    두 개의 독립적 하드 게이트를 순서대로 적용한다(하나라도 걸리면 차단):
+
+    1) 계좌 하드 게이트 — 사용자 공통(strategy_id=NULL) daily_loss_limit 을 **계좌 전체
+       손익**(모든 전략 + 비귀속 포지션 합산)에 적용. 계좌를 통째로 보호한다. 이 게이트는
+       특정 전략에 per-strategy 한도가 있든 없든 독립적으로 작동한다(전략 한도로 계좌 게이트를
+       우회할 수 없다).
+    2) 전략 하드 게이트 — 이 전략에 **명시적으로** 설정된 per-strategy daily_loss_limit 이
+       있는 경우에만, 그 전략에 귀속된 손익만 합산한 **전략 스코프 손익**에 적용.
+
+    회귀 안전(최우선): 해당 전략에 per-strategy 한도가 없거나(행 없음) daily_loss_limit 이
+    NULL 이면 기존 동작과 100% 동일해야 한다.
+      - per-strategy 행이 아예 없으면: 기존 `_get_limit` 은 공통 한도로 fallback 했으므로,
+        공통 한도를 계좌 전체 손익에 적용하는 (1)의 결과가 기존과 동일하다.
+      - per-strategy 행이 있으나 daily_loss_limit 이 NULL 이면: 기존 `_get_limit` 은 그 행을
+        우선 선택해 daily loss 검사를 통째로 건너뛰었다. 이 동작을 보존하기 위해, 이 경우
+        계좌 공통 게이트도 적용하지 않는다(suppress).
+    """
+    common = await _get_common_limit(db, user_id)
+    strat = await _get_strategy_limit(db, user_id, strategy_id)
+
+    # 회귀 보존: per-strategy 행이 존재하지만 daily_loss_limit 이 NULL 이면, 기존 코드가
+    # 그 전략의 daily loss 검사를 통째로 건너뛰던 동작을 그대로 재현한다(계좌 게이트도 skip).
+    suppress = strat is not None and strat.daily_loss_limit is None
+
+    # (1) 계좌 하드 게이트: 공통 한도 × 계좌 전체 손익(strategy_id=None).
+    if not suppress and common is not None and common.daily_loss_limit is not None:
+        account_pnl = await _daily_pnl(db, user_id, current_prices)
+        if account_pnl <= -common.daily_loss_limit:
+            logger.warning(
+                "일일 손실 한도 초과(계좌): 손익 %s <= -%s — 신규 진입 차단",
+                account_pnl, common.daily_loss_limit,
+            )
+            return RiskDecision(False, 0, "일일 손실 한도 초과")
+
+    # (2) 전략 하드 게이트: 명시적 per-strategy 한도 × 전략 스코프 손익(strategy_id 지정).
+    if strat is not None and strat.daily_loss_limit is not None:
+        strat_pnl = await _daily_pnl(db, user_id, current_prices, strategy_id=strategy_id)
+        if strat_pnl <= -strat.daily_loss_limit:
+            logger.warning(
+                "일일 손실 한도 초과(전략 %s): 손익 %s <= -%s — 신규 진입 차단",
+                strategy_id, strat_pnl, strat.daily_loss_limit,
+            )
+            return RiskDecision(False, 0, "전략별 일일 손실 한도 초과")
+
     return RiskDecision(True, 0, "")
 
 
@@ -105,21 +147,34 @@ def _today_start_utc() -> datetime:
 
 
 async def _daily_pnl(
-    db: AsyncSession, user_id: int, current_prices: dict[str, Decimal]
+    db: AsyncSession,
+    user_id: int,
+    current_prices: dict[str, Decimal],
+    strategy_id: int | None = None,
 ) -> Decimal:
     """당일 손익(실현 현금흐름 + 보유 포지션 평가손익)을 계산한다.
 
     :param current_prices: 종목별 현재가(평가손익 계산용). 없는 종목은 평가에서 제외
+    :param strategy_id: 스코프 선택.
+        - None(기본): 계좌 전체 합산. 사용자의 모든 전략 + 비귀속(strategy_id=NULL)
+          Position/Execution 을 포함한다(계좌 단위 하드 게이트용). 이 경우 동작은
+          strategy_id 파라미터 도입 이전과 **완전히 동일**하다(회귀 없음).
+        - int: 그 전략에 귀속된(Execution.strategy_id / Position.strategy_id 가 정확히
+          일치하는) 것만 합산한다. 비귀속(strategy_id=NULL) Position/Execution 은
+          **제외**된다(모듈 상단 "리스크 귀속 규칙" 주석 참조).
     :return: 당일 손익(양수=이익, 음수=손실)
     """
     start = _today_start_utc()
-    rows = (
-        await db.execute(
-            select(Execution, Order.side)
-            .join(Order, Execution.order_id == Order.id)
-            .where(Order.user_id == user_id, Execution.executed_at >= start)
-        )
-    ).all()
+    # 실현 현금흐름: side 판별을 위해 Order 조인은 유지한다. 전략 스코프면 비정규화된
+    # Execution.strategy_id 로 직접 좁힌다(Order 조인 없이도 되지만 side 가 필요하므로 유지).
+    realized_stmt = (
+        select(Execution, Order.side)
+        .join(Order, Execution.order_id == Order.id)
+        .where(Order.user_id == user_id, Execution.executed_at >= start)
+    )
+    if strategy_id is not None:
+        realized_stmt = realized_stmt.where(Execution.strategy_id == strategy_id)
+    rows = (await db.execute(realized_stmt)).all()
 
     realized = Decimal("0")
     for ex, side in rows:
@@ -130,12 +185,14 @@ async def _daily_pnl(
             realized -= gross + ex.fee
 
     # 보유 포지션 평가손익(현재가 제공된 종목만).
-    # 의도적으로 strategy_id 로 좁히지 않는다 — 일일 손실 한도는 계좌 전체를 보호하는
-    # 하드 게이트이므로 모든 전략의 포지션을 합산해 판정한다(계좌 단위 리스크).
+    # 계좌 스코프(strategy_id=None)에서는 의도적으로 strategy_id 로 좁히지 않는다 —
+    # 일일 손실 한도는 계좌 전체를 보호하는 하드 게이트이므로 모든 전략 + 비귀속 포지션을
+    # 합산해 판정한다. 전략 스코프에서는 해당 전략 귀속 포지션만 합산한다.
+    pos_stmt = select(Position).where(Position.user_id == user_id)
+    if strategy_id is not None:
+        pos_stmt = pos_stmt.where(Position.strategy_id == strategy_id)
     unrealized = Decimal("0")
-    positions = (
-        await db.scalars(select(Position).where(Position.user_id == user_id))
-    ).all()
+    positions = (await db.scalars(pos_stmt)).all()
     for pos in positions:
         cur = current_prices.get(pos.symbol)
         if cur is None or pos.qty <= 0:
@@ -169,12 +226,43 @@ async def check_stop_loss(
 
 
 async def _get_limit(db: AsyncSession, user_id: int, strategy_id: int) -> RiskLimit | None:
-    """적용할 리스크 한도를 조회한다(전략별 한도 우선, 없으면 사용자 공통 한도)."""
+    """적용할 리스크 한도를 조회한다(전략별 한도 우선, 없으면 사용자 공통 한도).
+
+    evaluate_buy(max_position_size)·check_stop_loss(stop_loss_pct) 에서 쓰인다.
+    daily_loss_limit 검사는 계좌/전략 하드 게이트를 분리하기 위해 아래
+    `_get_common_limit`·`_get_strategy_limit` 을 대신 사용한다.
+    """
     return await db.scalar(
         select(RiskLimit)
         .where(RiskLimit.user_id == user_id)
         .where((RiskLimit.strategy_id == strategy_id) | (RiskLimit.strategy_id.is_(None)))
         .order_by(RiskLimit.strategy_id.desc().nullslast())
+    )
+
+
+async def _get_common_limit(db: AsyncSession, user_id: int) -> RiskLimit | None:
+    """사용자 공통(strategy_id=NULL) 한도만 조회한다(전략 한도로 fallback 하지 않음)."""
+    return await db.scalar(
+        select(RiskLimit).where(
+            RiskLimit.user_id == user_id,
+            RiskLimit.strategy_id.is_(None),
+        )
+    )
+
+
+async def _get_strategy_limit(
+    db: AsyncSession, user_id: int, strategy_id: int
+) -> RiskLimit | None:
+    """이 전략에 **명시적으로** 설정된 한도만 조회한다(공통 한도로 fallback 하지 않음).
+
+    반환값이 None 이면 이 전략 전용 한도가 없다는 뜻이며, 이 경우 전략 하드 게이트는
+    작동하지 않는다(기존 동작과 동일).
+    """
+    return await db.scalar(
+        select(RiskLimit).where(
+            RiskLimit.user_id == user_id,
+            RiskLimit.strategy_id == strategy_id,
+        )
     )
 
 
