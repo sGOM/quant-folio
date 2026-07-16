@@ -871,7 +871,8 @@ export type AlertCode =
   | "runner_failures"
   | "pit_fallback"
   | "mdd_kill"
-  | "factor_outage";
+  | "factor_outage"
+  | "fill_quality_drift";
 
 /** 알림 심각도. critical=파국/치명, warning=주의(자동 폴백 등). */
 export type AlertSeverity = "warning" | "critical";
@@ -899,6 +900,62 @@ export interface StrategiesHealthOut {
   /** unhealthy 판정 연속 실패 임계값. */
   threshold: number;
   strategies: StrategyHealth[];
+}
+
+/** 분포 요약 통계(n·평균·표준편차·중앙값·p90·p95). 표본 없으면 n=0·나머지 null. */
+export interface MetricStats {
+  n: number;
+  mean: number | null;
+  std: number | null;
+  median: number | null;
+  p90: number | null;
+  p95: number | null;
+}
+
+/** 방향별(전체/매수/매도) 분포 요약 묶음. */
+export interface MetricBlock {
+  all: MetricStats;
+  buy: MetricStats;
+  sell: MetricStats;
+}
+
+/**
+ * 실거래–백테스트 체결 정합 실측(P2-3, GET /api/backtest/fill-quality) 응답.
+ * M1=실행 슬리피지(주문가 대비 실제 체결가) · M2=시점 규약 표류(당일종가 vs 익일종가) ·
+ * M3=총 정합 괴리(실제 체결가 vs 백테스트 가정가). 등급은 표본(min_sample) 미달 시
+ * "INSUFFICIENT"(판정 보류)가 정상 경로 — 모의투자 초기이거나 매매가 드문 전략에서 흔하다.
+ */
+export interface FillQualityReport {
+  sample: {
+    n_orders: number;
+    n_skipped: number;
+    n_clusters: number;
+    n_arrival_fallback: number;
+    min_sample: number;
+    note: string;
+  };
+  assumptions: {
+    backtest_slip_bps: number;
+    slip_base_bps: number;
+    slip_vol_scale: number;
+    annual_turnover: number | null;
+  };
+  m1_exec: MetricBlock;
+  m2_time: MetricBlock;
+  m3_total: MetricBlock;
+  checksum: { mean_abs_residual_bp: number | null; note: string };
+  annualized_drag: {
+    drag_abs_pct_per_yr: number | null;
+    drag_diff_pct_per_yr: number | null;
+  };
+  /** "INSUFFICIENT" | "GREEN" | "AMBER" | "RED". */
+  grades: { m1_exec: string; m3_total: string };
+  window: {
+    date_from: string;
+    date_to: string;
+    strategy_id: number | null;
+    turnover_estimated: boolean;
+  };
 }
 
 export interface OrderRow {
@@ -1187,6 +1244,20 @@ export const api = {
    */
   getStrategiesHealth: () =>
     request<StrategiesHealthOut>("/api/engine/strategies/health"),
+
+  /**
+   * 실거래–백테스트 체결 정합 실측 리포트(P2-3)를 조회한다. 전략을 지정하지 않으면
+   * 본인의 모든 전략 리밸런싱 체결을 합산한다. 표본이 min_sample 미만이면 등급이
+   * "INSUFFICIENT"(판정 보류)로 나오는 게 정상 — 매매 이력이 쌓일수록 신뢰도가 오른다.
+   * @param days 조회 기간(오늘 기준 최근 N일, 기본 90)
+   * @param strategyId 특정 전략만 볼 때 지정
+   */
+  getFillQuality: (days = 90, strategyId?: number) =>
+    request<FillQualityReport>(
+      `/api/backtest/fill-quality?days=${days}${
+        strategyId !== undefined ? `&strategy_id=${strategyId}` : ""
+      }`,
+    ),
 
   // --- 종목 검색 ---
   /**

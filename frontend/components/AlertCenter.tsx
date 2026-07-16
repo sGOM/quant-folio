@@ -33,6 +33,7 @@ const CODE_LABEL: Record<string, string> = {
   mdd_kill: "MDD 킬스위치",
   pit_fallback: "PIT 유니버스 폴백",
   factor_outage: "팩터 조회 장애",
+  fill_quality_drift: "체결 정합 이탈",
 };
 
 function loadStored(): AlertItem[] {
