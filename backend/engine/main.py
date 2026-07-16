@@ -25,6 +25,8 @@ from app.core.database import AsyncSessionLocal
 from app.core.redis import redis_client
 from app.models import Strategy, StrategyStatus, User
 from app.services.broker import resolve_credentials
+from app.services.live_gate import evaluate_live_gate
+from engine.alerts import publish_alert
 from engine.price_feed import PriceFeedManager
 from engine.rebalance_runner import RebalanceRunner
 from engine.runner import StrategyRunner
@@ -66,9 +68,49 @@ async def _make_runner(strategy_id: int):
     return StrategyRunner(strategy_id, redis_client)
 
 
+async def _live_gate_allows_start(strategy_id: int) -> bool:
+    """실전(prod) 전환 게이트로 전략 기동 허용 여부를 판정한다(prod 일 때만 강제).
+
+    실제 자금이 나가기 전 단계에서, 승인 플래그·체결 정합 등급을 확인해 미승인·정합
+    미달이면 아예 러너를 띄우지 않는다(주문 단위 방어와 이중 게이트). vts 는 통과.
+    게이트 실패 시 critical 알림을 보낸다. 조회 실패 등 예외는 보수적으로 기동을 막는다.
+    """
+    if settings.is_paper_trading:
+        return True
+    try:
+        async with AsyncSessionLocal() as db:
+            uid = await db.scalar(select(Strategy.user_id).where(Strategy.id == strategy_id))
+            if uid is None:
+                return False
+            gate = await evaluate_live_gate(db, uid, strategy_id)
+        if gate.passed:
+            return True
+        logger.error(
+            "실전 게이트 차단 — 전략 %d 기동 거부: %s",
+            strategy_id, "; ".join(gate.reasons),
+        )
+        await publish_alert(
+            redis_client,
+            user_id=uid,
+            strategy_id=strategy_id,
+            severity="critical",
+            code="live_gate_blocked",
+            message=(
+                f"실전 게이트 차단 — 전략 {strategy_id} 기동 거부. "
+                f"사유: {'; '.join(gate.reasons)}"
+            ),
+        )
+        return False
+    except Exception:  # noqa: BLE001 — 게이트 평가 실패는 보수적으로 기동 차단.
+        logger.exception("실전 게이트 평가 실패 — 전략 %d 기동 보수적 차단", strategy_id)
+        return False
+
+
 async def _start_strategy(strategy_id: int) -> None:
     """전략 러너 태스크를 시작하고 활성 집합·PriceFeed 를 갱신한다(이미 실행 중이면 무시)."""
     if strategy_id in _runners:
+        return
+    if not await _live_gate_allows_start(strategy_id):
         return
     stop = asyncio.Event()
     runner = await _make_runner(strategy_id)

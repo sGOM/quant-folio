@@ -1,5 +1,6 @@
 """애플리케이션 설정 — 환경변수에서 로드 (pydantic-settings)."""
 import os
+from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
@@ -92,6 +93,17 @@ class Settings(BaseSettings):
     KIS_APP_KEY: str = ""
     KIS_APP_SECRET: str = ""
     KIS_ACCOUNT_NO: str = ""  # 'CANO-PRDT' 형식 (예: 50012345-01)
+
+    # --- 실전(prod) 전환 안전 게이트 ---
+    # KIS_ENV=prod(실전) 는 실제 자금이 즉시 나가므로, 실수로 켜지는 사고를 구조적으로
+    # 막기 위한 2단계 승인 플래그. 기본값은 항상 False(안전측) — prod 로 전환하려면
+    # 명시적으로 True 로 주입해야 하며, 승인 없이 prod 면 프로세스 기동이 거부된다
+    # (아래 _ensure_prod_approval 검증기). 실전 게이트(app/services/live_gate.py)도
+    # 이 플래그가 꺼져 있으면 주문을 차단한다.
+    KIS_PROD_APPROVED: bool = False
+    # 일일 누적 주문 금액 상한(원). 당일 체결 합계가 이 값을 넘기면 실전 게이트가
+    # 신규 주문을 차단한다. None/0 이면 미적용(1회 상한은 RiskLimit.max_position_size).
+    KIS_DAILY_ORDER_NOTIONAL_CAP: Decimal | None = None
 
     # --- 토스증권 Open API ---
     # 토스는 단일 운영 도메인만 제공(모의투자 환경 없음), REST 전용(WS 미지원).
@@ -217,6 +229,22 @@ class Settings(BaseSettings):
             raise ValueError(
                 "CREDENTIAL_ENC_KEY 가 유효한 Fernet 키(base64 32바이트)가 아닙니다."
             ) from e
+        return self
+
+    @model_validator(mode="after")
+    def _ensure_prod_approval(self) -> "Settings":
+        """실전(KIS_ENV=prod) 인데 2단계 승인이 없으면 프로세스 기동을 거부한다.
+
+        실전은 실제 자금이 즉시 나가므로, 승인 플래그(KIS_PROD_APPROVED)를 명시적으로
+        켜지 않은 채 prod 로 전환되면 부팅 자체를 막아 실수 전환을 구조적으로 차단한다
+        (APP_ENV prod 검증과 동일한 '안전측 기본' 방침). 런타임 실전 게이트
+        (app/services/live_gate.py)와 이중 방어를 이룬다.
+        """
+        if self.KIS_ENV == "prod" and not self.KIS_PROD_APPROVED:
+            raise ValueError(
+                "KIS_ENV=prod(실전)인데 KIS_PROD_APPROVED 가 승인(true)되지 않았습니다. "
+                "실전 전환은 명시적 2단계 승인이 필요합니다 — KIS_PROD_APPROVED=true 를 주입하세요."
+            )
         return self
 
     @property
