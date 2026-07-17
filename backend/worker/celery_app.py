@@ -37,6 +37,12 @@ celery_app.conf.beat_schedule = {
         "task": "worker.check_fill_quality_drift",
         "schedule": crontab(day_of_week="mon", hour=9, minute=0),
     },
+    # 업종분류 PIT 스냅샷 적재(C-2 해소) — 분기 1회(1/4/7/10월 1일). 업종 재편 빈도가
+    # 낮아 이보다 촘촘한 주기는 불필요. 장 마감 이후 시간대에 실행.
+    "snapshot-sector-map-quarterly": {
+        "task": "worker.snapshot_sector_map",
+        "schedule": crontab(month_of_year="1,4,7,10", day_of_month="1", hour=19, minute=0),
+    },
 }
 
 

@@ -17,9 +17,11 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, timedelta
 
+from app.core.database import AsyncSessionLocal
 from app.services.data.loader import bounded_socket_timeout
 
 logger = logging.getLogger(__name__)
@@ -214,21 +216,39 @@ def market_caps(as_of: date) -> dict[str, int]:
 
 
 def sector_map(as_of: date | None = None) -> dict[str, str]:
-    """전 상장종목의 업종명 매핑 {code: 업종명} 을 KRX MDC(MDCSTAT03901)로 조회한다.
+    """전 상장종목의 업종명 매핑 {code: 업종명} 을 반환한다.
 
     KOSPI(STK)·KOSDAQ(KSQ) 각 시장을 요청 1회씩(총 2회)만 호출해 전종목 업종을 얻는다
     — OpenDART 기업개황(종목당 1회 호출) 대비 압도적으로 효율적이라 이쪽을 채택했다.
-    업종 분류는 사실상 정적이므로 (as_of 는 KRX 가 요구하는 조회 기준일일 뿐) 프로세스 내
-    1회 로드 후 캐시를 재사용한다. 미인증/실패/무자료 시 빈 dict 를 반환한다(호출부가
-    섹터 한도를 미적용으로 폴백하도록). 성공 결과만 캐시한다.
+    업종 분류는 사실상 정적이므로 프로세스 내 1회 로드 후 캐시를 재사용한다. 미인증/실패/
+    무자료 시 빈 dict 를 반환한다(호출부가 섹터 한도를 미적용으로 폴백하도록). 성공 결과만
+    캐시한다.
 
-    :param as_of: 조회 기준일(기본 today). 휴장일이면 최대 9일 소급해 직전 영업일로 스냅.
-        업종 분류 자체는 시점 의존이 낮으므로 정확한 PIT 는 요구하지 않는다.
+    :param as_of: PIT 조회 시점. 주어지면 먼저 ``sector_map_snapshots`` 테이블에서 as_of
+        이전(포함) 가장 가까운 스냅샷(``snapshot_sector_map`` 이 분기 1회 적재, worker
+        beat "snapshot-sector-map-quarterly")을 조회해 그 시점 분류를 PIT 로 반환한다.
+        스냅샷이 하나도 없으면(스냅샷 도입 이전 구간이거나 아직 첫 배치 전) 아래의 '현재
+        KRX 분류' 조회로 폴백하고 그 사실을 warning 로그로 남긴다. None 이면 스냅샷 조회를
+        건너뛰고 곧바로 현재 분류를 반환한다(과거 동작과 동일 — KRX 가 요구하는 조회
+        기준일로만 쓰이며, 휴장일이면 최대 9일 소급해 직전 영업일로 스냅한다).
 
-    한계(C-2, 확인됨): KRX MDC 는 '현재' 분류만 제공하고 과거 임의 시점의 분류를 조회하는
-    API 가 없다. 여러 해에 걸친 백테스트에서 이 매핑을 쓰면 현재 분류를 과거 구간에
-    소급 적용하는 약한 look-ahead 가 생긴다(호출부: portfolio.py 의 섹터 캡 로딩 참고).
+    한계(C-2, 부분 해소): KRX MDC 자체는 여전히 '현재' 분류만 제공하고 과거 임의 시점의
+    분류를 조회하는 API 가 없다. 이를 우회하기 위해 스냅샷을 지금부터 주기 적재하기
+    시작했다(분기 1회로 충분 — 업종 재편 빈도가 낮음) — **스냅샷 도입 이후** 시점부터는
+    이 함수가 실제 PIT 매핑을 준다. 스냅샷 도입 **이전** 과거 구간(수년치 백테스트의 초기
+    구간 등)은 그 시점의 분류를 보존한 데이터 소스가 없어 소급 적용이 여전히 불가능하며,
+    이 경우 현재 분류로 폴백한다(약한 look-ahead 잔존 — 호출부: portfolio.py 의 섹터 캡
+    로딩 참고). 섹터 '한도'(비중 상한) 용도라 왜곡은 제한적이다.
     """
+    if as_of is not None:
+        snap = _lookup_pit_snapshot_sync(as_of)
+        if snap:
+            return snap
+        logger.warning(
+            "업종분류 PIT 스냅샷 미확보(%s 이전 스냅샷 없음) — 현재 KRX 분류로 폴백"
+            "(C-2 잔존: 스냅샷 도입 이전 구간은 소급 불가).", as_of,
+        )
+
     global _SECTOR_CACHE
     if _SECTOR_CACHE is not None:
         return _SECTOR_CACHE
@@ -265,6 +285,111 @@ def sector_map(as_of: date | None = None) -> dict[str, str]:
         _SECTOR_CACHE = mapping
         logger.info("KRX 업종분류 로드: %d종목", len(mapping))
     return mapping
+
+
+def _lookup_pit_snapshot_sync(as_of: date) -> dict[str, str]:
+    """as_of 이전(포함) 가장 최근 업종분류 스냅샷 {code: 업종명} 을 동기 컨텍스트에서 조회한다.
+
+    이 모듈의 다른 함수처럼 블로킹 호출부(라우트가 run_in_threadpool 로 돌리는 스레드)
+    에서 쓰이므로, 이벤트루프가 없는 스레드에서 asyncio.run 으로 비동기 DB 세션을 돌린다
+    (worker.tasks 의 asyncio.run(...) 과 동일 패턴). 이미 실행 중인 이벤트루프 안(예:
+    향후 async 호출부)에서 부르면 asyncio.run 이 RuntimeError 를 내므로, 그런 호출부는
+    _lookup_pit_snapshot 코루틴을 직접 await 할 것. DB 미가동·미마이그레이션·네트워크
+    오류 등은 모두 여기서 흡수해 빈 dict 를 반환한다(호출부 sector_map 이 현재 분류로
+    자동 폴백하도록 — 자가복구).
+    """
+    try:
+        return asyncio.run(_lookup_pit_snapshot(as_of))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("업종분류 PIT 스냅샷 조회 실패(%s): %s", as_of, e)
+        return {}
+
+
+async def _lookup_pit_snapshot(as_of: date) -> dict[str, str]:
+    """as_of 이전(포함) 가장 최근 스냅샷의 {code: 업종명} 을 비동기로 조회한다.
+
+    스냅샷은 배치(snapshot_sector_map)가 한 번에 전종목을 같은 snapshot_date 로 적재하므로,
+    '가장 최근 snapshot_date' 하나만 찾으면 그 날짜의 전 종목 매핑을 그대로 쓸 수 있다.
+    """
+    from sqlalchemy import func as sa_func
+    from sqlalchemy import select
+
+    from app.models import SectorMapSnapshot
+
+    async with AsyncSessionLocal() as db:
+        latest_date = await db.scalar(
+            select(sa_func.max(SectorMapSnapshot.snapshot_date)).where(
+                SectorMapSnapshot.snapshot_date <= as_of
+            )
+        )
+        if latest_date is None:
+            return {}
+        rows = await db.execute(
+            select(SectorMapSnapshot.symbol, SectorMapSnapshot.sector).where(
+                SectorMapSnapshot.snapshot_date == latest_date
+            )
+        )
+        mapping = {code: sector for code, sector in rows.all()}
+        if mapping:
+            logger.info(
+                "업종분류 PIT 스냅샷 사용: snapshot_date=%s(요청 as_of=%s) %d종목",
+                latest_date, as_of, len(mapping),
+            )
+        return mapping
+
+
+async def snapshot_sector_map(
+    db, as_of: date | None = None, *, force: bool = False,
+) -> int:
+    """현재 KRX 업종분류를 ``sector_map_snapshots`` 에 적재한다(C-2 해소용 주기 배치).
+
+    분기 1회(worker beat "snapshot-sector-map-quarterly", worker.snapshot_sector_map
+    태스크) 실행을 전제로 한다 — 업종 재편 빈도가 낮아 더 촘촘한 주기는 불필요하다.
+
+    :param db: 비동기 DB 세션(AsyncSession). 이 함수는 flush 만 하고 commit 은 호출부
+        책임이다(다른 배치 함수들과 동일 패턴).
+    :param as_of: 스냅샷 날짜(기본 오늘). 이미 이 날짜의 스냅샷이 있으면 force=True 가
+        아닌 한 건너뛴다 — 같은 배치를 중복 실행해도 멱등이 되도록.
+    :param force: True 면 기존 as_of 스냅샷을 삭제 후 재적재한다.
+    :return: 적재한 종목 수(스킵·조회 실패 시 0).
+    """
+    from sqlalchemy import delete, func as sa_func, select
+
+    from app.models import SectorMapSnapshot
+
+    snap_date = as_of or date.today()
+
+    existing = await db.scalar(
+        select(sa_func.count()).select_from(SectorMapSnapshot).where(
+            SectorMapSnapshot.snapshot_date == snap_date
+        )
+    )
+    if existing and not force:
+        logger.info(
+            "업종분류 스냅샷(%s) 이미 존재(%d건) — 스킵(force=True 로 재적재 가능)",
+            snap_date, existing,
+        )
+        return 0
+
+    mapping = sector_map()  # 현재 KRX 분류(모듈 캐시 재사용, 없으면 신규 조회)
+    if not mapping:
+        logger.warning("업종분류 조회 실패/미인증 — 스냅샷(%s) 적재 건너뜀", snap_date)
+        return 0
+
+    if existing:
+        await db.execute(
+            delete(SectorMapSnapshot).where(SectorMapSnapshot.snapshot_date == snap_date)
+        )
+
+    db.add_all(
+        [
+            SectorMapSnapshot(symbol=code, sector=sector, snapshot_date=snap_date)
+            for code, sector in mapping.items()
+        ]
+    )
+    await db.flush()
+    logger.info("업종분류 스냅샷 적재: snapshot_date=%s %d종목", snap_date, len(mapping))
+    return len(mapping)
 
 
 def membership_union(dates: list[date], index: str = "KOSPI200") -> dict[str, list[str]]:
