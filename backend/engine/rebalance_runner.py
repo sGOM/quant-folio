@@ -25,7 +25,7 @@ from app.services.data.loader import (
     load_ohlcv,
     upsert_price_ticks,
 )
-from app.services.market import is_business_day, is_market_open, now_kst
+from app.services.market import is_business_day, is_market_open_async, now_kst
 from app.services.metrics import (
     _approx_start,
     _fetch_index_ohlcv,
@@ -102,19 +102,23 @@ class RebalanceRunner(BaseRunner):
         now = now_kst()
         rf = self._cfg.get("regime_filter") or {}
         regime_enabled = bool(rf.get("enabled"))
+        # async 래퍼로 1회만 판정(pykrx 영업일 조회의 이벤트 루프 블로킹 방지).
+        # 같은 now 를 쓰므로 틱 내내 이 값을 재사용해도 판정이 달라지지 않는다.
+        market_open = await is_market_open_async(now)
         logger.info(
             "전략 %d 틱 시작 (now=%s, regime_enabled=%s, market_open=%s)",
-            self.strategy_id, now.isoformat(), regime_enabled, is_market_open(now),
+            self.strategy_id, now.isoformat(), regime_enabled, market_open,
         )
 
         # MDD 킬스위치(파국 백스톱) — 레짐/정기 리밸런싱보다 절대 우선(역할 분리: 레짐=추세
         # 오버레이, 킬스위치=고점 대비 낙폭 서킷브레이커). 장중에만 자산가치를 평가·청산한다.
         # 발동/쿨다운 중이면 레짐·cadence 로직을 건너뛰고 즉시 청산·현금 대피만 수행한다.
-        risk = self._cfg.get("risk_layer") or {}
-        mdd_kill_pct = risk.get("mdd_kill_pct")
-        if mdd_kill_pct and is_market_open(now):
+        # (변수명 risk_layer: engine.risk 모듈 import 를 가리지 않도록 한다.)
+        risk_layer = self._cfg.get("risk_layer") or {}
+        mdd_kill_pct = risk_layer.get("mdd_kill_pct")
+        if mdd_kill_pct and market_open:
             killed = await self._evaluate_mdd_kill(
-                float(mdd_kill_pct), int(risk.get("mdd_rearm_days", 20) or 20)
+                float(mdd_kill_pct), int(risk_layer.get("mdd_rearm_days", 20) or 20)
             )
             if killed:
                 logger.info(
@@ -129,7 +133,7 @@ class RebalanceRunner(BaseRunner):
         risk_off = False
         reentry = False
         # 레짐 전환 판정은 장중에만(주문 실행 가능 시점). 매 tick 확인해 회복 즉시 반응.
-        if regime_enabled and is_market_open(now):
+        if regime_enabled and market_open:
             logger.info("전략 %d 레짐 체크 진입", self.strategy_id)
             risk_off = await self._is_risk_off()
             logger.info("전략 %d 레짐 체크 완료: risk_off=%s", self.strategy_id, risk_off)
@@ -159,7 +163,7 @@ class RebalanceRunner(BaseRunner):
             not due
             and bool(self._cfg.get("initial_fill_immediate"))
             and last is None
-            and is_market_open(now)
+            and market_open
             and not await self._has_holdings()
         )
 
@@ -332,8 +336,11 @@ class RebalanceRunner(BaseRunner):
         if equity > hwm:
             hwm = equity
         # 쿨다운 경과 → 재가동(고점 기준선 리셋)
+        # to_thread: 영업일 카운트가 날짜별 pykrx 조회(미캐시 시 네트워크)를 동반하므로
+        # 이벤트 루프를 멈추지 않게 스레드로 오프로드한다.
         if killed and kill_date is not None and (
-            self._business_days_since(kill_date, today) >= rearm_days
+            await asyncio.to_thread(self._business_days_since, kill_date, today)
+            >= rearm_days
         ):
             killed = False
             kill_date = None
@@ -402,8 +409,8 @@ class RebalanceRunner(BaseRunner):
         # price_history 로 변동성을 산출한다. 백테스트의 _compute_vol_ann(tail(253))과
         # 동일 정의를 맞추려면 최소 253봉을 확보해야 한다).
         # 리스크 레이어(P1-2) 변동성 타겟팅도 종가 히스토리를 요구한다(vol_lookback 봉+1).
-        risk = self._cfg.get("risk_layer") or {}
-        want_vol_target = bool(risk.get("target_vol"))
+        risk_layer = self._cfg.get("risk_layer") or {}
+        want_vol_target = bool(risk_layer.get("target_vol"))
         need_hist = (
             bool(rule.get("type"))
             or method in ("momentum", "custom", "all")
@@ -415,7 +422,7 @@ class RebalanceRunner(BaseRunner):
             if weighting == "inverse_vol":
                 min_bars = max(min_bars, 253)
             if want_vol_target:
-                min_bars = max(min_bars, int(risk.get("vol_lookback", 20) or 20) + 1)
+                min_bars = max(min_bars, int(risk_layer.get("vol_lookback", 20) or 20) + 1)
             history = await self._seed_history(pool, min_bars=min_bars)
             logger.info("전략 %d 히스토리 시딩 완료: %d종목", self.strategy_id, len(history))
 
@@ -443,11 +450,11 @@ class RebalanceRunner(BaseRunner):
         # 리스크 레이어(P1-2): 종목 집중 한도·변동성 타겟팅을 목표비중에 적용(백테스트
         # _targets_at 와 동일 로직 재사용). MDD 킬스위치는 계좌 고점(HWM) 상태 지속이
         # 필요해 _tick_once 상단에서 별도로 평가·청산한다(_evaluate_mdd_kill).
-        if risk and targets:
+        if risk_layer and targets:
             from app.services.backtest.portfolio import _apply_risk_caps
 
-            smap = await self._get_sector_map() if risk.get("max_sector_pct") else None
-            targets = _apply_risk_caps(targets, pd.DataFrame(history), risk, smap)
+            smap = await self._get_sector_map() if risk_layer.get("max_sector_pct") else None
+            targets = _apply_risk_caps(targets, pd.DataFrame(history), risk_layer, smap)
         return pool, targets
 
     async def _get_sector_map(self) -> dict[str, str]:
@@ -618,7 +625,7 @@ class RebalanceRunner(BaseRunner):
 
         미래참조 방지를 위해 직전 확정 영업일까지의 종가로 이동평균을 계산한다.
         레짐 필터가 꺼져 있거나 기준지수 조회에 실패하면 False(투자 유지)를 반환한다.
-        새 상태 저장은 호출부(_maybe_rebalance 의 _set_regime)가 담당한다.
+        새 상태 저장은 호출부(_tick_once 의 _set_regime)가 담당한다.
         """
         rf = self._cfg.get("regime_filter") or {}
         if not rf.get("enabled"):
