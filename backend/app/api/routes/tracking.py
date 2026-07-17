@@ -14,6 +14,9 @@
     null·warning 을 채운다.
   - 종가는 price_ticks(단일 출처)에서 조회한다. 백테스트 곡선은 저장된 result.equity_curve
     를 그대로 쓴다(재계산하지 않음).
+  - date_from 은 '표시 창'만 좁힌다(§5). NAV 재구성 자체는 언제나 이 전략의 진짜 첫 체결
+    부터 전체 재생하고, date_from 이후 구간만 잘라 반환한다 — date_from 이전부터 보유하던
+    포지션이 있어도 NAV 레벨이 어긋나지 않는다(tracking.reconstruct_realized_curve 참고).
 """
 from __future__ import annotations
 
@@ -199,7 +202,8 @@ async def get_strategy_tracking(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "시작일이 종료일보다 늦습니다."
         )
 
-    # 1) 대상 주문·체결 조회(본인·전략·체결분) → 정규화.
+    # 1) 대상 주문·체결 조회(본인·전략·체결분) → 정규화. 재생(replay)은 항상 진짜 첫 체결
+    # 부터 전체 이력으로 하고(§5), date_from 은 아래 window_execs 로 '표시'만 좁힌다.
     orders = list(
         await db.scalars(
             select(Order)
@@ -212,24 +216,33 @@ async def get_strategy_tracking(
             .order_by(Order.created_at)
         )
     )
-    execs = _normalize_executions(orders, d_from, d_to)
-    if not execs:
+    all_execs = _normalize_executions(orders, date(1970, 1, 1), d_to)
+    if not all_execs:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "해당 기간 실측 체결이 없습니다(모의투자/실거래 체결 후 이용 가능).",
+        )
+    window_execs = [e for e in all_execs if e["date"].date() >= d_from]
+    if not window_execs:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             "해당 기간 실측 체결이 없습니다(모의투자/실거래 체결 후 이용 가능).",
         )
 
-    exec_dates = [e["date"].date() for e in execs]
-    eff_from = min(exec_dates)
-    eff_to = max(max(exec_dates), d_to)
+    window_dates = [e["date"].date() for e in window_execs]
+    eff_from = min(window_dates)
+    eff_to = max(max(window_dates), d_to)
+    all_dates = [e["date"].date() for e in all_execs]
+    replay_from = min(all_dates)
 
-    # 2) 종가 패널 조회(price_ticks). 첫 체결일부터 종료일까지.
-    symbols = sorted({e["symbol"] for e in execs})
-    start_dt = datetime.combine(eff_from, time(0, 0, 0), tzinfo=KST)
+    # 2) 종가 패널 조회(price_ticks). 재생 시작일(진짜 첫 체결일)부터 종료일까지 —
+    # display_from 이전 보유 종목의 시세도 필요하다(§5).
+    symbols = sorted({e["symbol"] for e in all_execs})
+    start_dt = datetime.combine(replay_from, time(0, 0, 0), tzinfo=KST)
     end_dt = datetime.combine(eff_to, time(23, 59, 59), tzinfo=KST)
     panel = await _build_close_panel(db, symbols, start_dt, end_dt)
 
-    # 3) 실측 NAV 재구성.
+    # 3) 실측 NAV 재구성 — 전체 이력을 재생하되 display_from(=d_from) 이후만 반환(§5).
     cfg = strategy.config or {}
     capital = float(
         initial_capital
@@ -237,8 +250,14 @@ async def get_strategy_tracking(
         else (cfg.get("cash") or _DEFAULT_CAPITAL)
     )
     realized_curve, notes = reconstruct_realized_curve(
-        execs, panel, initial_capital=capital
+        all_execs, panel, initial_capital=capital, display_from=d_from,
     )
+    if replay_from < eff_from:
+        n_prior = sum(1 for d in all_dates if d < eff_from)
+        notes.append(
+            f"조회 구간 이전 체결 {n_prior}건을 반영해 표시 구간 시작 시점의 초기 보유·현금을"
+            " 산출했습니다(표시 구간 자체는 그대로 유지)."
+        )
 
     # 4) 비교 백테스트 매칭.
     bt_query = select(Backtest).where(Backtest.strategy_id == strategy_id)
@@ -279,8 +298,8 @@ async def get_strategy_tracking(
         backtest_index=[CurvePoint(**p) for p in tracking["backtest_index"]],
         metrics=TrackingMetrics(**tracking["metrics"]),
         sample=TrackingSample(
-            n_executions=len(execs),
-            n_symbols=len(symbols),
+            n_executions=len(window_execs),
+            n_symbols=len({e["symbol"] for e in window_execs}),
             n_realized_days=len(realized_curve),
             n_backtest_days=len(backtest_curve),
         ),

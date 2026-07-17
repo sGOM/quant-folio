@@ -44,15 +44,22 @@
   주어지면, 종목별 20일 ADV(거래대금, rolling·미래참조 없음)의 그 비율을 하루 매매 상한으로
   삼아 초과분을 절사한다(잔량은 다음 리밸런싱에서 재평가 — 이월 큐를 별도로 두지 않는
   단순화된 모델). volume_panel 미공급 시 설정돼 있어도 경고 로그만 남기고 미적용.
+- **호가단위·상하한가(price_limit_model, opt-in, §4)**: config.price_limit_model=True 면
+  체결가를 KRX 가격대별 호가단위로 라운딩하고, 전일종가 대비 ±30% 상하한가에 도달한
+  방향의 주문(매수는 상한가, 매도는 하한가)을 그날 체결 불가로 막아 다음 리밸런싱으로
+  이월한다. 기본 False — 기존 결과 재현성 보존(옵트인 재검증 대상, docs/improvements.md §4).
 
 알려진 한계(실거래와의 차이)
 --------------------------
 - 목표비중은 '현재 포트폴리오 평가액'(복리) 기준으로 산정한다(실거래는 배정 capital 고정).
   백테스트는 복리 성장을 반영하는 것이 성과추정에 더 적절하다.
-- 슬리피지는 slippage_bps(변동성 스케일 옵션)로 반영한다. 상하한가·호가단위는 아직
-  반영하지 않는다(슬리피지에 근사 흡수돼 있다고 보수적으로 해석할 것).
-- 회전율(turnover)·거래 로그의 거래대금은 ADV 캡·정수주 절사 '이전'(의도된 드리프트
-  보정치) 기준이다 — 실제 체결액은 그보다 작거나 같다(사후 분석 시 참고).
+- 슬리피지는 slippage_bps(변동성 스케일 옵션)로 반영한다. 상하한가·호가단위는
+  price_limit_model 옵트인으로만 반영된다(기본 미적용 시 슬리피지에 근사 흡수돼 있다고
+  보수적으로 해석할 것).
+- 회전율(turnover)·거래 로그의 거래대금은 기본적으로 ADV 캡·정수주 절사 '이전'(의도된
+  드리프트 보정치) 기준이다 — 실제 체결액(ADV 캡·정수주 절사·상하한가 체결불가 반영
+  이후)은 avg_turnover_actual 로 별도 노출한다(§7). 개별 거래 로그(trades[].amount)는
+  애초부터 이 절사들을 모두 반영한 실체결액이다(집계 지표만 사전/사후 두 버전이 있는 것).
 - 생존편향: 가격 패널이 '현재 상장 종목' 기준이면 과거 성과가 상방 편향될 수 있다.
 - 레짐 필터는 일별로 판정한다. 청산은 risk-off 즉시, 재진입은 risk-on 회복 즉시 이뤄진다
   (실거래 러너와 동일 규약). 왕복 매매비용(fees+tax)은 _apply_rebalance 에서 그대로 차감된다.
@@ -396,6 +403,44 @@ def _trade_rec(
     }
 
 
+# KRX 호가단위표(2023-01-25 개정, 코스피·코스닥 통일). (가격 미만 상한, 호가단위원) 오름차순.
+_TICK_BANDS: list[tuple[float, float]] = [
+    (2_000, 1),
+    (5_000, 5),
+    (20_000, 10),
+    (50_000, 50),
+    (200_000, 100),
+    (500_000, 500),
+    (float("inf"), 1_000),
+]
+
+
+def _krx_tick_size(price: float) -> float:
+    """KRX 가격대별 호가단위(원)를 반환한다."""
+    for upper, tick in _TICK_BANDS:
+        if price < upper:
+            return tick
+    return _TICK_BANDS[-1][1]
+
+
+def _round_to_tick(price: float | None) -> float | None:
+    """가격을 그 가격대의 KRX 호가단위 배수로 반올림한다(price_limit_model opt-in 전용).
+
+    None/NaN/0 이하는 그대로 통과시킨다(호출부가 결측 처리를 맡는다).
+    """
+    if price is None or not np.isfinite(price) or price <= 0:
+        return price
+    tick = _krx_tick_size(price)
+    return round(price / tick) * tick
+
+
+def _price_limit_band(prev_close: float) -> tuple[float, float]:
+    """전일종가 기준 ±30% 상하한가를 호가단위로 라운딩해 (하한, 상한)을 반환한다."""
+    lower = _round_to_tick(prev_close * 0.7) or 0.0
+    upper = _round_to_tick(prev_close * 1.3) or 0.0
+    return lower, upper
+
+
 def _floor_to_shares(amt: float, sym: str, prices: pd.Series | None, capital: float) -> float:
     """정규화 거래대금을 KRX 정수주 단위로 절사한 정규화 거래대금으로 변환한다(A-1).
 
@@ -448,7 +493,9 @@ def _apply_rebalance(
     integer_shares: bool = True,
     adv_cap_frac: float = 0.0,
     adv_map: pd.Series | None = None,
-) -> tuple[float, float]:
+    price_limit_model: bool = False,
+    prev_prices: pd.Series | None = None,
+) -> tuple[float, float, float]:
     """목표비중으로 리밸런싱하며 비용을 차감하고 거래 로그를 남긴다(매도 먼저 → 매수).
 
     :param val: 종목→평가액(정규화 단위). 함수가 제자리 수정한다.
@@ -461,16 +508,44 @@ def _apply_rebalance(
     :param integer_shares: True(기본)면 체결 거래대금을 정수주 단위로 절사(A-1).
     :param adv_cap_frac: ADV 대비 1일 참여율 상한(0=미적용, A-2).
     :param adv_map: 종목→ADV(KRW) Series. adv_cap_frac>0 일 때만 사용.
-    :return: (리밸런싱 후 cash, 회전율 turnover=Σ|Δw|, 의도된 드리프트 기준).
+    :param price_limit_model: True 면 체결가를 KRX 호가단위로 라운딩하고, 전일종가 대비
+        ±30% 상하한가에 도달한 방향의 주문을 체결 불가(다음 리밸런싱 이월)로 막는다(opt-in,
+        improvements.md §4). 기본 False — 기존 결과 재현성 보존.
+    :param prev_prices: 전일(직전 거래일) 종가 Series. price_limit_model=True 일 때만 상하한가
+        밴드 판정에 쓰인다. None 이면 상하한가 판정을 건너뛴다(호가단위 라운딩은 그대로 적용).
+    :return: (리밸런싱 후 cash, 회전율 turnover=Σ|Δw|(의도된 드리프트 기준),
+        executed_notional=ADV 캡·정수주 절사·상하한가 체결불가 반영 이후 실체결 거래대금 합
+        (정규화 단위, §7)).
     """
     if equity <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     def _slip(sym: str) -> float:
         if slip_map and sym in slip_map:
             return slip_map[sym]
         return slip_base
 
+    # 체결가(fill_prices): price_limit_model 이 켜져 있으면 호가단위로 라운딩한 가격을
+    # 정수주 환산·거래 로그에 쓴다. 마크투마켓(메인 루프)은 실제 종가를 그대로 쓰므로
+    # 이 라운딩은 체결 정밀도에만 영향을 준다(평가액 로직은 불변).
+    fill_prices = prices
+    if price_limit_model and prices is not None:
+        fill_prices = prices.map(lambda p: _round_to_tick(float(p)) if pd.notna(p) else p)
+
+    def _limit_blocked(sym: str, side: str) -> bool:
+        """전일종가 대비 상하한가 도달로 이 방향 주문이 체결 불가인지 판정한다."""
+        if not price_limit_model or prev_prices is None or prices is None:
+            return False
+        cur_p = prices.get(sym)
+        prev_p = prev_prices.get(sym)
+        if cur_p is None or pd.isna(cur_p) or prev_p is None or pd.isna(prev_p) or float(prev_p) <= 0:
+            return False
+        lower, upper = _price_limit_band(float(prev_p))
+        if side == "buy":
+            return float(cur_p) >= upper - 1e-6
+        return float(cur_p) <= lower + 1e-6
+
+    executed_notional = 0.0
     port_return = equity - 1.0  # 시작 자산 1.0 앵커 기준 누적수익률
 
     sells: list[tuple[str, float]] = []
@@ -511,12 +586,14 @@ def _apply_rebalance(
 
     # 매도 먼저 실행(현금 확보) — 포지션 원가 대비 수익률을 로그로 남긴다
     for sym, amt in sells:
+        if _limit_blocked(sym, "sell"):
+            continue  # 하한가 도달 — 매도 체결 불가(다음 리밸런싱으로 이월, §4)
         cur_val = val.get(sym, 0.0)
         # 전량 청산(ADV 캡으로 amt 가 이미 줄었다면 '전량'이 아니므로 절사 대상이 된다) 만
         # 정수주 절사를 건너뛴다 — 보유 전량을 정리하는 거래에 소수점 잔량을 남기지 않기 위함.
         is_full_exit = amt >= cur_val - 1e-9
         if integer_shares and not is_full_exit:
-            amt = _floor_to_shares(amt, sym, prices, capital)
+            amt = _floor_to_shares(amt, sym, fill_prices, capital)
         amt = min(amt, cur_val)
         if amt <= 1e-12:
             continue
@@ -531,16 +608,18 @@ def _apply_rebalance(
             val.pop(sym, None)
             cost.pop(sym, None)
         trades.append(
-            _trade_rec(d, sym, "sell", amt, prices, capital, port_return, pos_ret, reason)
+            _trade_rec(d, sym, "sell", amt, fill_prices, capital, port_return, pos_ret, reason)
         )
+        executed_notional += amt
 
     # 매수: 정수주 절사(A-1) 먼저 적용한 뒤, 현금 부족 시 비례 축소(음수 현금 방지).
     # 절사 후 축소이므로 축소가 다시 소수점 금액을 만들 수 있으나, floor 로 만든 금액은
     # 이미 실제 정수주 가치이고 scale(<=1) 은 그 정수주 중 '몇 주를 못 산다'는 의미이므로
     # 축소된 buy_cost 가 cash 를 넘지 않게만 하고 별도 재절사는 하지 않는다(과최적화 방지 —
     # 근소한 초과 매수 방지가 목적이지 소수점 주수 재현이 목적이 아님).
+    buys = [(sym, amt) for sym, amt in buys if not _limit_blocked(sym, "buy")]
     if integer_shares:
-        buys = [(sym, _floor_to_shares(amt, sym, prices, capital)) for sym, amt in buys]
+        buys = [(sym, _floor_to_shares(amt, sym, fill_prices, capital)) for sym, amt in buys]
     total_buy_cost = sum(amt * (1.0 + fees + _slip(sym)) for sym, amt in buys)
     scale = 1.0
     if total_buy_cost > cash and total_buy_cost > 0:
@@ -554,10 +633,11 @@ def _apply_rebalance(
         val[sym] = val.get(sym, 0.0) + amt
         cost[sym] = cost.get(sym, 0.0) + amt  # 원가는 수수료 제외 매수액으로 적립
         trades.append(
-            _trade_rec(d, sym, "buy", amt, prices, capital, port_return, None, reason)
+            _trade_rec(d, sym, "buy", amt, fill_prices, capital, port_return, None, reason)
         )
+        executed_notional += amt
 
-    return cash, turnover
+    return cash, turnover, executed_notional
 
 
 def run_rebalance_backtest(
@@ -599,8 +679,10 @@ def run_rebalance_backtest(
         산출한다. None 이면 캡이 설정돼 있어도 미적용(경고 로그만).
     :return: {total_return, mdd, sharpe, sortino, cagr, alpha, beta, information_ratio,
         tracking_error, benchmark_return, excess_return, win_rate, num_trades,
-        num_rebalances, num_kills, num_panic_events, factor_ic, avg_turnover, equity_curve,
-        markers, holdings, trades} — JSON. num_kills 는 MDD 킬스위치(risk_layer) 발동 횟수.
+        num_rebalances, num_kills, num_panic_events, factor_ic, avg_turnover,
+        avg_turnover_actual, equity_curve, markers, holdings, trades} — JSON. avg_turnover_actual
+        은 ADV 캡·정수주 절사·상하한가 체결불가(§4) 반영 이후 실체결 기준 평균 회전율(§7,
+        avg_turnover 이하). num_kills 는 MDD 킬스위치(risk_layer) 발동 횟수.
         num_panic_events 는 패닉 오버레이 Confirm(재진입) 발동 횟수(P2). 리스크 레이어
         (집중 한도·변동성 타겟팅)는 목표비중에 반영되며 markers 에 'mdd_exit' 로 킬스위치
         청산이, 'panic_confirm'/'panic_scale_full'/'panic_exit_*' 로 오버레이 이벤트가
@@ -655,9 +737,11 @@ def run_rebalance_backtest(
     slip_vol_scale = max(0.0, float(config.get("slippage_vol_scale", 0.0) or 0.0))
     rf_annual = float(config.get("risk_free_rate", 0.0) or 0.0)  # 위험조정지표용 무위험수익률(연)
 
-    # 체결 정밀도(P2-2): A-1 정수주, A-2 ADV 참여율 캡.
+    # 체결 정밀도(P2-2): A-1 정수주, A-2 ADV 참여율 캡. 체결 모델 정밀화(§4, opt-in):
+    # 호가단위 라운딩 + 상하한가 체결 불가. 기본 False — 기존 결과 재현성 보존.
     integer_shares = bool(config.get("integer_shares", True))
     adv_cap_frac = float(config.get("adv_participation_cap") or 0.0)
+    price_limit_model = bool(config.get("price_limit_model", False))
     adv_frame: pd.DataFrame | None = None
     if adv_cap_frac > 0:
         if volume_panel is not None and not volume_panel.empty:
@@ -793,6 +877,7 @@ def run_rebalance_backtest(
     equity_curve: list[dict] = []
     markers: list[dict] = []
     turnovers: list[float] = []
+    turnovers_actual: list[float] = []  # 실체결(ADV 캡·정수주·상하한가 반영 이후) 거래대금(§7)
     trades: list[dict] = []
 
     # 결정(선정·청산)과 체결을 분리한다. next_close 면 어떤 날 d 에 내린 결정을 다음
@@ -800,25 +885,39 @@ def run_rebalance_backtest(
     # 결정 근거는 언제나 결정일 d 까지의 데이터만 쓰므로 미래참조가 없다.
     pending: dict | None = None
 
-    def _run_decision(decision: dict, prices: pd.Series, d: pd.Timestamp, cash: float) -> float:
-        """decision(청산/리밸런싱)을 d 종가로 체결한다(val/cost/trades 등 제자리 수정)."""
+    def _run_decision(
+        decision: dict,
+        prices: pd.Series,
+        d: pd.Timestamp,
+        cash: float,
+        limit_ref_prices: pd.Series | None = None,
+    ) -> float:
+        """decision(청산/리밸런싱)을 d 종가로 체결한다(val/cost/trades 등 제자리 수정).
+
+        :param limit_ref_prices: 상하한가 밴드 판정 기준이 되는 '체결일 직전 거래일' 종가
+            (price_limit_model=True 일 때만 사용). fill_mode=next_close 면 결정일의 종가와
+            같다(체결은 다음날이지만 밴드는 그 전날 종가 기준).
+        """
         equity = cash + sum(val.values())
         adv_today = adv_frame.loc[d] if adv_frame is not None else None
         if decision["kind"] == "liquidate":
             if not val:
                 return cash
             slip_map = _vol_slippage_map(panel.loc[:d], list(val), slip_base, slip_vol_scale)
-            cash, turnover = _apply_rebalance(
+            cash, turnover, exec_notional = _apply_rebalance(
                 val, cost, {}, equity, prices, d, capital,
                 drift_band, fees, tax, trades,
                 liquidate=True, reason=decision["reason"],
                 slip_base=slip_base, slip_map=slip_map,
                 integer_shares=integer_shares, adv_cap_frac=adv_cap_frac, adv_map=adv_today,
+                price_limit_model=price_limit_model, prev_prices=limit_ref_prices,
             )
             if turnover > 0:
                 turnovers.append(turnover)
                 mk = "mdd_exit" if decision["reason"] == "mdd_kill" else "regime_exit"
                 markers.append({"t": d.isoformat(), "type": mk})
+            if exec_notional > 0:
+                turnovers_actual.append(exec_notional)
         else:  # rebalance
             # 체결일 가격이 없는 종목은 제외(매매 불가). next_close 면 체결일 = d.
             targets = {
@@ -829,11 +928,12 @@ def run_rebalance_backtest(
                 slip_map = _vol_slippage_map(
                     panel.loc[:d], list(set(targets) | set(val)), slip_base, slip_vol_scale
                 )
-                cash, turnover = _apply_rebalance(
+                cash, turnover, exec_notional = _apply_rebalance(
                     val, cost, targets, equity, prices, d, capital,
                     drift_band, fees, tax, trades, reason=decision["reason"],
                     slip_base=slip_base, slip_map=slip_map,
                     integer_shares=integer_shares, adv_cap_frac=adv_cap_frac, adv_map=adv_today,
+                    price_limit_model=price_limit_model, prev_prices=limit_ref_prices,
                 )
                 if turnover > 0:
                     turnovers.append(turnover)
@@ -842,10 +942,15 @@ def run_rebalance_backtest(
                         "type": "rebalance",
                         "holdings": len(val),
                     })
+                if exec_notional > 0:
+                    turnovers_actual.append(exec_notional)
         return cash
 
     for i, d in enumerate(sim_dates):
         prices = panel.loc[d]
+        # 상하한가 밴드 기준(직전 거래일 종가) — 아래에서 prev_prices 를 오늘자로 갱신하기
+        # 전에 캡처해둔다. next_close 체결도 '체결일의 전날' 종가를 정확히 가리킨다.
+        limit_ref_prices = prev_prices
         # 1) 당일 수익률 반영(보유 종목 평가액 갱신) + 상장폐지 손실 확정
         if prev_prices is not None and val:
             for sym in list(val):
@@ -867,7 +972,7 @@ def run_rebalance_backtest(
 
         # 2) 전일 결정의 지연 체결(next_close). same_close 면 pending 이 항상 비어 있다.
         if pending is not None:
-            cash = _run_decision(pending, prices, d, cash)
+            cash = _run_decision(pending, prices, d, cash, limit_ref_prices)
             pending = None
 
         # 3) MDD 킬스위치 상태 갱신(P1-2) — 마크투마켓·지연체결 반영 후 자산가치로 판정.
@@ -1028,7 +1133,7 @@ def run_rebalance_backtest(
             if defer:
                 pending = decision      # 익일 종가 체결로 이월
             else:
-                cash = _run_decision(decision, prices, d, cash)
+                cash = _run_decision(decision, prices, d, cash, limit_ref_prices)
 
         equity_now = cash + sum(val.values())
         equities_norm.append(equity_now)
@@ -1103,6 +1208,9 @@ def run_rebalance_backtest(
         "num_panic_events": num_panic_events,  # 패닉 오버레이 Confirm(재진입) 발동 횟수(P2)
         "factor_ic": factor_ic,  # 팩터별 IC·IR·롱숏수익(P1-1, score 전략만; 그 외 {})
         "avg_turnover": _safe(np.mean(turnovers)) if turnovers else 0.0,
+        # 실체결 기준(ADV 캡·정수주 절사·상하한가 체결불가 반영 이후) 평균 회전율(§7).
+        # avg_turnover(의도된 드리프트 기준)보다 항상 작거나 같다 — 기존 필드 의미는 불변.
+        "avg_turnover_actual": _safe(np.mean(turnovers_actual)) if turnovers_actual else 0.0,
         "equity_curve": equity_curve,
         "markers": markers,
         "holdings": holdings,
