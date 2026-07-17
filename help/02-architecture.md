@@ -107,6 +107,10 @@ engine 은 5초마다 `engine:heartbeat` 키를 TTL 15초로 갱신한다
 (`engine/main.py` `_heartbeat_loop`). web 의 `GET /api/engine/status` 는 그 키가
 있는지로 엔진 생존을 판단한다. (TTL 이 지나 키가 사라지면 = 엔진 죽음)
 
+전략(러너) 단위 생존은 별도로 `engine:health:{strategy_id}` 키에 기록된다 —
+마지막 성공 시각·연속 실패 횟수가 담기고, 연속 실패가 임계(3회)에 달하면
+`alert` 이벤트로 사용자에게 경보가 발행된다(`engine/alerts.py`).
+
 ---
 
 ## 4. 데이터 흐름 한 장 요약
@@ -149,6 +153,6 @@ Spring 으로 치면 API Gateway 한 대만 공개하고 나머지는 사설망�
 → [03-fastapi-for-spring-developers.md](03-fastapi-for-spring-developers.md)
 
 ### 직접 열어볼 파일
-- `backend/app/core/channels.py` — **40줄, 필독.** web↔engine 규약의 단일 출처.
+- `backend/app/core/channels.py` — **60줄, 필독.** web↔engine 규약의 단일 출처.
 - `backend/engine/main.py` — 엔진이 제어 명령을 받고 전략을 켜고 끄는 루프.
 - `backend/app/api/routes/engine.py` — web 이 명령을 발행하는 쪽.

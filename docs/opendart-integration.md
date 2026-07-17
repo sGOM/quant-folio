@@ -70,38 +70,16 @@
 > 현금흐름표(FCF/F-Score)는 OpenDART가 정석.** (라이브 스크리닝은 KIS, 백테스트는
 > OpenDART 로 역할 분담 권장.)
 
-## 이미 준비된 것 (이 커밋)
+## 인프라 배선(참고)
 
 - `app/core/config.py`: `OPENDART_API_KEY`(시크릿 파일 필드) + `OPENDART_BASE_URL` +
   `settings.has_opendart` 프로퍼티.
-- `secrets/opendart_api_key.txt`(빈 파일) + docker-compose secret 배선 +
+- `secrets/opendart_api_key.txt` + docker-compose secret 배선 +
   `.env.example`(`OPENDART_API_KEY_FILE`) + `secrets/README.md`.
-- `app/services/data/opendart.py`: 클라이언트 스캐폴딩.
-  - `is_enabled()` — 키 없으면 False(전 조회 비활성).
-  - `_get()` — 공통 호출부(status "000"만 성공, "013" 무자료 None, 실패 None).
-  - `corp_code_map()` — 종목코드→corp_code(모든 재무 API 선행 필요). **동작 구현됨.**
-  - `single_company_accounts()` — 단일회사 전체 재무제표 원계정. **동작 구현됨.**
-  - `derive_metrics()` — ROE·부채비율·영업이익·FCF 파생 **⚠️ TODO(미구현, None 반환).**
-  - `announcement_lagged_year()` — 룩어헤드 방지용 공시지연 규칙(연간 기준).
-
-## 승인 후 배선 순서(To-Do)
-
-1. **키 주입 확인**: 발급키를 `secrets/opendart_api_key.txt`에 넣고
-   `docker compose exec -T web python -c "from app.services.data import opendart as o; print(o.is_enabled(), len(o.corp_code_map() or {}))"` 로 corp_code 매핑 로드 검증.
-2. **`derive_metrics()` 구현** — 가장 큰 작업. `account_nm` 표준화가 관건(회사/업종/
-   작성기준별 계정명 상이). 표준 계정 매핑 테이블을 만들고, 연결(CFS) 우선·개별(OFS)
-   폴백. 우선 ROE·부채비율·영업이익·순이익부터, 그다음 FCF, 마지막 F-Score(다년치).
-3. **캐시 계층** — corp_code 매핑(하루 1회)·재무제표(연·분기 단위)를 DB 또는 Redis에
-   캐시. 일 20,000건 요율·종목당 개별 호출이라 벌크 백테스트 시 필수.
-4. **PIT/룩어헤드** — `announcement_lagged_year`(+분기별 세분: 1Q 5월중순 / 2Q 8월중순
-   / 3Q 11월중순 / 4Q 이듬해 3월말)를 백테스트 fundamentals_provider에 반영해, 공시일
-   이전 시점엔 해당 실적을 쓰지 않도록 강제.
-5. **팩터 배선** — `app/services/metrics/factors.py::_compute_stock_scores` / `metrics/fetch.py::_fetch_fundamentals`
-   와 `backtests.py::_fundamentals_provider`에 OpenDART 파생지표를 합류. 새 팩터군(quality)
-   또는 기존 value군 확장. **factor_weights 스키마 확장 필요 시** `schemas/strategy.py`.
-6. **전략 정의** — 우량가치(저PBR·저PER + 고ROE·저부채) / 실적상향(영업이익 YoY 서프라이즈
-   + 가격모멘텀) 전략 config 등록. 소형주 턴어라운드는 시총(KIS/KRX)·상폐필터까지 필요.
-7. **테스트** — 파생 계산 단위테스트(대표 종목 수치 검증), 공시지연 경계 테스트.
+- `app/services/data/opendart.py`: `is_enabled()`(키 없으면 전 조회 비활성) ·
+  `corp_code_map()` · `single_company_accounts()` · `derive_metrics()` ·
+  `announcement_lagged_year()`(룩어헤드 방지 공시지연 규칙) — 모두 구현 완료.
+  키 주입 검증: `docker compose exec -T web python -c "from app.services.data import opendart as o; print(o.is_enabled(), len(o.corp_code_map() or {}))"`
 
 ## 아직 OpenDART로도 안 되는 것
 

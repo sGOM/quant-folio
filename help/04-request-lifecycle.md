@@ -73,6 +73,10 @@ response.set_cookie(SESSION_COOKIE, sid,
 > `OAuth2PasswordRequestForm` 때문에 로그인은 JSON 이 아니라 **form 데이터**이고,
 > 이메일이 `username` 필드로 들어온다. Swagger 의 "Authorize" 버튼과 호환되는 관용구.
 
+실패가 누적된 이메일/IP 는 일정 시간 차단(429)하는 **브루트포스 방어**가 걸려 있고,
+로그인 성공 시 해당 카운터가 리셋된다(bcrypt 해싱은 오프라인 공격 방어, 이건 온라인
+추측 공격 방어 — 서로 별개의 층).
+
 ### (c) 이후 인증된 요청 (예: `GET /api/auth/me`)
 
 ```

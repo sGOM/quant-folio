@@ -14,11 +14,16 @@
 ```
 main()
  ├─ 시그널 핸들러 등록 (SIGTERM/SIGINT → 그레이스풀 종료)
- ├─ _recover()         : DB 에서 status=LIVE 인 전략을 찾아 다시 켠다(재기동 복구)
- ├─ _control_loop()    : Redis engine:control 구독 → start/stop 명령 수신 (코루틴)
- ├─ _heartbeat_loop()  : 5초마다 engine:heartbeat 갱신(TTL 15s) (코루틴)
- └─ _shutdown.wait()   : 종료 신호까지 대기 → 모든 러너/피드 정리 후 종료
+ ├─ _recover()          : DB 에서 status=LIVE 인 전략을 찾아 다시 켠다(재기동 복구)
+ ├─ _control_loop()     : Redis engine:control 구독 → start/stop 명령 수신 (코루틴)
+ ├─ _heartbeat_loop()   : 5초마다 engine:heartbeat 갱신(TTL 15s) (코루틴)
+ ├─ _reconcile_loop()   : 주기적으로 미체결 주문을 KIS 에 재조회해 체결 보정 (코루틴)
+ ├─ _fill_notice_loop() : 사용자별 KIS 실시간 체결통보(H0STCNI0/9) 구독 동기화 (코루틴)
+ └─ _shutdown.wait()    : 종료 신호까지 대기 → 모든 러너/피드 정리 후 종료
 ```
+
+전략 시작 전에는 **실전 전환 게이트**(`app/services/live_gate.py`)를 통과해야 한다 —
+실전(prod) 환경이면 정합 등급·금액 상한·승인 플래그를 검사해 미달 시 시작을 거부한다.
 
 핵심 자료구조:
 
@@ -41,7 +46,12 @@ _feed_mgr = PriceFeedManager(...) # 사용자별 시세 WS 피드 관리자
 
 ## 2. 전략 1개가 도는 법 (`engine/runner.py` — `StrategyRunner`)
 
-`run()` 은 단순한 폴링 루프다(`_POLL_INTERVAL = 30초`):
+러너는 2종류다 — 단일종목 신호를 보는 `StrategyRunner`(30초 주기)와 멀티팩터
+리밸런싱을 수행하는 `RebalanceRunner`(`engine/rebalance_runner.py`, 60초 주기).
+공통 골격(전략 적재·실행 루프·주문 래핑·분산 락)은 **`engine/base_runner.py` 의
+`BaseRunner`** 가 담당하고, 서브클래스는 틱 본문(`_tick_once`)만 구현한다.
+
+`run()` 은 단순한 폴링 루프다(`_poll_interval = 30초`):
 
 ```python
 async def run(self, stop_event):
@@ -122,24 +132,40 @@ except IntegrityError: await db.rollback(); return None
 > "락은 성능 최적화, **정합성의 진짜 보증은 DB 제약**" — 분산 시스템의 정석.
 > Java 로 치면 Redisson 락 + DB unique index 조합과 같은 패턴.
 
-### 주문 후 체결 처리
+### 주문 후 체결 처리 — 3중 경로
 
 ```python
 res = await broker.place_order(symbol, side, qty, order_type="market")  # 시장가 접수
 fill_qty, fill_price = await _resolve_fill(broker, order, qty, price)   # 실제 체결 조회
-await _record_fill(db, order, fill_qty, fill_price)                      # 기록 + 포지션 갱신
-await _publish(redis, {"type":"execution", ...})                        # WS 로 알림
+await record_fill(db, order, fill_qty, fill_price, ...)                 # 기록 + 포지션 갱신
+# → record_fill 내부에서 WS 이벤트({"type":"execution", ...})도 발행
 ```
 
 **중요**: 시장가라도 신호 시점가와 실제 체결가는 다르다. 그래서 KIS 체결조회
 (`get_order_execution`)로 **실제 평균체결가**를 받아 기록한다(`_resolve_fill`).
 조회 실패 시에만 신호가로 폴백(경고 로그).
 
-`_record_fill` 의 평균단가 갱신(매수 시):
+체결 반영 경로는 **3중**이며, 셋 다 공유 모듈 `engine/fills.py` 의 `record_fill` 을
+단일 진입점으로 쓴다(포지션·주문 상태 일관성):
+
+| 경로 | 모듈 | 시점 |
+|------|------|------|
+| 주문 직후 1회 조회 | `executor.py` (`_resolve_fill`) | 주문 접수 직후 |
+| 주기적 미체결 재조회 | `reconcile.py` (`_reconcile_loop`) | 부분체결·지연체결 보정 |
+| 실시간 체결통보 | `fill_notice.py` (KIS H0STCNI0/9 WS) | 체결 즉시 푸시 |
+
+세 경로가 같은 주문을 중복 기록하지 않도록, reconcile·fill_notice 는 "이미 기록된
+누적 체결수량 대비 **델타만 반영**" 하는 멱등 방식을 쓴다.
+
+`record_fill` 의 평균단가 갱신(매수 시):
 ```python
 new_qty = pos.qty + fill_qty
 pos.avg_price = (pos.qty * pos.avg_price + fill_qty * price) / new_qty  # 가중평균
 ```
+
+**포지션 스코프 주의**: Position/Execution 은 `(user_id, strategy_id, symbol)` 로
+스코프된다 — 여러 전략이 같은 종목을 동시에 보유해도 전략별로 분리 기록된다.
+`strategy_id=NULL` 인 포지션은 "비귀속"(수동·레거시 또는 전략 삭제 잔여)이다.
 
 ---
 
@@ -170,6 +196,11 @@ pos.avg_price = (pos.qty * pos.avg_price + fill_qty * price) / new_qty  # 가중
 
 `_daily_pnl` 은 **당일 실현 손익(체결 현금흐름) + 보유 포지션 평가손익**을 합산한다.
 한도 조회(`_get_limit`)는 **전략별 한도 우선, 없으면 사용자 공통 한도** 순으로 찾는다.
+
+일일 손실 한도는 **계좌 스코프와 전략 스코프의 이중(AND) 하드 게이트**다:
+- **계좌 스코프**: 비귀속(strategy_id=NULL) 포지션·체결까지 전부 합산 — 계좌 전체 보호.
+- **전략 스코프**: 전략별 한도가 설정된 경우, 그 전략에 귀속된 것만 합산해 추가 검사
+  (비귀속은 제외 — 특정 전략의 손실이 아니므로).
 
 config 기반 청산(`runner._config_exit`)도 별도로 있다 — `stop_loss_pct` /
 `take_profit_pct` / `trailing_stop_pct`. **트레일링 스탑**은 보유 중 고점을 Redis
@@ -230,7 +261,10 @@ class BrokerClient(Protocol):     # = Java interface
 
 ### 직접 열어볼 파일 (이 순서로)
 - `backend/engine/main.py` — 엔진 생애주기.
+- `backend/engine/base_runner.py` — 러너 공통 골격(적재·루프·락).
 - `backend/engine/runner.py` — `_tick()` 을 정독. 매매 판단의 전부.
 - `backend/engine/executor.py` — 멱등성 3중 방어.
+- `backend/engine/fills.py` — 체결 기록 단일 진입점(3중 경로가 공유).
+- `backend/engine/reconcile.py`, `fill_notice.py` — 체결 보정·실시간 체결통보.
 - `backend/engine/risk.py` — 리스크 게이트.
 - `backend/app/services/broker/base.py`, `factory.py` — 추상화/주입.

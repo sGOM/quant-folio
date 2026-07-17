@@ -6,7 +6,7 @@
 
 이 문서는 **금융학적 타당성 검증** 관점에서 작성되었습니다. 신호 수식은 단일 출처인 `signals.py` 구현을 그대로 반영했으며, 추측이 아닌 코드 근거에 기반합니다. 백테스트 수치는 실거래를 보장하지 않습니다.
 
-> ℹ️ **범위 안내**: 이 문서는 **단일종목 기술적 지표 전략**(SMA/EMA/RSI/MACD 등, `signals.py` + 단일종목 vectorbt 엔진 `engine.py`)만 다룹니다. **다종목 리밸런싱(멀티팩터) 전략**(id=23 균형 멀티팩터, id=24 밸류·퀄리티 컨트래리언 등, `app/services/backtest/portfolio.py`)은 별도 엔진·별도 문서 계통입니다 — 전략별 설계 의도는 등록 스크립트(`backend/scripts/register_and_validate_abc.py` 등)의 주석·커밋 메시지, 로드맵 현황은 `docs/improvement-plan-2026-07-16.md` 를 참고하세요. 아래 부록의 "검증 우선순위"는 최초 작성 시(2026-06-22) 단일종목 엔진 기준으로 쓰였고, 이후 리밸런싱 엔진 쪽에서 대부분 구현됐습니다(현황은 해당 절 참고).
+> ℹ️ **범위 안내**: 이 문서는 **단일종목 기술적 지표 전략**(SMA/EMA/RSI/MACD 등, `signals.py` + 단일종목 vectorbt 엔진 `engine.py`)만 다룹니다. **다종목 리밸런싱(멀티팩터) 전략**(id=23 균형 멀티팩터, id=24 밸류·퀄리티 컨트래리언 등, `app/services/backtest/portfolio.py`)은 별도 엔진·별도 문서 계통입니다 — 전략별 설계 의도는 등록 스크립트(`backend/scripts/register_and_validate_abc.py` 등)의 주석·커밋 메시지, 로드맵 현황은 `docs/improvements.md`(매 반복 갱신) 를 참고하세요. 아래 부록의 "검증 우선순위"는 최초 작성 시(2026-06-22) 단일종목 엔진 기준으로 쓰였고, 이후 리밸런싱 엔진 쪽에서 대부분 구현됐습니다(현황은 해당 절 참고).
 
 ---
 
@@ -489,11 +489,11 @@
 
 ## 부록: 검증 우선순위 (요약, 2026-07-16 현행화)
 
-최초 작성(2026-06-22) 시점엔 전부 미구현이었으나, 이후 로드맵(P0~P2, `docs/improvement-plan-2026-07-16.md` 참고)으로 아래와 같이 진행됐다.
+최초 작성(2026-06-22) 시점엔 전부 미구현이었으나, 이후 로드맵(P0~P2, 구 개선안 improvement-plan-2026-07-16 — git 히스토리 참고)으로 아래와 같이 진행됐다.
 
 1. ✅ **거래비용·세금(0.20%)·슬리피지 반영** — 완료(P0-1). 단일종목 `engine.py`(`fees`+`tax`+`slippage_bps`, vectorbt `fees`/`slippage` 인자)·리밸런싱 `portfolio.py`(`_apply_rebalance`) 양쪽 모두 반영.
 2. ✅ **체결 가정 표준화(t+1 체결)** — 완료(P0-1). `fill_mode="next_close"`(기본)가 신호일 종가 확정 후 산출한 결정을 익일 종가에 체결(당일 미래참조 제거). `same_close` 는 구 동작 opt-in(민감도 분석용).
-3. 🟡 **호가단위·상하한가 반영** — 미구현. 슬리피지(기본 5bp)에 근사 흡수돼 있다고 보수적으로 해석 중(`docs/improvement-plan-2026-07-16.md` A-3, Low 우선순위로 보류).
+3. 🟡 **호가단위·상하한가 반영** — 미구현. 슬리피지(기본 5bp)에 근사 흡수돼 있다고 보수적으로 해석 중(구 개선안 improvement-plan-2026-07-16 A-3 — git 히스토리, Low 우선순위로 보류).
 4. ✅ **포지션 사이징·ATR 손절 — 리스크 레이어 강건화** — 완료(P1-2, 리밸런싱 엔진). 종목 집중 한도(`max_position_pct`/`max_sector_pct`)·변동성 타겟팅·MDD 킬스위치(`risk_layer`). 단일종목 엔진 쪽 ATR 트레일링 손절은 `signals.py` 의 `atr_trailing`/`volatility_breakout`/`keltner` 전략으로 이미 제공.
 5. 🟡 **워크포워드·성과지표 보강** — 부분 완료. 성과지표는 벤치마크 상대지표(alpha/beta/IR, P0-2)·팩터 IC/IR 성과귀속(P1-1)·Deflated Sharpe Ratio(과최적화 방어, P2-1)까지 보강됨(프론트 백테스트 결과 화면 DSR 카드 노출 포함). 정식 워크포워드(rolling 재적합·out-of-sample 자동 분할) 자체는 아직 스크립트 수준(`scripts/wf_id23.py`)이고 UI/자동화는 미구현.
 

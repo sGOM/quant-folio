@@ -69,6 +69,8 @@
   WebSocket 으로 실시간 이벤트 푸시. **매매 로직은 없다**([02 문서](02-architecture.md)).
 - **커맨드**: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
   (`--reload` 없음 — 24시간 운용 중 파일 변경에 의한 의도치 않은 재시작 방지).
+  단, 개발 환경에선 `docker-compose.override.yml` 이 자동 병합되어 `--reload` 로 뜬다.
+  운영 배포는 `docker compose -f docker-compose.yml up -d --build` 로 override 를 제외.
 - **언제 만지나**: API 엔드포인트·인증·DB 모델 작업. 대부분의 백엔드 개발.
 - **로그**: `docker compose logs -f web` — 요청 처리, 명령 발행이 보인다.
 
@@ -117,6 +119,7 @@
 | 실시간 이벤트 | `engine:events:{uid}` (pub/sub) | engine→web→브라우저 |
 | 주문/포지션 락 | `lock:order:*`, `lock:position:*` | engine |
 | 엔진 하트비트 | `engine:heartbeat` | engine |
+| 러너 헬스 상태 | `engine:health:{strategy_id}` | engine→web |
 | Celery 브로커 | (큐) | worker |
 
 ### frontend — Next.js (이 가이드 범위 밖)
@@ -177,8 +180,9 @@ secrets/*.txt (호스트) ─► /run/secrets/* (컨테이너 tmpfs) ─► conf
 `web`/`engine`/`worker` 는 `./backend:/app` 을 **bind mount** 한다 → 호스트에서 코드를
 고치면 컨테이너 안에 즉시 반영된다. 단:
 
-- **web 은 `--reload` 가 없으므로** 코드 변경 후 `docker compose restart web` 필요.
-- **engine/worker 도** 변경 반영하려면 재시작: `docker compose restart engine`.
+- **web**: 개발 환경(override 병합)에선 `--reload` 로 즉시 반영. 운영(override 제외)
+  기동이면 `docker compose restart web` 필요.
+- **engine/worker 는** 항상 재시작 필요: `docker compose restart engine`.
 - **requirements.txt(의존성) 변경** 시엔 이미지 재빌드: `docker compose up -d --build`.
 
 ---

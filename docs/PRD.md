@@ -6,7 +6,7 @@
 > §6 "MVP 범위"의 "제외(추후)" 항목 중 다음은 **이미 구현 완료**됐다 — 실전 투자 연동(§2
 > `live-order-guide.md`), 다중 전략 동시 운용, 알림(텔레그램, `engine/alerts.py`), 종목
 > 스크리너(`/screener`), 펀더멘털 데이터 필터(OpenDART 연동). 현재 실제 구현 상태는
-> 루트 `CLAUDE.md`(아키텍처 한 줄 지도)와 `docs/improvement-plan-2026-07-16.md`(완료/잔여
+> 루트 `CLAUDE.md`(아키텍처 한 줄 지도)와 `docs/improvements.md`(완료/잔여
 > 항목 현황표)를 신뢰 소스로 볼 것 — 이 PRD는 최초 의도·설계 근거를 남기는 역사적 기록으로
 > 유지한다.
 
