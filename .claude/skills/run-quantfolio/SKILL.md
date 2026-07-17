@@ -97,6 +97,32 @@ Open <http://localhost:8080> (app), <http://localhost:8080/docs> (Swagger),
 <http://localhost:8080/health>. Register at `/login`. For phone/external access
 over WireGuard, see README §5 — not needed for local verification.
 
+## Run: scripted Playwright E2E smoke (codified version of "UI flow" above)
+
+There's also a codified Playwright spec — `frontend/e2e/smoke.spec.ts` — that
+drives the exact same path as "Run: UI flow" (register/login → strategies list
+→ create + run one backtest → monitor page) but as a repeatable, assertable
+test instead of manual MCP steps. It needs the full stack already up (see
+"Build & launch" above):
+
+```bash
+cd frontend
+npm install                       # once, or after pulling changes (adds @playwright/test)
+npx playwright install --with-deps chromium   # once
+npm run test:e2e                  # runs against http://localhost:8080 by default
+```
+
+Override the target with `E2E_BASE_URL=http://localhost:8080 npm run test:e2e`.
+There's also a nightly/manual-only GitHub Actions workflow
+(`.github/workflows/e2e-smoke.yml`) that boots the whole stack from a clean
+checkout and runs this — it's not part of the required `ci.yml` gate because
+spinning up the full stack is too heavy for every push. Trigger it manually via
+`gh workflow run e2e-smoke.yml` or the Actions UI.
+
+Use the manual MCP path above when you're actively debugging a UI issue
+in-session; use this scripted spec for regression coverage (it's what you'd
+extend if you add a new critical-path screen).
+
 ## Backend code change → restart, don't wait
 
 The `web` container runs `uvicorn` **without `--reload`** (24/7 operation). After
