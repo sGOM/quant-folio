@@ -4,32 +4,18 @@ import { use, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, Backtest, DsrAnalysis, FactorIC, StrategyConfig } from "@/lib/api";
+import { api, Backtest, BacktestTrade, DsrAnalysis, FactorIC, StrategyConfig } from "@/lib/api";
 import { Nav } from "@/components/Nav";
 import { LineChart } from "@/components/LineChart";
 import { RequireAuth } from "@/components/RequireAuth";
 import { StrategyForm } from "@/components/StrategyForm";
 import { summarizeConfig } from "@/lib/strategy";
+import { useSymbolNames } from "@/lib/useSymbolNames";
+import { fmtNum, fmtPct, pctColor } from "@/lib/format";
 
-/**
- * 비율(0~1)을 백분율 문자열로 변환한다.
- * @param x 비율 값(null/undefined 면 "-")
- * @returns 예: 0.1234 → "12.34%"
- */
-function pct(x: number | null | undefined): string {
-  if (x === null || x === undefined) return "-";
-  return `${(x * 100).toFixed(2)}%`;
-}
-
-/**
- * 배수/비율 지표(베타·정보비율 등)를 소수 문자열로 변환한다.
- * @param x 값(null/undefined 면 "-")
- * @param digits 소수 자릿수(기본 2)
- */
-function num(x: number | null | undefined, digits = 2): string {
-  if (x === null || x === undefined) return "-";
-  return x.toFixed(digits);
-}
+// lib/format 공용 헬퍼에 이 화면의 표준 자릿수(2)만 입힌 별칭 — 포맷 로직 중복 금지.
+const pct = (x: number | null | undefined) => fmtPct(x, 2);
+const num = (x: number | null | undefined, digits = 2) => fmtNum(x, digits);
 
 /** 전략 상세 라우트. 동적 params 를 풀어 인증 게이트로 감싼 콘텐츠에 전달한다. */
 export default function StrategyDetailPage({
@@ -58,33 +44,13 @@ function StrategyDetailContent({ sid }: { sid: number }) {
   const [start, setStart] = useState("2023-01-01");
   const [end, setEnd] = useState(today);
   const [editing, setEditing] = useState(false);
-  // 체결 로그: 기본 최근 60건, "더 보기"로 60건씩 추가 노출.
-  const TRADE_PAGE = 60;
-  const [tradeLimit, setTradeLimit] = useState(TRADE_PAGE);
-  // 체결 로그 정렬: 일자(기본, 최근 우선) 또는 종목코드. 헤더 클릭으로 토글.
-  const [tradeSort, setTradeSort] = useState<{
-    key: "time" | "code";
-    dir: "asc" | "desc";
-  }>({ key: "time", dir: "desc" });
 
   const strategy = useQuery({
     queryKey: ["strategy", sid],
     queryFn: () => api.getStrategy(sid),
   });
-  // 종목코드 → 한글명 매핑(체결 로그에 종목명 표시). Infinity 는 피한다 — 서버가 최초에
-  // 불완전한 맵(외부 소스 일시 실패)을 준 경우 세션 내내 코드만 표시되는 문제를 막고,
-  // 서버 자가복구 후 갱신되도록 monitor 와 동일한 유한 staleTime 을 쓴다.
-  const names = useQuery({
-    queryKey: ["symbol-names"],
-    queryFn: api.symbolNames,
-    staleTime: 60 * 60 * 1000,
-    refetchOnWindowFocus: true,
-  });
-  // "종목명(코드)" 형태로 표기. 이름을 모르면 코드만 반환.
-  const nameOf = (code: string) => {
-    const n = names.data?.[code];
-    return n ? `${n}(${code})` : code;
-  };
+  // 종목코드 → 한글명 매핑(체결 로그에 종목명 표시). 캐시 정책은 훅 참조.
+  const { nameOf } = useSymbolNames();
   const backtests = useQuery({
     queryKey: ["backtests", sid],
     queryFn: () => api.listBacktests(sid),
@@ -148,8 +114,6 @@ function StrategyDetailContent({ sid }: { sid: number }) {
     : undefined;
 
   const isRebalance = strategy.data?.config.type === "rebalance";
-  // 체결 로그 총 건수(클로저 안에서 안전하게 참조하기 위한 파생 상수).
-  const tradeCount = latest?.result?.trades?.length ?? 0;
 
   // DSR(Deflated Sharpe Ratio, P2-1) — 최신 백테스트에 한해 온디맨드 계산(가벼운 순수함수).
   const dsr = useQuery({
@@ -157,33 +121,6 @@ function StrategyDetailContent({ sid }: { sid: number }) {
     queryFn: () => api.getBacktestDsr(latest!.id),
     enabled: !!latest?.id,
   });
-
-  // 표시할 체결: 최근 tradeLimit 건을 창으로 잡고, 선택한 기준으로 정렬한다.
-  // (limit=최근 몇 건을 볼지, sort=그 창 안의 정렬 순서 — 두 개념을 분리)
-  const shownTrades = useMemo(() => {
-    const window = (latest?.result?.trades ?? []).slice(-tradeLimit);
-    const d = tradeSort.dir === "asc" ? 1 : -1;
-    return [...window].sort((a, b) => {
-      if (tradeSort.key === "code") {
-        const c = String(a.symbol).localeCompare(String(b.symbol));
-        // 같은 종목이면 시간 오름차순으로 안정 정렬
-        return c !== 0 ? c * d : String(a.t).localeCompare(String(b.t));
-      }
-      return String(a.t).localeCompare(String(b.t)) * d;
-    });
-  }, [latest, tradeLimit, tradeSort]);
-
-  // 헤더 클릭: 같은 열이면 방향 토글, 다른 열이면 기본 방향으로 전환
-  // (일자=최근 우선 desc, 종목코드=오름차순 asc).
-  function toggleTradeSort(key: "time" | "code") {
-    setTradeSort((prev) =>
-      prev.key === key
-        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
-        : { key, dir: key === "time" ? "desc" : "asc" },
-    );
-  }
-  const sortArrow = (key: "time" | "code") =>
-    tradeSort.key === key ? (tradeSort.dir === "asc" ? " ↑" : " ↓") : "";
 
   return (
     <>
@@ -386,126 +323,7 @@ function StrategyDetailContent({ sid }: { sid: number }) {
             {isRebalance &&
               latest.result.trades &&
               latest.result.trades.length > 0 && (
-                <div className="rounded-lg border border-border bg-card p-4">
-                  <div className="mb-2 flex items-center justify-between gap-2">
-                    <h2 className="text-sm text-muted-foreground">
-                      체결 로그 (매수/매도 · 최근{" "}
-                      {Math.min(tradeLimit, tradeCount)}건 / 전체 {tradeCount}건)
-                    </h2>
-                    <div className="flex shrink-0 gap-1">
-                      {tradeLimit < tradeCount && (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setTradeLimit((n) => n + TRADE_PAGE)
-                          }
-                          className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                        >
-                          더 보기 (+
-                          {Math.min(TRADE_PAGE, tradeCount - tradeLimit)}건)
-                        </button>
-                      )}
-                      {tradeLimit < tradeCount && (
-                        <button
-                          type="button"
-                          onClick={() => setTradeLimit(tradeCount)}
-                          className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                        >
-                          전체 보기
-                        </button>
-                      )}
-                      {tradeLimit > TRADE_PAGE && (
-                        <button
-                          type="button"
-                          onClick={() => setTradeLimit(TRADE_PAGE)}
-                          className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                        >
-                          접기
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  <div className="max-h-96 overflow-auto">
-                    <table className="w-full text-xs">
-                      <thead className="text-muted-foreground">
-                        <tr className="border-b border-border">
-                          <th className="py-1 text-left font-normal">
-                            <button
-                              type="button"
-                              onClick={() => toggleTradeSort("time")}
-                              className="font-normal transition-colors hover:text-foreground"
-                              title="일자순 정렬"
-                            >
-                              일자{sortArrow("time")}
-                            </button>
-                          </th>
-                          <th className="py-1 text-left font-normal">
-                            <button
-                              type="button"
-                              onClick={() => toggleTradeSort("code")}
-                              className="font-normal transition-colors hover:text-foreground"
-                              title="종목코드순 정렬"
-                            >
-                              종목{sortArrow("code")}
-                            </button>
-                          </th>
-                          <th className="py-1 text-center font-normal">구분</th>
-                          <th className="py-1 text-right font-normal">거래대금</th>
-                          <th className="py-1 text-right font-normal">체결가</th>
-                          <th className="py-1 text-right font-normal">포지션손익</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {shownTrades
-                          .map((tr, i) => (
-                            <tr key={i} className="border-b border-border/50">
-                              <td className="py-1">{tr.t.slice(0, 10)}</td>
-                              <td className="py-1">{nameOf(tr.symbol)}</td>
-                              <td className="py-1 text-center">
-                                <span
-                                  className={
-                                    tr.side === "buy"
-                                      ? "text-red-500"
-                                      : tr.reason === "regime_exit" || tr.reason === "mdd_kill"
-                                        ? "text-amber-500"
-                                        : "text-blue-500"
-                                  }
-                                >
-                                  {tr.side === "buy"
-                                    ? "매수"
-                                    : tr.reason === "mdd_kill"
-                                      ? "킬스위치"
-                                      : tr.reason === "regime_exit"
-                                        ? "청산"
-                                        : "매도"}
-                                </span>
-                              </td>
-                              <td className="py-1 text-right">
-                                {tr.amount.toLocaleString()}원
-                              </td>
-                              <td className="py-1 text-right">
-                                {tr.price?.toLocaleString() ?? "-"}
-                              </td>
-                              <td
-                                className={`py-1 text-right ${
-                                  (tr.position_return ?? 0) > 0
-                                    ? "text-red-500"
-                                    : (tr.position_return ?? 0) < 0
-                                      ? "text-blue-500"
-                                      : ""
-                                }`}
-                              >
-                                {tr.position_return === null ||
-                                tr.position_return === undefined
-                                  ? "-"
-                                  : pct(tr.position_return)}
-                              </td>
-                            </tr>
-                          ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
+                <TradeLogTable trades={latest.result.trades} nameOf={nameOf} />
               )}
           </section>
         )}
@@ -564,6 +382,163 @@ function StrategyDetailContent({ sid }: { sid: number }) {
         </section>
       </main>
     </>
+  );
+}
+
+/** 체결 로그 페이지 단위: 기본 최근 60건, "더 보기"로 60건씩 추가 노출. */
+const TRADE_PAGE = 60;
+
+/**
+ * 백테스트 체결 로그 테이블. 노출 건수(더 보기/전체/접기)와 정렬(일자·종목코드,
+ * 헤더 클릭 토글) 상태를 자체 관리한다.
+ * @param trades 백테스트 체결 목록(시간 오름차순)
+ * @param nameOf 종목코드 → "종목명(코드)" 변환(useSymbolNames)
+ */
+function TradeLogTable({
+  trades,
+  nameOf,
+}: {
+  trades: BacktestTrade[];
+  nameOf: (code: string) => string;
+}) {
+  const [limit, setLimit] = useState(TRADE_PAGE);
+  // 정렬: 일자(기본, 최근 우선) 또는 종목코드.
+  const [sort, setSort] = useState<{
+    key: "time" | "code";
+    dir: "asc" | "desc";
+  }>({ key: "time", dir: "desc" });
+  const total = trades.length;
+
+  // 표시할 체결: 최근 limit 건을 창으로 잡고, 선택한 기준으로 정렬한다.
+  // (limit=최근 몇 건을 볼지, sort=그 창 안의 정렬 순서 — 두 개념을 분리)
+  const shown = useMemo(() => {
+    const window = trades.slice(-limit);
+    const d = sort.dir === "asc" ? 1 : -1;
+    return [...window].sort((a, b) => {
+      if (sort.key === "code") {
+        const c = String(a.symbol).localeCompare(String(b.symbol));
+        // 같은 종목이면 시간 오름차순으로 안정 정렬
+        return c !== 0 ? c * d : String(a.t).localeCompare(String(b.t));
+      }
+      return String(a.t).localeCompare(String(b.t)) * d;
+    });
+  }, [trades, limit, sort]);
+
+  // 헤더 클릭: 같은 열이면 방향 토글, 다른 열이면 기본 방향으로 전환
+  // (일자=최근 우선 desc, 종목코드=오름차순 asc).
+  function toggleSort(key: "time" | "code") {
+    setSort((prev) =>
+      prev.key === key
+        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: key === "time" ? "desc" : "asc" },
+    );
+  }
+  const sortArrow = (key: "time" | "code") =>
+    sort.key === key ? (sort.dir === "asc" ? " ↑" : " ↓") : "";
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <h2 className="text-sm text-muted-foreground">
+          체결 로그 (매수/매도 · 최근 {Math.min(limit, total)}건 / 전체 {total}건)
+        </h2>
+        <div className="flex shrink-0 gap-1">
+          {limit < total && (
+            <button
+              type="button"
+              onClick={() => setLimit((n) => n + TRADE_PAGE)}
+              className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              더 보기 (+{Math.min(TRADE_PAGE, total - limit)}건)
+            </button>
+          )}
+          {limit < total && (
+            <button
+              type="button"
+              onClick={() => setLimit(total)}
+              className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              전체 보기
+            </button>
+          )}
+          {limit > TRADE_PAGE && (
+            <button
+              type="button"
+              onClick={() => setLimit(TRADE_PAGE)}
+              className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              접기
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="max-h-96 overflow-auto">
+        <table className="w-full text-xs">
+          <thead className="text-muted-foreground">
+            <tr className="border-b border-border">
+              <th className="py-1 text-left font-normal">
+                <button
+                  type="button"
+                  onClick={() => toggleSort("time")}
+                  className="font-normal transition-colors hover:text-foreground"
+                  title="일자순 정렬"
+                >
+                  일자{sortArrow("time")}
+                </button>
+              </th>
+              <th className="py-1 text-left font-normal">
+                <button
+                  type="button"
+                  onClick={() => toggleSort("code")}
+                  className="font-normal transition-colors hover:text-foreground"
+                  title="종목코드순 정렬"
+                >
+                  종목{sortArrow("code")}
+                </button>
+              </th>
+              <th className="py-1 text-center font-normal">구분</th>
+              <th className="py-1 text-right font-normal">거래대금</th>
+              <th className="py-1 text-right font-normal">체결가</th>
+              <th className="py-1 text-right font-normal">포지션손익</th>
+            </tr>
+          </thead>
+          <tbody>
+            {shown.map((tr, i) => (
+              <tr key={i} className="border-b border-border/50">
+                <td className="py-1">{tr.t.slice(0, 10)}</td>
+                <td className="py-1">{nameOf(tr.symbol)}</td>
+                <td className="py-1 text-center">
+                  <span
+                    className={
+                      tr.side === "buy"
+                        ? "text-profit"
+                        : tr.reason === "regime_exit" || tr.reason === "mdd_kill"
+                          ? "text-amber-500"
+                          : "text-loss"
+                    }
+                  >
+                    {tr.side === "buy"
+                      ? "매수"
+                      : tr.reason === "mdd_kill"
+                        ? "킬스위치"
+                        : tr.reason === "regime_exit"
+                          ? "청산"
+                          : "매도"}
+                  </span>
+                </td>
+                <td className="py-1 text-right">{tr.amount.toLocaleString()}원</td>
+                <td className="py-1 text-right">{tr.price?.toLocaleString() ?? "-"}</td>
+                <td className={`py-1 text-right ${pctColor(tr.position_return)}`}>
+                  {tr.position_return === null || tr.position_return === undefined
+                    ? "-"
+                    : pct(tr.position_return)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 
@@ -697,12 +672,12 @@ const FACTOR_IC_ORDER = [
   "score",
 ];
 
-/** IR 값에 따른 색상(≥1 우수 초록, >0 양호, ≤0 빨강). */
+/** IR 값에 따른 색상(≥1 우수 초록, >0 양호, ≤0 손실 토큰). */
 function irColor(ir: number | null | undefined): string {
   if (ir === null || ir === undefined) return "text-muted-foreground";
   if (ir >= 1) return "text-emerald-600 dark:text-emerald-400";
   if (ir > 0) return "text-foreground";
-  return "text-red-500";
+  return "text-loss";
 }
 
 /**
@@ -747,13 +722,7 @@ function FactorICCard({ factorIc }: { factorIc: Record<string, FactorIC> }) {
                   </td>
                   <td className="py-1 text-right tabular-nums">{pct(v.ic_hit)}</td>
                   <td
-                    className={`py-1 text-right tabular-nums ${
-                      (v.ls_return ?? 0) > 0
-                        ? "text-red-500"
-                        : (v.ls_return ?? 0) < 0
-                          ? "text-blue-500"
-                          : ""
-                    }`}
+                    className={`py-1 text-right tabular-nums ${pctColor(v.ls_return)}`}
                   >
                     {pct(v.ls_return)}
                   </td>
