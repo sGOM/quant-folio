@@ -21,21 +21,30 @@ quant/
 │   │   └── services/         ← 비즈니스 로직 (@Service 격)
 │   │       ├── kis/          ← 한국투자증권 API 클라이언트
 │   │       ├── broker/       ← 증권사 추상화 (KIS/토스 공통 인터페이스)
-│   │       ├── backtest/     ← 백테스트 엔진 + 신호 생성
-│   │       └── data/         ← 과거 시세 적재(loader)
+│   │       ├── backtest/     ← 백테스트 엔진 + 신호 생성 + 포트폴리오 시뮬레이션
+│   │       ├── data/         ← 과거 시세 적재(loader) + OpenDART 재무데이터
+│   │       ├── metrics/      ← 팩터 점수·섹터/종목 지표 계산
+│   │       ├── screener.py / recommend.py ← 스크리너·추천
+│   │       └── live_gate.py  ← 실전(prod) 전환 게이트
 │   │
 │   ├── engine/               ← ★ 독립 프로세스: 24시간 매매 엔진 (web 과 분리!)
 │   │   ├── main.py           ← 엔진 진입점 (asyncio 이벤트 루프)
-│   │   ├── runner.py         ← 전략 1개를 굴리는 실행기 (신호→리스크→주문)
+│   │   ├── base_runner.py    ← 러너 공통 골격 (적재·루프·분산 락)
+│   │   ├── runner.py         ← 단일종목 신호 전략 실행기 (신호→리스크→주문)
+│   │   ├── rebalance_runner.py ← 멀티팩터 리밸런싱 전략 실행기
 │   │   ├── executor.py       ← 주문 실행 + 멱등성 + DB 기록
+│   │   ├── fills.py          ← 체결 기록 단일 진입점 (3중 경로 공유)
+│   │   ├── reconcile.py      ← 미체결 주문 주기 재조회·보정
+│   │   ├── fill_notice.py    ← KIS 실시간 체결통보(H0STCNI0/9) 리스너
 │   │   ├── risk.py           ← 리스크 관리 (손절·포지션·일일 한도)
+│   │   ├── alerts.py         ← 이상 상황 앱 내 경보 발행
 │   │   └── price_feed.py     ← KIS WebSocket 시세 구독 → Redis 캐시
 │   │
 │   ├── worker/               ← Celery 워커 (배치 작업)
 │   └── alembic/              ← DB 마이그레이션 (Flyway/Liquibase 격)
 │
 ├── frontend/                 ← Next.js (이 가이드에선 거의 다루지 않음)
-├── docker-compose.yml        ← 6개 컨테이너 오케스트레이션
+├── docker-compose.yml        ← 7개 컨테이너 오케스트레이션 (+ 개발용 override)
 ├── Caddyfile                 ← 리버스 프록시 (단일 진입점 :8080)
 └── docs/                     ← PRD, 전략 수식 문서
 ```
@@ -115,5 +124,5 @@ user = await db.scalar(select(User).where(User.email == form.username))
 → [02-architecture.md](02-architecture.md)
 
 ### 직접 열어볼 파일
-- `backend/app/main.py` — 30줄. 앱이 어떻게 조립되는지 한눈에 들어온다.
+- `backend/app/main.py` — 약 120줄. 앱이 어떻게 조립되는지 한눈에 들어온다.
 - `docker-compose.yml` — 어떤 프로세스들이 같이 도는지(서비스 목록)를 본다.

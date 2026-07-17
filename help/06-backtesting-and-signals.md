@@ -166,6 +166,8 @@ sig = latest_signal(series, cfg)    # 백테스트와 같은 함수로 마지막
 ### 직접 열어볼 파일
 - `backend/app/services/backtest/signals.py` — 길지만 한 함수씩 읽으면 쉽다.
   `_cross_up`/`_cross_down` 과 `_sma_signals` 부터.
-- `backend/app/services/backtest/engine.py` — 100줄. vectorbt 호출부.
+- `backend/app/services/backtest/engine.py` — 약 150줄. vectorbt 호출부.
+- `backend/app/services/backtest/portfolio.py` — 멀티팩터 리밸런싱(포트폴리오)
+  백테스트. 익일 체결·슬리피지·리스크 캡·팩터 성과귀속까지 이쪽에서 처리.
 - `backend/app/api/routes/backtests.py` — 요청 흐름.
 - `docs/strategies.md` — 각 전략의 금융학적 근거·수식(매우 상세).
