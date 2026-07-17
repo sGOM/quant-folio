@@ -252,7 +252,7 @@ curl http://localhost:8000/api/engine/status    # {"engine_alive": true}
 따라 즉시 매수하거나 다음 정기 리밸런싱을 기다린다(§1-B 참고).
 
 ### 개선 방향(TODO, 미구현)
-`docs/improvement-plan-2026-07-16.md` B-3 은 "재개는 반드시 수동 조작으로 제한"을
+구 개선안(improvement-plan-2026-07-16, git 히스토리) B-3 은 "재개는 반드시 수동 조작으로 제한"을
 권장한다 — 즉 쿨다운 경과만으로 자동 재가동하지 말고, 사람이 명시적으로 승인해야만
 `killed` 상태를 해제하도록 `_evaluate_mdd_kill` 을 바꾸는 것. 이는 실거래 안전성을 바꾸는
 변경이라 별도 논의·구현 작업으로 남겨둔다(현재는 위 "실시탭 stop→점검→start" 수동

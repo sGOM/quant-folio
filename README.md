@@ -22,7 +22,7 @@
 
 | 구분 | 기술 |
 |------|------|
-| **Frontend** | Next.js 15 (React 19, App Router), TypeScript, TanStack Query, Tailwind CSS, Lucide React |
+| **Frontend** | Next.js 15 (React 19, App Router), TypeScript, TanStack Query, Tailwind CSS, Lucide React, Vitest |
 | **Backend (web)** | Python, FastAPI, Pydantic v2, SQLAlchemy 2 (async), 서버측 세션(Redis), bcrypt, cryptography(Fernet) |
 | **매매 엔진 / 워커** | asyncio 이벤트 루프 엔진, Celery, websockets |
 | **백테스팅 / 데이터** | pandas, numpy, vectorbt, pykrx, FinanceDataReader |
@@ -47,6 +47,7 @@
 - **국내주식 현재가** (`FHKST01010100`) / **실시간 체결가 WebSocket** (`H0STCNT0`)
 - **현금 주문** (`order-cash`, 모의 `VTTC080*U` / 실전 `TTTC080*U`)
 - **주문체결 조회** (`inquire-daily-ccld`) — 실제 체결가/수량 확인
+- **실시간 체결통보 WebSocket** (모의 `H0STCNI9` / 실전 `H0STCNI0`) — 계좌 단위 체결 이벤트 수신(`KIS_HTS_ID` 필요)
 - **주식 잔고 조회** (`inquire-balance`)
 
 > 보조 시세 데이터 소스: [pykrx](https://github.com/sharebook-kr/pykrx), [FinanceDataReader](https://github.com/FinanceData/FinanceDataReader) (백테스트용 과거 일봉 적재)
@@ -158,6 +159,10 @@ cp .env.example .env
 ### 3단계 — 컨테이너 기동 + DB 마이그레이션
 
 ```bash
+# 운영(24시간 서버) — 개발용 오버라이드(docker-compose.override.yml, web --reload) 제외
+docker compose -f docker-compose.yml up -d --build
+
+# 개발 — override 자동 병합(web 이 --reload 로 떠서 코드 변경이 즉시 반영)
 docker compose up -d --build
 
 # 최초 1회 — 테이블 생성(TimescaleDB hypertable 포함)
@@ -336,7 +341,7 @@ docker compose up -d
 docker compose ps                 # 상태 확인
 docker compose logs -f web        # 로그 실시간(web/engine/worker 등)
 docker compose restart web        # 특정 서비스 재시작
-git pull && docker compose up -d --build   # 코드 업데이트 후 반영
+git pull && docker compose -f docker-compose.yml up -d --build   # 코드 업데이트 후 반영(운영)
 docker compose exec db pg_dump -U quant quant > backup.sql   # DB 백업
 ```
 
@@ -355,7 +360,9 @@ docker compose exec db pg_dump -U quant quant > backup.sql   # DB 백업
 ## 테스트
 
 ```bash
-docker compose exec web pytest          # 신호·보안·장운영시간·멱등성 단위 테스트
+docker compose exec web pytest             # 백엔드 — 신호·보안·장운영시간·멱등성·엔진 E2E
+docker compose exec frontend npm test      # 프론트 — Vitest 유닛 테스트(lib·전략 폼 검증)
+docker compose exec frontend npm run lint  # 프론트 — ESLint
 ```
 
 ---
