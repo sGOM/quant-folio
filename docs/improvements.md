@@ -2,7 +2,9 @@
 
 작성일: 2026-07-18(갱신) · 근거: PR #61~#66 완료 반영 후 코드베이스 재점검으로 신규 개선안
 5건(§3~§7)을 발굴해 추가. 발굴 근거는 각 모듈이 스스로 문서화해 둔 "알려진 한계"와
-배선만 되고 검증되지 않은 경로들.
+배선만 되고 검증되지 않은 경로들. §4~§7 구현(PR #69) 직후 후속 재점검으로 §8~§11
+4건을 추가 발굴했고, 같은 갱신에서 전부 구현 완료했다(부수적으로 worker 컨테이너의
+`engine.*` 임포트가 전부 조용히 실패하던 인프라 버그도 §9 작업 중 발견해 함께 고쳤다).
 
 ## 완료 확인 (직전 우선순위 대비)
 
@@ -112,13 +114,84 @@ TTM이 실제로 성과를 개선하는지는 **한 번도 판정되지 않았�
 
 ---
 
+## 신규 발굴 (2026-07-18 재점검, §8~§11)
+
+발굴 근거: §4~§7 구현 직후 후속 점검 — 새로 배선된 백엔드 경로의 소비자 부재
+(프론트 미노출·Redis 키 미소비)와 각 모듈이 스스로 문서화한 한계 중 코드로 해소
+가능해진 것들.
+
+## 8. 신규 백테스트 옵션·지표의 프론트 노출 ✅
+
+`frontend/lib/api.ts`(`RebalanceConfig.price_limit_model`/`financial_period`,
+`BacktestResult.avg_turnover_actual`) · `components/StrategyForm.tsx`(체결·현실성
+fieldset에 상하한가·호가단위 토글) · `components/strategy-form/RebalanceFields.tsx`
+(score 방식 섹션에 재무데이터 반영 주기 select) · `app/strategies/[id]/page.tsx`(자산곡선
+캡션에 실체결 회전율 병기)로 노출했다.
+
+착수 중 `use_ttm`이 **어디에도 배선돼 있지 않다**는 사실을 발견했다(§3 원문의 "옵트인으로
+배선만 된 상태" 서술은 부정확했음 — `opendart.metrics_by_symbol(use_ttm=...)`는 테스트
+외 호출자가 전무했다). 그래서 §8 범위를 넓혀 진짜 배선까지 했다: `RebalanceConfig`에
+`financial_period: "annual"|"ttm"` 필드 추가 → `app/services/metrics/factors.py::
+compute_universe_scores`(라이브·백테스트 공통 진입점)에 파라미터 스레딩 →
+`engine/rebalance_runner.py`(라이브)·`app/api/routes/backtests.py::_fundamentals_provider`
+(백테스트, `functools.partial`로 클로저 바인딩) 양쪽에서 `config.financial_period`를
+반영. 이제 프론트 토글이 실제로 TTM 경로를 켠다 — §3(TTM A/B 재검증)을 raw config 편집
+없이 UI로 수행할 수 있게 됐다.
+
+## 9. DB 백업 신선도 감시 (last_success_at 소비자 부재) ✅
+
+`backend/worker/tasks.py::check_backup_freshness`(신규 Celery 태스크, beat 09:00 KST) —
+`backup:last_success_at`(공유 상수 `app.core.channels.BACKUP_LAST_SUCCESS_KEY`로
+worker·web이 동일 키 참조)이 없거나 26시간 초과면 `publish_alert` critical
+(`db_backup_stale`) 발행. `GET /api/engine/status`에 `backup_last_success_at` 필드도
+추가해 운영 가시성을 넓혔다.
+
+이 작업 중 **worker 컨테이너의 모든 `engine.*` 임포트가 조용히 실패해 왔다는 걸 발견**해
+함께 고쳤다: `docker-compose.yml`의 worker 커맨드가 `celery ...`(설치된 콘솔 스크립트를
+직접 실행)였는데, 이 경로로 실행하면 `sys.path[0]`이 스크립트 디렉터리(`/usr/local/bin`)가
+되어 `WORKDIR`(`/app`)의 최상위 패키지(`engine`)를 찾지 못한다(`app.*`는 Celery가 `-A`
+앱 모듈을 로드할 때 cwd를 임시로 꽂아줘서 우연히 살아있었다). 즉 `check_fill_quality_drift`의
+알림 발행도, 이번에 새로 만든 `backup_database`의 실패 알림·`check_backup_freshness`
+자체도 실제로는 한 번도 성공한 적이 없었다(§6 완료 확인 당시의 e2e 검증은 재빌드 직후
+1회성 수동 호출이라 이 경로를 타지 않았던 것으로 보인다). `command: python -m celery ...`로
+바꿔 해결 — `-m` 실행은 항상 cwd를 `sys.path[0]`에 넣는다. 재빌드 후 `backup_database`·
+`check_fill_quality_drift`·`check_backup_freshness` 세 태스크 모두 실제 실행으로
+재검증했다.
+
+## 10. 백업 오프사이트 복제 ✅
+
+`backend/worker/tasks.py::_upload_backup_to_s3` — 로컬 pg_dump 성공 직후 S3 호환
+스토리지(AWS S3/R2/B2/MinIO, `boto3`)에 추가 업로드하는 opt-in 경로. 설정
+(`app/core/config.py`: `S3_BACKUP_BUCKET`/`S3_BACKUP_ENDPOINT_URL`/`S3_BACKUP_REGION`/
+`S3_BACKUP_PREFIX` + 시크릿 파일 `S3_BACKUP_ACCESS_KEY_ID`/`S3_BACKUP_SECRET_ACCESS_KEY`)
+중 버킷·자격증명이 하나라도 비어 있으면(`settings.has_s3_backup`) 업로드를 통째로
+건너뛴다 — 기존 로컬 전용 백업 동작에 영향 없음(현재 이 저장소는 자격증명 미설정이라
+비활성 상태로 남아 있다, 계정 준비는 운영자 몫). 업로드 실패는 로컬 백업 성공을
+무효화하지 않고 warning 알림(`db_backup_s3_upload_failed`)만 발행한다.
+`docs/db-backup.md`·`.env.example`·`secrets/README.md`에 설정 절차를 문서화했다.
+
+## 11. 라이브 자산가치 근사에 실현손익 반영 ✅
+
+`engine/rebalance_runner.py::_live_equity` — 구 근사(`배정자본 + 보유 종목 미실현손익`,
+확정 실현손익 무시)를 `app/services/backtest/tracking.py::replay_cash_balance`(§5 재생
+로직에서 파생한 경량 버전, 일별 곡선 없이 최종 현금잔고만 계산) 기반으로 교체했다.
+전략의 전체 체결(Order+Execution, 상태 PARTIAL/FILLED) 이력을 재생해 현재 현금잔고를
+구하고, 여기에 보유 종목 시가평가(Position 현재 수량×현재가, 시세 조회 실패 시 평단가
+폴백)를 더해 자산가치를 산출한다 — 매도 체결의 현금흐름에 매수원가와의 차익이 자연히
+반영되므로 과거 라운드트립의 실현손익이 누락 없이 잡힌다. MDD 킬스위치·변동성 타겟팅의
+입력 정확도가 개선됐다(손실 라운드트립 이후 자산가치가 낙관적으로 리셋되던 과소 발동
+편향 해소).
+
+---
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |
 |------|------|------|
 | 1 | fill_notice 실계정 검증 (§1) | 실전 전환의 마지막 관문 — 미검증 가정 3개 해소. 실계정 필요 |
 | 2 | 0008 백필 감사 (§2) | id=23+24 병행 운용의 남은 전제(§5 해소로 긴급도는 낮아짐). 운영 DB 필요 |
-| 3 | TTM A/B 재검증 (§3) | 배선만 된 경로의 성과 판정 — 코드 리스크 없이 전략 개선 여지 확인 |
+| 3 | TTM A/B 재검증 (§3) | §8에서 `financial_period` 실배선이 끝나 UI 토글만으로 수행 가능해짐 — 코드 리스크 없이 전략 개선 여지 확인 |
 | 4 | 체결 모델 정밀화 id=23/24 재검증 | §4 코드는 완료 — `price_limit_model=True` 로 영향도 판정(성과 변화 미미하면 근사 유지로 종결) |
+| 5 | S3 오프사이트 백업 자격증명 발급·활성화 (§10) | 코드는 완료, 버킷·키 준비는 운영자 몫(외부 계정 필요) |
 
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.
