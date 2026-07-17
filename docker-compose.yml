@@ -126,7 +126,10 @@ services:
       redis:
         condition: service_healthy
     # -B: beat 스케줄러를 워커 프로세스에 내장(단일 워커 replica 전제 — 여러 개면 중복 스케줄 위험).
-    command: celery -A worker.celery_app.celery_app worker --loglevel=info -B
+    # python -m celery(설치된 celery 콘솔 스크립트 직접 실행 아님)로 실행해야 한다 — 콘솔
+    # 스크립트로 실행하면 sys.path[0]이 스크립트 디렉터리(/usr/local/bin)가 되어 WORKDIR(/app)
+    # 최상위 패키지(engine 등)를 임포트하지 못한다(ModuleNotFoundError, §9 재점검 중 발견).
+    command: python -m celery -A worker.celery_app.celery_app worker --loglevel=info -B
     volumes:
       - ./backend:/app
       # 야간 DB 백업(worker.backup_database, E-2) 산출물 저장 위치. 서버 디스크 손상 시

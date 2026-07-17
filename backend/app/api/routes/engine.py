@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user
 from app.api.routes.strategies import _get_owned
 from app.core.channels import (
+    BACKUP_LAST_SUCCESS_KEY,
     ENGINE_CONTROL_CHANNEL,
     ENGINE_HEARTBEAT_KEY,
     FAILURE_ALERT_THRESHOLD,
@@ -71,9 +72,10 @@ async def stop_strategy(
 
 @router.get("/status")
 async def engine_status(_: User = Depends(get_current_user)):
-    """엔진 생존 여부(heartbeat)."""
+    """엔진 생존 여부(heartbeat)·마지막 DB 백업 성공 시각(§9)."""
     alive = await redis_client.get(ENGINE_HEARTBEAT_KEY)
-    return {"engine_alive": alive == "alive"}
+    last_backup = await redis_client.get(BACKUP_LAST_SUCCESS_KEY)
+    return {"engine_alive": alive == "alive", "backup_last_success_at": last_backup}
 
 
 @router.get("/strategies/health")
