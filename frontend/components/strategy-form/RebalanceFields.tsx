@@ -360,6 +360,25 @@ export function RebalanceFields({
             시가총액 축에 직교화해, 팩터가 의도치 않게 대형/소형주 베팅으로 변질되는 것을
             막습니다(순수 팩터 노출). 시가총액(PIT)이 필요하며, 조회 실패 시 중립화는 생략됩니다.
           </p>
+          <Field label="재무데이터 반영 주기(퀄리티·성장 팩터)">
+            <select
+              value={config.financial_period ?? "annual"}
+              onChange={(e) =>
+                patch({
+                  financial_period: e.target.value as "annual" | "ttm",
+                } as Partial<StrategyConfig>)
+              }
+              className={INPUT}
+            >
+              <option value="annual">연간(사업보고서, 기본)</option>
+              <option value="ttm">분기 TTM(트레일링 4분기)</option>
+            </select>
+          </Field>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            <b className="text-muted-foreground">분기 TTM</b>은 최근 4개 분기 실적을 합산해
+            재무 반영 시차를 분기 단위로 좁힙니다(둘 다 미래참조 없음 — as_of 시점에 이미
+            공시된 보고서만 사용). 기본은 연간(기존 등록 전략 재현성 보존).
+          </p>
           <div className="space-y-2.5">
             {FACTOR_META.map((f) => {
               const w = (config.selection.factor_weights ?? DEFAULT_FACTOR_WEIGHTS)[f.key];

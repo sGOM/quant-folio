@@ -109,6 +109,8 @@ export function defaultConfig(
       slippage_vol_scale: COMMON_DEFAULTS.slippage_vol_scale,
       risk_free_rate: COMMON_DEFAULTS.risk_free_rate,
       benchmark_index: "KOSPI200",
+      price_limit_model: false,
+      financial_period: "annual",
     };
   }
   const base = { ...COMMON_DEFAULTS, ...common };
