@@ -1118,7 +1118,7 @@ async def test_rebalance_once_pit_narrows_and_scores_injected_universe(monkeypat
 
     captured: dict = {}
 
-    def fake_scores(universe, as_of, factor_weights, neutralize="none"):
+    def fake_scores(universe, as_of, factor_weights, neutralize="none", financial_period="annual"):
         captured["universe"] = list(universe)
         return {sym: 1.0 for sym in universe}
 
@@ -1167,7 +1167,9 @@ async def test_preview_returns_orders_without_executing(monkeypatch):
     monkeypatch.setattr(r, "_seed_history", lambda pool, min_bars=0: _async(hist))
     monkeypatch.setattr(
         rebalance_runner, "compute_universe_scores",
-        lambda universe, as_of, fw, neutralize="none": {sym: 1.0 for sym in universe},
+        lambda universe, as_of, fw, neutralize="none", financial_period="annual": {
+            sym: 1.0 for sym in universe
+        },
     )
     monkeypatch.setattr(rebalance_runner, "AsyncSessionLocal", lambda: _FakeDbCtx())
     monkeypatch.setattr(r, "_holdings", lambda db, pool: _async({}))
@@ -1407,12 +1409,23 @@ def test_rebalance_backtest_exposes_factor_ic_for_score_method():
 
 
 class _MddFakeDb:
-    """AsyncSessionLocal() 대체 — scalars 로 주입한 포지션 리스트를 돌려준다."""
+    """AsyncSessionLocal() 대체 — 쿼리 대상 엔티티(Order/Position)에 따라 다른 리스트를 돌려준다.
 
-    def __init__(self, positions):
-        self._positions = positions
+    _live_equity(§11)가 체결 재생용 Order 쿼리와 시가평가용 Position 쿼리를 순서대로
+    던지므로, select(Order)/select(Position) 를 구분해 각각의 fixture 를 반환해야 한다.
+    """
+
+    def __init__(self, positions=None, orders=None):
+        from app.models import Order
+
+        self._positions = positions or []
+        self._orders = orders or []
+        self._Order = Order
 
     async def scalars(self, stmt):
+        entity = stmt.column_descriptions[0]["entity"]
+        if entity is self._Order:
+            return list(self._orders)
         return list(self._positions)
 
     async def __aenter__(self):
@@ -1431,8 +1444,26 @@ class _Pos:
         self.avg_price = Decimal(str(avg_price))
 
 
-async def test_live_equity_capital_plus_unrealized_pnl(monkeypatch):
-    """라이브 자산가치 = 배정자본 + 보유 종목 미실현손익(Σ 수량×(현재가−평단))."""
+class _Exec:
+    def __init__(self, qty, price, fee=0):
+        from datetime import datetime, timezone
+        from decimal import Decimal
+
+        self.filled_qty = Decimal(str(qty))
+        self.filled_price = Decimal(str(price))
+        self.fee = Decimal(str(fee))
+        self.executed_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+
+class _Ord:
+    def __init__(self, symbol, side, executions):
+        self.symbol = symbol
+        self.side = side
+        self.executions = executions
+
+
+async def test_live_equity_no_orders_cash_equals_capital_plus_market_value(monkeypatch):
+    """체결 이력 없음 → 현금 = capital. 자산가치 = capital + Σ 수량×현재가(시가평가)."""
     from decimal import Decimal
 
     r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
@@ -1444,8 +1475,8 @@ async def test_live_equity_capital_plus_unrealized_pnl(monkeypatch):
     monkeypatch.setattr(
         r, "_quotes", lambda syms: _async({"A": Decimal("1200"), "B": Decimal("1800")})
     )
-    # 10M + 10×(1200−1000) + 5×(1800−2000) = 10M + 2000 − 1000 = 10,001,000
-    assert await r._live_equity() == 10_001_000.0
+    # cash=10M(체결 없음) + 10×1200 + 5×1800 = 10M + 12000 + 9000 = 10,021,000
+    assert await r._live_equity() == 10_021_000.0
 
 
 async def test_live_equity_no_holdings_returns_capital(monkeypatch):
@@ -1457,8 +1488,8 @@ async def test_live_equity_no_holdings_returns_capital(monkeypatch):
     assert await r._live_equity() == 7_000_000.0
 
 
-async def test_live_equity_quote_failure_is_conservative(monkeypatch):
-    """시세 조회 실패 종목은 손익 0(평단 평가)으로 보수 처리 — 데이터 결손이 오발동을 유발하지 않는다."""
+async def test_live_equity_quote_failure_falls_back_to_avg_price(monkeypatch):
+    """시세 조회 실패 종목은 평단가로 평가한다(현금흐름엔 이미 반영, 시가 대신 원가로 보수 처리)."""
     from decimal import Decimal
 
     r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
@@ -1467,9 +1498,29 @@ async def test_live_equity_quote_failure_is_conservative(monkeypatch):
     monkeypatch.setattr(r, "_resolve_universe", lambda as_of: _async(["A", "B"]))
     positions = [_Pos("A", 10, 1000), _Pos("B", 5, 2000)]
     monkeypatch.setattr(rebalance_runner, "AsyncSessionLocal", lambda: _MddFakeDb(positions))
-    # B 시세 누락 → B 는 손익 0, A 만 반영: 10M + 10×200 = 10,002,000
+    # B 시세 누락 → B 는 평단가(2000)로 평가: 10M + 10×1200 + 5×2000 = 10,022,000
     monkeypatch.setattr(r, "_quotes", lambda syms: _async({"A": Decimal("1200")}))
-    assert await r._live_equity() == 10_002_000.0
+    assert await r._live_equity() == 10_022_000.0
+
+
+async def test_live_equity_reflects_realized_pnl_from_past_roundtrip(monkeypatch):
+    """§11: 과거 라운드트립의 확정 실현손익이 체결 재생 현금잔고에 반영된다.
+
+    1000원에 10주 매수 후 1500원에 전량 매도(원가 10,000 → 회수 15,000, 실현손익 +5,000).
+    보유 없음(청산 완료) → 자산가치 = capital + 5,000(구 근사라면 실현손익을 놓쳐 capital 그대로).
+    """
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._user_id = 1
+    r._cfg = {"capital": 10_000_000}
+    monkeypatch.setattr(r, "_resolve_universe", lambda as_of: _async(["A"]))
+    orders = [
+        _Ord("A", "buy", [_Exec(10, 1000)]),
+        _Ord("A", "sell", [_Exec(10, 1500)]),
+    ]
+    monkeypatch.setattr(
+        rebalance_runner, "AsyncSessionLocal", lambda: _MddFakeDb(positions=[], orders=orders)
+    )
+    assert await r._live_equity() == 10_005_000.0
 
 
 async def _mdd_runner(monkeypatch, *, mdd_kill_pct=0.2, rearm_days=5):

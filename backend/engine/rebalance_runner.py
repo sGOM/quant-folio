@@ -17,15 +17,17 @@ from decimal import Decimal
 
 import pandas as pd
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.core.database import AsyncSessionLocal
-from app.models import Position
+from app.models import Order, OrderStatus, Position
+from app.services.backtest.tracking import replay_cash_balance
 from app.services.data.loader import (
     get_close_series,
     load_ohlcv,
     upsert_price_ticks,
 )
-from app.services.market import is_business_day, is_market_open_async, now_kst
+from app.services.market import KST, is_business_day, is_market_open_async, now_kst
 from app.services.metrics import (
     _approx_start,
     _fetch_index_ohlcv,
@@ -41,6 +43,10 @@ from engine.rebalance import (
     compute_target_weights,
     is_rebalance_due,
 )
+
+# MDD 킬스위치·변동성 타겟팅 입력(§11)에서 실현손익을 반영한 체결로 인정하는 상태.
+# tracking route(app.api.routes.tracking)와 동일 규약.
+_FILLED_STATUSES = (OrderStatus.PARTIAL, OrderStatus.FILLED)
 
 logger = logging.getLogger("engine.rebalance_runner")
 
@@ -255,25 +261,49 @@ class RebalanceRunner(BaseRunner):
         await self.redis.set(self._mdd_key(), json.dumps(state), ex=_LAST_TTL)
 
     async def _live_equity(self) -> float:
-        """라이브 계좌 자산가치 근사 = 배정자본 + 보유 종목 미실현손익.
+        """라이브 계좌 자산가치 근사 = 체결 재생 현금잔고 + 보유 종목 시가평가(§11).
 
-        라이브에는 별도의 현금 잔고 원장이 없다(리밸런싱은 config.capital 대비 목표비중으로
-        수량을 정한다). 그래서 자산가치를 '배정자본(capital) + 보유 종목의 미실현손익
-        (Σ 수량×(현재가−평단))' 으로 근사한다. 이는 다음과 동치다:
+        라이브에는 별도의 현금 잔고 원장이 없어(리밸런싱은 config.capital 대비 목표비중으로
+        수량을 정한다), 이 전략의 전체 체결(executions) 이력을 재생해 '지금' 시점의 현금
+        잔고를 계산한다(tracking.replay_cash_balance — §5 에서 만든 실행 기반 재구성 로직
+        재사용). 매도 체결의 현금흐름에는 매수원가와의 차익(실현손익)이 자연히 반영되므로,
+        과거 라운드트립에서 확정된 실현손익이 자산가치에 포함된다:
 
-            equity ≈ (capital − Σ 수량×평단[투입원가])  +  Σ 수량×현재가[시가평가]
-                   = capital + Σ 수량×(현재가 − 평단)
+            equity = 체결 재생 현금잔고 + Σ 현재 보유수량×현재가[시가평가]
 
-        즉 '미투자 현금분은 capital 잔여로, 투자분은 시가평가로' 본다. 완전 투자 상태에서
-        시장 급락 시 미실현손익이 크게 음(−)이 되어 자산가치가 하락하고 HWM 대비 낙폭이
-        커지므로 킬스위치가 겨냥하는 파국(시장 붕괴)을 정확히 포착한다.
-
-        한계: 과거 라운드트립에서 확정된 실현손익은 반영되지 않는다(현재 보유 장부의 시가
-        평가만 추적). 정밀 회계보다 파국 방어(안전장치)가 우선이라는 과제 원칙에 따른 절충이며,
-        시세 조회 실패 종목은 손익 0(평단 평가)으로 보수 처리해 데이터 결손이 오발동을
-        유발하지 않게 한다.
+        구 근사(capital + 미실현손익)는 확정 실현손익을 무시해 손실 라운드트립 이후에도
+        자산가치가 낙관적으로 리셋되는 편향이 있었다(MDD 킬스위치 과소 발동 방향). 시세 조회
+        실패 종목은 평단가로 평가한다(현금흐름에는 이미 반영됐으므로 시가 대신 원가로 두는
+        편이 미조회로 인한 오발동 왜곡보다 보수적).
         """
         capital = float(self._cfg.get("capital", 10_000_000))
+        async with AsyncSessionLocal() as db:
+            orders = list(
+                await db.scalars(
+                    select(Order)
+                    .options(selectinload(Order.executions))
+                    .where(
+                        Order.user_id == self._user_id,
+                        Order.strategy_id == self.strategy_id,
+                        Order.status.in_(_FILLED_STATUSES),
+                    )
+                )
+            )
+        executions = [
+            {
+                "symbol": o.symbol,
+                "side": str(o.side),
+                "qty": float(e.filled_qty),
+                "price": float(e.filled_price),
+                "fee": float(e.fee) if e.fee is not None else 0.0,
+                "date": pd.Timestamp(e.executed_at.astimezone(KST).date()),
+            }
+            for o in orders
+            for e in o.executions
+            if float(e.filled_qty) > 0 and float(e.filled_price) > 0
+        ]
+        cash = replay_cash_balance(executions, capital)
+
         pool = await self._resolve_universe(_last_business_day())
         async with AsyncSessionLocal() as db:
             rows = await db.scalars(
@@ -286,15 +316,15 @@ class RebalanceRunner(BaseRunner):
             )
             positions = list(rows)
         if not positions:
-            return capital
+            return cash
         prices = await self._quotes({p.symbol for p in positions})
-        unrealized = 0.0
+        market_value = 0.0
         for p in positions:
             price = prices.get(p.symbol)
-            if price is None:  # 시세 조회 실패 → 손익 0(평단 평가)으로 보수 처리
-                continue
-            unrealized += float(p.qty) * (float(price) - float(p.avg_price))
-        return capital + unrealized
+            if price is None:  # 시세 조회 실패 → 평단가로 보수 처리
+                price = p.avg_price
+            market_value += float(p.qty) * float(price)
+        return cash + market_value
 
     def _business_days_since(self, start: date, end: date) -> int:
         """start(제외)~end(포함) 사이 영업일 수. 백테스트의 (i − kill_idx) 와 동일 의미.
@@ -441,8 +471,10 @@ class RebalanceRunner(BaseRunner):
             # (rebalance_time 은 통상 장중이라 당일 종가는 아직 미확정).
             factor_weights = selection.get("factor_weights")
             neutralize = selection.get("neutralize", "none")
+            financial_period = self._cfg.get("financial_period", "annual")
             scores = await asyncio.to_thread(
-                compute_universe_scores, universe, as_of, factor_weights, neutralize
+                compute_universe_scores,
+                universe, as_of, factor_weights, neutralize, financial_period,
             )
             logger.info("전략 %d 종합점수 산정 완료: %d종목", self.strategy_id, len(scores))
         targets = compute_target_weights(history, cfg, scores=scores)

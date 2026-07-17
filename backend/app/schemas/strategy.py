@@ -674,6 +674,13 @@ class RebalanceConfig(BaseModel):
         " 상하한가에 도달한 방향의 주문을 그날 체결 불가(다음 리밸런싱 이월)로 막는다."
         " False(기본)면 구 동작(슬리피지에 근사 흡수) 유지 — 기존 결과 재현성 보존.",
     )
+    # 재무데이터 갱신 주기(§8/§3, opt-in) — OpenDART 퀄리티·성장 팩터의 소스 경로.
+    financial_period: Literal["annual", "ttm"] = Field(
+        default="annual",
+        description="퀄리티·성장 팩터(OpenDART)의 재무 반영 주기. 'annual'(기본)은 사업보고서"
+        " 기준 연간 경로(기존 등록 전략 재현성 보존). 'ttm'은 분기 TTM(트레일링 4분기)으로"
+        " 재무 반영 시차를 분기 단위로 좁힌다 — 둘 다 미래참조 없음(as_of 시점 공시분만 사용).",
+    )
     # 벤치마크 상대성과(alpha·beta·IR)용 지수. 위험조정지표 무위험수익률(연).
     benchmark_index: Literal["KOSPI200", "KOSPI", "KOSDAQ"] = Field(
         default="KOSPI200", description="벤치마크 상대성과 산출용 지수"

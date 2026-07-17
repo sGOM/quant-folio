@@ -49,6 +49,12 @@ celery_app.conf.beat_schedule = {
         "task": "worker.backup_database",
         "schedule": crontab(hour=3, minute=0),
     },
+    # 백업 신선도 감시(§9) — 야간 백업(03:00) 이후 이용자 활동이 시작되는 아침에 점검.
+    # worker/beat 자체가 죽어 backup_database 가 아예 실행되지 못하는 침묵 실패를 잡는다.
+    "check-backup-freshness": {
+        "task": "worker.check_backup_freshness",
+        "schedule": crontab(hour=9, minute=0),
+    },
 }
 
 

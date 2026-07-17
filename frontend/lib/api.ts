@@ -428,6 +428,12 @@ export interface RebalanceConfig {
   risk_free_rate?: number;
   /** 벤치마크 상대성과(alpha·beta·IR) 산출용 지수. 기본 KOSPI200. */
   benchmark_index?: "KOSPI200" | "KOSPI" | "KOSDAQ";
+  /** 체결가를 KRX 호가단위로 라운딩하고 ±30% 상하한가 도달 방향 주문을 그날 체결
+   * 불가(다음 리밸런싱 이월)로 막는다. false(기본)면 슬리피지에 근사 흡수(구 동작). */
+  price_limit_model?: boolean;
+  /** 퀄리티·성장 팩터(OpenDART)의 재무 반영 주기. "annual"(기본)=연간 사업보고서,
+   * "ttm"=분기 트레일링 4분기(재무 신선도↑, 둘 다 미래참조 없음). */
+  financial_period?: "annual" | "ttm";
 }
 
 export type StrategyConfig =
@@ -579,8 +585,12 @@ export interface BacktestResult {
    * 키: score_momentum/value/lowvol/quality/growth + 종합 score.
    */
   factor_ic?: Record<string, FactorIC>;
-  /** 평균 회전율 Σ|Δw|(리밸런싱 백테스트). */
+  /** 평균 회전율 Σ|Δw|(리밸런싱 백테스트, ADV 캡·절사·상하한가 반영 이전 드리프트 보정치). */
   avg_turnover?: number | null;
+  /** 실체결 기준 평균 회전율(§7, 항상 avg_turnover 이하) — ADV 캡·정수주 절사·상하한가
+   * 체결불가 반영 이후 실제 체결된 거래대금 기준. 둘의 괴리가 곧 유동성 제약으로 못
+   * 채운 물량이다. */
+  avg_turnover_actual?: number | null;
   equity_curve: { t: string; v: number }[];
   markers: { t: string; type: string; price?: number }[];
   /** 종료 시점 보유 비중(종목코드 → 비중). 리밸런싱 백테스트. */

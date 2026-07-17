@@ -16,6 +16,8 @@ x-backend-secret-env: &backend-secret-env
   OPENDART_API_KEY_FILE: /run/secrets/opendart_api_key
   TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
   TELEGRAM_CHAT_ID_FILE: /run/secrets/telegram_chat_id
+  S3_BACKUP_ACCESS_KEY_ID_FILE: /run/secrets/s3_backup_access_key_id
+  S3_BACKUP_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_backup_secret_access_key
 
 x-backend-secrets: &backend-secrets
   - secret_key
@@ -29,6 +31,8 @@ x-backend-secrets: &backend-secrets
   - opendart_api_key
   - telegram_bot_token
   - telegram_chat_id
+  - s3_backup_access_key_id
+  - s3_backup_secret_access_key
 
 services:
   db:
@@ -122,7 +126,10 @@ services:
       redis:
         condition: service_healthy
     # -B: beat 스케줄러를 워커 프로세스에 내장(단일 워커 replica 전제 — 여러 개면 중복 스케줄 위험).
-    command: celery -A worker.celery_app.celery_app worker --loglevel=info -B
+    # python -m celery(설치된 celery 콘솔 스크립트 직접 실행 아님)로 실행해야 한다 — 콘솔
+    # 스크립트로 실행하면 sys.path[0]이 스크립트 디렉터리(/usr/local/bin)가 되어 WORKDIR(/app)
+    # 최상위 패키지(engine 등)를 임포트하지 못한다(ModuleNotFoundError, §9 재점검 중 발견).
+    command: python -m celery -A worker.celery_app.celery_app worker --loglevel=info -B
     volumes:
       - ./backend:/app
       # 야간 DB 백업(worker.backup_database, E-2) 산출물 저장 위치. 서버 디스크 손상 시
@@ -193,6 +200,10 @@ secrets:
     file: ./secrets/telegram_bot_token.txt
   telegram_chat_id:
     file: ./secrets/telegram_chat_id.txt
+  s3_backup_access_key_id:
+    file: ./secrets/s3_backup_access_key_id.txt
+  s3_backup_secret_access_key:
+    file: ./secrets/s3_backup_secret_access_key.txt
 
 volumes:
   pgdata:

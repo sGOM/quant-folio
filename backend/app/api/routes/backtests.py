@@ -5,6 +5,7 @@
 """
 import logging
 from datetime import date, datetime, time, timedelta
+from functools import partial
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -108,13 +109,15 @@ def _load_regime_series(start_d, end_d, ticker: str):
     return df["close"]
 
 
-def _fundamentals_provider(as_of_date, codes):
+def _fundamentals_provider(as_of_date, codes, use_ttm: bool = False):
     """score 선정용 as_of 시점 펀더멘털을 조회한다(블로킹, 스레드풀 내 호출).
 
     - 밸류(PER/PBR/DIV): metrics._fetch_fundamentals(pykrx) — 실거래 점수와 동일 소스.
     - 퀄리티(roe/debt_ratio/fcf): OpenDART 재무데이터(PIT 공시지연 반영). API 키가
       없으면 빈 결과라 quality 컬럼이 붙지 않고, 백테스트 엔진이 중립 처리한다.
 
+    :param use_ttm: True 면 분기 TTM 경로(§8/§3, RebalanceConfig.financial_period=="ttm")로
+        퀄리티 재무를 조회한다. False(기본)면 기존 연간 경로(재현성 보존).
     둘 다 실패/부재면 None 을 반환하면 엔진이 밸류·퀄리티 팩터를 중립 처리한다.
     """
     from app.services.data import opendart
@@ -133,7 +136,7 @@ def _fundamentals_provider(as_of_date, codes):
 
     # 퀄리티 팩터(OpenDART). 키 부재/미배선 시 {} → 병합 없음.
     try:
-        qmetrics = opendart.metrics_by_symbol(norm_codes, as_of_date)
+        qmetrics = opendart.metrics_by_symbol(norm_codes, as_of_date, use_ttm=use_ttm)
     except Exception:  # noqa: BLE001
         qmetrics = {}
 
@@ -150,7 +153,7 @@ def _fundamentals_provider(as_of_date, codes):
     return fdf.join(qdf, how="left")
 
 
-def _fundamentals_provider_with_market_cap(as_of_date, codes):
+def _fundamentals_provider_with_market_cap(as_of_date, codes, use_ttm: bool = False):
     """_fundamentals_provider 결과에 as_of 시점 시가총액(원) 컬럼을 덧붙인다(사이즈 중립화용).
 
     krx_index.market_caps(PIT)를 재사용한다. 미인증/실패로 시총이 비면 컬럼을 붙이지
@@ -158,7 +161,7 @@ def _fundamentals_provider_with_market_cap(as_of_date, codes):
     """
     from app.services.data import krx_index
 
-    fdf = _fundamentals_provider(as_of_date, codes)
+    fdf = _fundamentals_provider(as_of_date, codes, use_ttm=use_ttm)
     norm_codes = [str(c).zfill(6) for c in codes]
     try:
         caps = krx_index.market_caps(as_of_date)
@@ -269,11 +272,12 @@ async def _run_rebalance_backtest(
             logger.warning("ADV 캡 설정됨이나 거래량 데이터를 확보하지 못했다(미적용).")
 
     method = config.get("selection", {}).get("method", "momentum")
-    provider = _fundamentals_provider if method == "score" else None
+    use_ttm = config.get("financial_period", "annual") == "ttm"
+    provider = partial(_fundamentals_provider, use_ttm=use_ttm) if method == "score" else None
     # 사이즈 중립화(P1-3): 시가총액(PIT)을 펀더멘털 프레임에 실어 스코어러가 각 팩터를
     # 로그 시총 축에 직교화하게 한다. 중립화가 꺼진 전략에는 추가 조회를 하지 않는다.
     if provider is not None and config.get("selection", {}).get("neutralize") == "size":
-        provider = _fundamentals_provider_with_market_cap
+        provider = partial(_fundamentals_provider_with_market_cap, use_ttm=use_ttm)
 
     # 현금화 오버레이(레짐 필터): 켜져 있으면 기준지수 종가 시리즈를 적재해 주입한다.
     regime_series = None

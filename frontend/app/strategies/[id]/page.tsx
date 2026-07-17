@@ -302,6 +302,11 @@ function StrategyDetailContent({ sid }: { sid: number }) {
                 <p className="mt-2 text-xs text-muted-foreground">
                   리밸런싱 {latest.result.num_rebalances ?? 0}회 · 평균 회전율{" "}
                   {pct(latest.result.avg_turnover)}
+                  {latest.result.avg_turnover_actual != null && (
+                    <span title="ADV 캡·정수주 절사·상하한가 체결불가 반영 이후 실체결 기준(항상 이 값 이하)">
+                      {" "}(실체결 {pct(latest.result.avg_turnover_actual)})
+                    </span>
+                  )}
                   {latest.result.num_kills != null && latest.result.num_kills > 0 && (
                     <span className="text-amber-600 dark:text-amber-400">
                       {" "}· MDD 킬스위치 {latest.result.num_kills}회 발동

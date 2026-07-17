@@ -22,6 +22,8 @@ docker compose 가 이 파일들을 `/run/secrets/*`(tmpfs)로 마운트하고, 
 | `opendart_api_key.txt` | (선택) OpenDART 인증키 | 재무데이터용(준비/미배선). 미사용 시 빈 파일 |
 | `telegram_bot_token.txt` | (선택) 텔레그램 봇 토큰 | critical 알림 외부 발송용. 미사용 시 빈 파일 |
 | `telegram_chat_id.txt` | (선택) 텔레그램 채팅 ID | 봇 토큰과 함께 둘 다 설정해야 활성화. 미사용 시 빈 파일 |
+| `s3_backup_access_key_id.txt` | (선택) S3 백업 오프사이트 복제 액세스 키 | 야간 DB 백업 추가 반출용(§10). 미사용 시 빈 파일 |
+| `s3_backup_secret_access_key.txt` | (선택) S3 백업 오프사이트 복제 시크릿 키 | 액세스 키와 함께 둘 다 설정해야 활성화. 미사용 시 빈 파일 |
 
 브로커 키 폴백을 쓰지 않고 앱(웹 UI)에서 사용자별로 등록한다면 브로커 파일들은
 빈 파일로 두면 됩니다(파일 자체는 존재해야 compose 가 기동됩니다).
@@ -42,6 +44,9 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 # 텔레그램 critical 알림(선택). @BotFather 로 봇 생성 후 토큰 발급, 채팅 ID는
 # 봇과 대화 시작 후 https://api.telegram.org/bot<TOKEN>/getUpdates 로 확인 — 미사용 시 빈 파일
 : > secrets/telegram_bot_token.txt; : > secrets/telegram_chat_id.txt
+# S3 백업 오프사이트 복제(선택, §10). AWS S3/Cloudflare R2/Backblaze B2/MinIO 등
+# S3 호환 스토리지의 액세스 키 — 미사용 시 빈 파일(로컬 백업만 동작, 영향 없음)
+: > secrets/s3_backup_access_key_id.txt; : > secrets/s3_backup_secret_access_key.txt
 ```
 
 > 🔁 `credential_enc_key.txt` 를 교체하면 기존에 암호화 저장된 DB 자격증명을

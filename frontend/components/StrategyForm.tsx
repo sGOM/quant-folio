@@ -336,6 +336,28 @@ export function StrategyForm({
           {config.type === "rebalance" &&
             " 벤치마크는 알파·베타·정보비율(IR) 산출 기준 지수입니다."}
         </p>
+        {config.type === "rebalance" && (
+          <>
+            <label className="mt-2 flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={!!(config as RebalanceConfig).price_limit_model}
+                onChange={(e) =>
+                  patch({
+                    price_limit_model: e.target.checked,
+                  } as Partial<StrategyConfig>)
+                }
+              />
+              상하한가·호가단위 반영
+            </label>
+            <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+              켜면 체결가를 KRX 가격대별 호가단위로 라운딩하고, 전일종가 대비 ±30%
+              상하한가에 도달한 방향(매수=상한가·매도=하한가)의 주문을 그날 체결
+              불가로 막아 다음 리밸런싱으로 이월합니다. 꺼두면(기본) 상하한가는
+              슬리피지에 근사 흡수된 것으로 봅니다.
+            </p>
+          </>
+        )}
       </fieldset>
 
       {config.type !== "rebalance" && (

@@ -214,6 +214,7 @@ def compute_universe_scores(
     as_of: date,
     factor_weights: dict[str, float] | None = None,
     neutralize: str = "none",
+    financial_period: str = "annual",
 ) -> dict[str, float]:
     """리밸런싱 selection.method="score" 전용: 지정 종목들의 종합점수를 계산한다.
 
@@ -228,6 +229,8 @@ def compute_universe_scores(
     :param symbols: 종목코드 목록(6자리, 미확정 zero-fill 은 함수 내부에서 처리)
     :param as_of: 점수 산출 기준일(확정 영업일)
     :param factor_weights: {"momentum","value","lowvol"} 카테고리 가중치. None 이면 기본값.
+    :param financial_period: "annual"(기본)/"ttm" — 퀄리티 팩터(OpenDART)의 재무 반영
+        주기(§8/§3, RebalanceConfig.financial_period). "ttm"이면 분기 TTM 경로로 조회한다.
     :return: {종목코드: score} dict. 데이터 부족(예: mom_6m 결측)으로 계산 불가한
         종목은 결과에서 제외된다(compute_target_weights 가 자연히 후순위/미선정 처리).
     """
@@ -299,7 +302,7 @@ def compute_universe_scores(
     try:
         from app.services.data import opendart
 
-        qmetrics = opendart.metrics_by_symbol(codes, as_of)
+        qmetrics = opendart.metrics_by_symbol(codes, as_of, use_ttm=financial_period == "ttm")
     except Exception as e:  # noqa: BLE001
         logger.warning("OpenDART 퀄리티 팩터 조회 실패 — 중립 처리: %s", e)
         qmetrics = {}

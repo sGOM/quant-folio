@@ -10,6 +10,7 @@ cryptography==44.0.0
 httpx==0.28.1
 redis==5.2.1
 celery==5.4.0
+boto3==1.35.90  # 백업 오프사이트 복제(§10) — S3 호환 스토리지(AWS S3/R2/B2/MinIO) 업로드
 websockets==14.1
 python-multipart==0.0.20
 email-validator==2.2.0

@@ -199,6 +199,31 @@ def reconstruct_realized_curve(
     return curve, notes
 
 
+def replay_cash_balance(executions: list[dict[str, Any]], initial_capital: float) -> float:
+    """체결 전체를 재생해 '지금' 시점의 현금 잔고를 계산한다(§11).
+
+    reconstruct_realized_curve 와 동일한 현금 갱신 규칙(매수: -notional-fee, 매도:
+    +notional-fee)을 쓰되, 일별 NAV 곡선 없이 최종 현금만 필요할 때 쓰는 경량 버전이다
+    (engine.rebalance_runner._live_equity 의 라이브 자산가치 근사). 현금은 각 체결의
+    현금흐름 델타를 그대로 누적한 합이므로 재생 순서(날짜 정렬)는 결과에 영향이 없다.
+
+    과거 라운드트립의 확정 실현손익이 이 현금 잔고에 자연히 반영된다는 점이 핵심이다
+    (매도로 원가보다 비싸게/싸게 팔았으면 그만큼 현금이 더/덜 들어온다) — 시가평가만
+    추적하던 기존 근사(capital + 미실현손익)의 한계를 해소한다.
+    """
+    cash = float(initial_capital)
+    for e in executions:
+        q = float(e["qty"])
+        px = float(e["price"])
+        fee = float(e.get("fee", 0.0) or 0.0)
+        notional = q * px
+        if str(e["side"]) == "buy":
+            cash -= notional + fee
+        else:
+            cash += notional - fee
+    return cash
+
+
 def _daily_returns(s: pd.Series) -> pd.Series:
     """양(>0) 값 구간의 일수익률(pct_change). 첫 NaN 은 제거한다."""
     r = s.pct_change()

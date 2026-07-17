@@ -203,8 +203,8 @@ def snapshot_sector_map() -> dict:
 # 파일명 규칙(quant_YYYYMMDD_HHMMSS.sql.gz)·보존정책은 그대로 맞춘다.
 _BACKUP_DIR = Path("/backups")
 _BACKUP_RETENTION_DAYS = 14
-# 마지막 성공 백업 시각(ISO). TTL 없이 최신값만 유지 — /health 등에서 노출할 수 있게 남겨둔다.
-_BACKUP_LAST_SUCCESS_REDIS_KEY = "backup:last_success_at"
+# 마지막 성공 백업 시각(ISO) 키는 app.core.channels.BACKUP_LAST_SUCCESS_KEY 공유
+# (worker.check_backup_freshness §9·엔진 헬스 API 가 같은 키를 조회).
 
 
 def _parse_database_url(url: str) -> dict:
@@ -264,9 +264,33 @@ def _prune_old_backups(backup_dir: Path, retention_days: int) -> list[str]:
     return removed
 
 
+def _upload_backup_to_s3(path: Path) -> str:
+    """백업 파일을 S3 호환 스토리지에 업로드한다(§10, opt-in). 반환: 업로드된 키.
+
+    endpoint_url 을 비워두면 AWS S3, 채우면 R2/B2/MinIO 등 S3 호환 스토리지를 겨냥한다.
+    boto3 클라이언트는 동기 API 라 이 함수도 동기다 — 호출부(_backup_database_async)는
+    이미 pg_dump 도 블로킹으로 직접 호출하는 단일 태스크 전용 이벤트루프라 문제 없다.
+    """
+    import boto3
+
+    from app.core.config import settings
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=settings.S3_BACKUP_ENDPOINT_URL or None,
+        region_name=settings.S3_BACKUP_REGION,
+        aws_access_key_id=settings.S3_BACKUP_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.S3_BACKUP_SECRET_ACCESS_KEY,
+    )
+    key = f"{settings.S3_BACKUP_PREFIX}{path.name}"
+    client.upload_file(str(path), settings.S3_BACKUP_BUCKET, key)
+    return key
+
+
 async def _backup_database_async() -> dict:
     from redis.asyncio import Redis
 
+    from app.core.channels import BACKUP_LAST_SUCCESS_KEY
     from app.core.config import settings
     from app.services.market import now_kst
     from engine.alerts import publish_alert
@@ -294,12 +318,32 @@ async def _backup_database_async() -> dict:
             return {"ok": False, "error": str(e)}
 
         removed = _prune_old_backups(_BACKUP_DIR, _BACKUP_RETENTION_DAYS)
-        await redis.set(_BACKUP_LAST_SUCCESS_REDIS_KEY, now_kst().isoformat())
+        await redis.set(BACKUP_LAST_SUCCESS_KEY, now_kst().isoformat())
+
+        # 오프사이트 복제(§10, opt-in) — 실패해도 로컬 백업 자체는 이미 성공했으므로
+        # critical 이 아니라 warning 으로 알리고 태스크는 정상 종료시킨다.
+        s3_key = None
+        if settings.has_s3_backup:
+            try:
+                s3_key = _upload_backup_to_s3(out_path)
+                logger.info(
+                    "DB 백업 오프사이트 업로드 완료: s3://%s/%s", settings.S3_BACKUP_BUCKET, s3_key
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error("DB 백업 오프사이트 업로드 실패(로컬 백업은 정상): %s", e)
+                await publish_alert(
+                    redis, user_id=None, strategy_id=0, severity="warning",
+                    message=f"DB 백업 오프사이트 업로드 실패(로컬 백업은 정상): {e}",
+                    code="db_backup_s3_upload_failed",
+                )
 
     finally:
         await redis.aclose()
 
-    result = {"ok": True, "path": str(out_path), "size_bytes": size, "removed": removed}
+    result = {
+        "ok": True, "path": str(out_path), "size_bytes": size, "removed": removed,
+        "s3_key": s3_key,
+    }
     logger.info("DB 백업 완료: %s", result)
     return result
 
@@ -314,5 +358,58 @@ def backup_database() -> dict:
     (텔레그램, docs/db-backup.md 참고). 개별 pg_dump 실패는 예외 전파 대신 결과 dict로
     표현한다 — Celery 재시도보다는 다음날 스케줄에서 재시도되는 편이 안전(중간 상태 tmp 파일
     정리까지 마친 뒤 반환).
+
+    오프사이트 복제(§10, opt-in): settings.has_s3_backup 이면 로컬 백업 성공 후 S3 호환
+    스토리지에도 업로드한다(서버 디스크 손상 대비). 업로드 실패는 warning 알림만 발행하고
+    태스크는 ok=True 로 정상 종료한다(로컬 백업 자체는 이미 성공했으므로).
     """
     return asyncio.run(_backup_database_async())
+
+
+# 백업 신선도 감시(docs/improvements.md §9) — backup:last_success_at 를 아무도 읽지
+# 않으면 worker/beat 자체가 죽어 백업이 아예 안 도는 침묵 실패를 아무도 못 알아챈다.
+_BACKUP_STALE_AFTER_HOURS = 26  # 03:00 KST 배치 + 1일 여유(하루 지연까진 정상 재시도 허용)
+
+
+async def _check_backup_freshness_async() -> dict:
+    from redis.asyncio import Redis
+
+    from app.core.channels import BACKUP_LAST_SUCCESS_KEY
+    from app.core.config import settings
+    from app.services.market import now_kst
+    from engine.alerts import publish_alert
+
+    redis = Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        raw = await redis.get(BACKUP_LAST_SUCCESS_KEY)
+        if raw is None:
+            age_hours = None
+        else:
+            last = datetime.fromisoformat(raw)
+            age_hours = (now_kst() - last).total_seconds() / 3600
+
+        stale = age_hours is None or age_hours > _BACKUP_STALE_AFTER_HOURS
+        if stale:
+            reason = (
+                "백업 성공 기록이 없습니다(worker/beat 미기동 가능성)"
+                if age_hours is None
+                else f"마지막 백업 성공 이후 {age_hours:.1f}시간 경과"
+            )
+            logger.error("DB 백업 신선도 점검 실패: %s", reason)
+            await publish_alert(
+                redis, user_id=None, strategy_id=0, severity="critical",
+                message=f"DB 백업이 최신이 아닙니다: {reason}", code="db_backup_stale",
+            )
+        return {"ok": not stale, "last_success_at": raw, "age_hours": age_hours}
+    finally:
+        await redis.aclose()
+
+
+@celery_app.task(name="worker.check_backup_freshness")
+def check_backup_freshness() -> dict:
+    """백업 신선도를 점검한다(§9) — backup:last_success_at 이 없거나 26시간 넘게 갱신되지
+    않으면 critical 알림을 발행한다. backup_database 태스크 자체의 실패는 이미 그 안에서
+    알림을 발행하므로, 이 태스크가 잡는 것은 그보다 상위의 침묵 실패(worker 프로세스 사망,
+    beat 스케줄러 중단 등 backup_database 가 아예 실행되지 못하는 경우)다.
+    """
+    return asyncio.run(_check_backup_freshness_async())
