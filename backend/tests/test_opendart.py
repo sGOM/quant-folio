@@ -6,6 +6,8 @@
 """
 from datetime import date
 
+import pytest
+
 from app.services.data import opendart
 
 
@@ -37,6 +39,7 @@ def test_derive_metrics_core_values():
     m = opendart.derive_metrics(_SAMSUNG_2023)
     assert m["net_income"] == 15_487_100_000_000  # 귀속분(14.47조) 아닌 전체 순이익
     assert m["op_income"] == 6_566_976_000_000
+    assert m["equity"] == 363_677_865_000_000  # TTM 합성(_combine_ttm)이 참조하는 저량값
     # ROE = 순이익 / 자본총계 ≈ 4.26%
     assert abs(m["roe"] - 15_487_100_000_000 / 363_677_865_000_000) < 1e-9
     # 부채비율(배수) = 부채/자본 ≈ 0.2536
@@ -201,3 +204,179 @@ def test_piotroski_f_score_weak():
 def test_piotroski_f_score_insufficient_data_none():
     """계산 가능한 항목이 5개 미만이면 None."""
     assert opendart.piotroski_f_score(_fin(roa=0.1), _fin()) is None
+
+
+# ───────────────────── 분기 TTM(트레일링 4분기) ─────────────────────
+
+
+def _fin_accounts(*, revenue, op_income, net_income, assets, liabilities, equity):
+    """TTM 테스트용 단순 재무제표 fixture(BS 저량 3개 + IS 손익 3개)."""
+    return [
+        _row("BS", "ifrs-full_Assets", "자산총계", str(assets)),
+        _row("BS", "ifrs-full_Liabilities", "부채총계", str(liabilities)),
+        _row("BS", "ifrs-full_Equity", "자본총계", str(equity)),
+        _row("IS", "ifrs-full_Revenue", "매출액", str(revenue)),
+        _row("IS", "dart_OperatingIncomeLoss", "영업이익", str(op_income)),
+        _row("IS", "ifrs-full_ProfitLoss", "당기순이익", str(net_income)),
+    ]
+
+
+def test_combine_ttm_telescopes_flow_and_keeps_latest_stock():
+    """flow(손익) 항목은 전년연간-전년동기+당해동기로 합성, stock(BS)은 당해 시점값 그대로."""
+    cur = opendart.derive_metrics(_fin_accounts(
+        revenue=100, op_income=20, net_income=10, assets=2000, liabilities=800, equity=1200,
+    ))
+    prev_same = opendart.derive_metrics(_fin_accounts(
+        revenue=80, op_income=15, net_income=8, assets=1800, liabilities=750, equity=1050,
+    ))
+    prev_annual = opendart.derive_metrics(_fin_accounts(
+        revenue=400, op_income=70, net_income=40, assets=1900, liabilities=770, equity=1130,
+    ))
+    combined = opendart._combine_ttm(cur, prev_same, prev_annual)
+    assert combined["revenue"] == 400 - 80 + 100  # 420
+    assert combined["op_income"] == 70 - 15 + 20   # 75
+    assert combined["net_income"] == 40 - 8 + 10   # 42
+    # 재무상태표는 당해 분기(cur) 시점값 그대로.
+    assert combined["assets"] == 2000
+    assert combined["liabilities"] == 800
+    assert combined["equity"] == 1200
+    # 비율은 텔레스코핑된 net_income 과 최신 시점 equity/assets 로 재계산.
+    assert combined["roe"] == pytest.approx(42 / 1200)
+    assert combined["debt_ratio"] == pytest.approx(800 / 1200)
+    assert combined["roa"] == pytest.approx(42 / 2000)
+
+
+def test_combine_ttm_missing_prior_period_leaves_flow_none():
+    """전년 자료가 없으면(상장 이력 짧음 등) flow 는 None, stock 은 여전히 당해값."""
+    cur = opendart.derive_metrics(_fin_accounts(
+        revenue=100, op_income=20, net_income=10, assets=2000, liabilities=800, equity=1200,
+    ))
+    empty = opendart.derive_metrics([])
+    combined = opendart._combine_ttm(cur, empty, empty)
+    assert combined["revenue"] is None
+    assert combined["net_income"] is None
+    assert combined["assets"] == 2000  # stock 은 cur 그대로 보존
+
+
+def test_ttm_metrics_annual_passthrough(monkeypatch):
+    """reprt_code 가 사업보고서면 TTM==연간 그 자체(전년 동기 등 추가 조회 없음)."""
+    opendart._PERIOD_METRICS_CACHE.clear()
+    opendart._ACCOUNTS_CACHE.clear()
+    calls = []
+
+    def fake_accounts(corp, year, reprt, fs):
+        calls.append((year, reprt, fs))
+        if reprt == opendart.REPORT_ANNUAL and fs == opendart.FS_CONSOLIDATED:
+            return _fin_accounts(
+                revenue=400, op_income=70, net_income=40,
+                assets=1900, liabilities=770, equity=1130,
+            )
+        return None
+
+    monkeypatch.setattr(opendart, "single_company_accounts", fake_accounts)
+    m = opendart.ttm_metrics("00012345", 2024, opendart.REPORT_ANNUAL)
+    assert m["revenue"] == 400
+    assert m["net_income"] == 40
+    # 연간 경로는 (2024, 연간) 한 번만 조회 — 전년동기 등은 조회하지 않는다.
+    assert {(y, r) for y, r, _fs in calls} == {(2024, opendart.REPORT_ANNUAL)}
+
+
+def test_ttm_metrics_quarterly_telescopes(monkeypatch):
+    """1분기 보고서 시점의 TTM = 전년연간 - 전년1분기 + 당해1분기."""
+    opendart._PERIOD_METRICS_CACHE.clear()
+    opendart._ACCOUNTS_CACHE.clear()
+
+    table = {
+        (2025, opendart.REPORT_Q1): _fin_accounts(
+            revenue=100, op_income=20, net_income=10, assets=2000, liabilities=800, equity=1200,
+        ),
+        (2024, opendart.REPORT_Q1): _fin_accounts(
+            revenue=80, op_income=15, net_income=8, assets=1800, liabilities=750, equity=1050,
+        ),
+        (2024, opendart.REPORT_ANNUAL): _fin_accounts(
+            revenue=400, op_income=70, net_income=40, assets=1900, liabilities=770, equity=1130,
+        ),
+    }
+
+    def fake_accounts(corp, year, reprt, fs):
+        if fs != opendart.FS_CONSOLIDATED:
+            return None  # 개별(OFS) 폴백까지 갈 필요 없는 fixture
+        return table.get((year, reprt))
+
+    monkeypatch.setattr(opendart, "single_company_accounts", fake_accounts)
+    m = opendart.ttm_metrics("00012345", 2025, opendart.REPORT_Q1)
+    assert m["revenue"] == 420
+    assert m["op_income"] == 75
+    assert m["net_income"] == 42
+    assert m["assets"] == 2000  # 당해 1분기 시점 재무상태표
+
+
+def test_ttm_metrics_falls_back_to_annual_when_quarter_missing(monkeypatch):
+    """당해 분기 원자료가 없으면(상장 이력 짧음 등) 직전 확정 연간으로 안전 폴백."""
+    opendart._PERIOD_METRICS_CACHE.clear()
+    opendart._ACCOUNTS_CACHE.clear()
+
+    annual_2024 = _fin_accounts(
+        revenue=400, op_income=70, net_income=40, assets=1900, liabilities=770, equity=1130,
+    )
+
+    def fake_accounts(corp, year, reprt, fs):
+        if fs != opendart.FS_CONSOLIDATED:
+            return None
+        if (year, reprt) == (2025, opendart.REPORT_Q1):
+            return None  # 당해 1분기 무자료(신규상장 등)
+        if (year, reprt) == (2024, opendart.REPORT_ANNUAL):
+            return annual_2024
+        return None
+
+    monkeypatch.setattr(opendart, "single_company_accounts", fake_accounts)
+    m = opendart.ttm_metrics("00099999", 2025, opendart.REPORT_Q1)
+    assert m["revenue"] == 400  # 연간 폴백값 그대로
+    assert m["net_income"] == 40
+
+
+def test_metrics_by_symbol_use_ttm_true_respects_pit(monkeypatch):
+    """use_ttm=True — latest_report_period 로 정한 PIT 안전 분기만 조회하고,
+    전년·전전년(동일 reprt_code) 은 과거이므로 룩어헤드가 아니다.
+
+    기본값은 False(기존 연간 경로) 다 — id=23/24 등 기존 등록 전략의 백테스트
+    재현성을 깨지 않기 위함. TTM 은 명시적 opt-in."""
+    monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+    monkeypatch.setattr(opendart, "cached_corp_code_map", lambda: {"000000": "00000000"})
+
+    calls = []
+
+    def fake_ttm(corp, year, reprt):
+        calls.append((year, reprt))
+        return {"roe": 0.1, "debt_ratio": 0.5, "op_income": 1.0,
+                "net_income": 1.0, "fcf": 1.0, "roa": 0.05}
+
+    monkeypatch.setattr(opendart, "ttm_metrics", fake_ttm)
+    out = opendart.metrics_by_symbol(["000000"], date(2025, 5, 20), use_ttm=True)
+    assert "000000" in out
+    # as_of=2025-05-20 → latest_report_period 는 (2025, Q1). 전년/전전년은
+    # 같은 reprt_code(Q1)의 과거 연도만 — 미래 분기(반기/3Q/차년도)는 절대 조회 안 함.
+    assert calls == [
+        (2025, opendart.REPORT_Q1),
+        (2024, opendart.REPORT_Q1),
+        (2023, opendart.REPORT_Q1),
+    ]
+
+
+def test_metrics_by_symbol_use_ttm_false_uses_annual_path(monkeypatch):
+    """use_ttm=False 는 기존 연간 경로(annual_metrics)를 그대로 사용한다(하위호환)."""
+    monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+    monkeypatch.setattr(opendart, "cached_corp_code_map", lambda: {"000000": "00000000"})
+    calls = []
+
+    def fake_annual(corp, year):
+        calls.append(year)
+        return {"roe": 0.1, "debt_ratio": 0.5, "op_income": 1.0,
+                "net_income": 1.0, "fcf": 1.0, "roa": 0.05}
+
+    monkeypatch.setattr(opendart, "annual_metrics", fake_annual)
+    monkeypatch.setattr(opendart, "ttm_metrics",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("ttm 호출 금지")))
+    out = opendart.metrics_by_symbol(["000000"], date(2025, 5, 20), use_ttm=False)
+    assert "000000" in out
+    assert set(calls) == {2024, 2023, 2022}  # announcement_lagged_year 기반 연간만
