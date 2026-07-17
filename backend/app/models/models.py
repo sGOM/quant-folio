@@ -3,13 +3,14 @@ price_ticks(hypertable), positions, risk_limits.
 
 금액·수량은 부동소수점 오차를 피하기 위해 NUMERIC 을 사용한다.
 """
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -287,6 +288,33 @@ class Position(Base):
     avg_price: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0"), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+# ─────────────────────────── sector_map_snapshots ───────────────────────────
+class SectorMapSnapshot(Base):
+    """업종분류 PIT 스냅샷(docs/improvements.md C-2 해소).
+
+    KRX MDC(app.services.data.krx_index.sector_map)는 '현재' 업종분류만 제공하고 과거
+    임의 시점을 조회하는 API 가 없다. 이를 우회하기 위해 지금부터 주기(분기 1회,
+    worker.snapshot_sector_map 태스크)로 현재 시점 분류를 이 테이블에 적재해 시점별
+    이력을 쌓는다. 스냅샷 도입 이후의 백테스트 구간부터는 point-in-time 매핑을 쓸 수
+    있다(krx_index.sector_map(as_of=...) 참고). 스냅샷 도입 이전 과거 구간은 데이터
+    소스 부재로 소급 적용이 여전히 불가능해 현재 분류로 폴백한다(문서화된 잔존 한계).
+    """
+    __tablename__ = "sector_map_snapshots"
+    __table_args__ = (
+        UniqueConstraint("symbol", "snapshot_date", name="uq_sector_map_snapshot_symbol_date"),
+        Index("ix_sector_map_snapshots_symbol_date", "symbol", "snapshot_date"),
+        Index("ix_sector_map_snapshots_date", "snapshot_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    sector: Mapped[str] = mapped_column(String(100), nullable=False)
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 
