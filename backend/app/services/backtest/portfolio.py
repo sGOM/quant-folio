@@ -682,17 +682,24 @@ def run_rebalance_backtest(
     # config 에 실어 _targets_at → _apply_risk_caps 로 흘려보낸다(업종 분류는 사실상 정적).
     # 소스 미확보(빈 dict)면 _apply_risk_caps 가 섹터 캡을 조용히 미적용한다.
     #
-    # PIT 한계(C-2, 확인됨·미해결): KRX MDC 는 '현재 시점' 업종분류만 제공하고 과거 임의
-    # 시점의 분류를 조회하는 API 가 없다. 즉 이 매핑을 수년치 백테스트 전 구간에 동일하게
-    # 소급 적용하는 약한 look-ahead 가 있다(업종 재편·이전 상장 종목의 과거 실제 분류와
-    # 다를 수 있음). 섹터 '한도'(비중 상한) 용도라 왜곡은 제한적이고(전략 id 관리 규약의
-    # PIT 원칙은 종목 선정·팩터 계산에 적용되는 원칙이며 이 캡은 그 위에 얹는 보조 장치),
-    # 별도 과거 스냅샷 데이터 소스가 없어 근본 해결은 보류한다.
+    # PIT 한계(C-2, 부분 해소): 업종분류 스냅샷을 분기 1회 적재하기 시작했다(worker
+    # "snapshot-sector-map-quarterly" → sector_map_snapshots 테이블, 자세한 내용은
+    # app.services.data.krx_index.sector_map 문서 참고). as_of=오늘로 조회하면 스냅샷
+    # 도입 이후 시점부터는 그 시점에 가장 가까운 과거 스냅샷(=PIT)을 쓴다. 다만 이 백테스트
+    # 전체에 대해 매핑을 1회만 로드하는 구조라, 수년치 백테스트 구간 전체를 '오늘' 시점
+    # 하나의 분류로 대표한다는 한계는 남는다(스냅샷이 아직 1건뿐이라면 이 시점부터는 오차가
+    # 없지만, 여러 분기 스냅샷이 쌓인 뒤에도 백테스트 구간별로 그 시점 스냅샷을 골라 쓰려면
+    # _apply_risk_caps 호출부를 리밸런싱일 단위로 리팩터링해야 한다 — 별도 과제). 스냅샷
+    # 도입 **이전** 과거 구간(첫 배치 이전 시점)은 그 시점 분류를 보존한 데이터 소스가 아예
+    # 없어 소급 적용이 여전히 불가능하며, 이 경우 현재 KRX 분류로 자동 폴백한다(약한
+    # look-ahead 잔존). 섹터 '한도'(비중 상한) 용도라 왜곡은 제한적이다.
 
     if risk_layer.get("max_sector_pct") and not config.get("_sector_map"):
+        from datetime import date as _date
+
         from app.services.data.krx_index import sector_map as _sector_map_fn
 
-        smap = _sector_map_fn()
+        smap = _sector_map_fn(as_of=_date.today())
         if smap:
             config = {**config, "_sector_map": smap}
             logger.info("섹터 집중 한도용 업종 매핑 로드: %d종목", len(smap))
