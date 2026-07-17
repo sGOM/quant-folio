@@ -161,3 +161,33 @@ def check_fill_quality_drift() -> dict:
     표본 부족(min_sample 미만)이면 등급이 INSUFFICIENT 라 자연히 알림이 발화하지 않는다.
     """
     return asyncio.run(_check_fill_quality_drift_async())
+
+
+async def _snapshot_sector_map_async() -> dict:
+    from app.core.database import AsyncSessionLocal
+    from app.services.data.krx_index import snapshot_sector_map
+
+    async with AsyncSessionLocal() as db:
+        try:
+            n = await snapshot_sector_map(db)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+    result = {"snapshot_symbols": n}
+    logger.info("업종분류 분기 스냅샷 적재 완료: %s", result)
+    return result
+
+
+@celery_app.task(name="worker.snapshot_sector_map")
+def snapshot_sector_map() -> dict:
+    """업종분류 PIT 스냅샷을 분기 1회 적재한다(C-2 해소, docs/improvements.md 참고).
+
+    KRX MDC(app.services.data.krx_index.sector_map)는 '현재' 업종분류만 제공하므로,
+    지금부터 주기 적재해 향후 백테스트 구간부터는 point-in-time 매핑을 쓸 수 있게 한다
+    (krx_index.sector_map(as_of=...) 가 이 테이블을 먼저 조회). 스냅샷 도입 이전 과거
+    구간의 소급 적용은 데이터 소스 부재로 여전히 불가능(문서화된 잔존 한계).
+    같은 분기에 이미 스냅샷이 있으면 멱등하게 스킵한다(snapshot_sector_map 내부 정책).
+    """
+    return asyncio.run(_snapshot_sector_map_async())
