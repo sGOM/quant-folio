@@ -1,0 +1,107 @@
+name: E2E Smoke
+
+# 전체 Docker Compose 스택(web/engine/worker/frontend/db/redis/proxy)을 실제로 띄우고
+# Playwright 로 "회원가입 → 로그인 → 전략 목록 → 백테스트 1회 → 모니터링" 핵심 경로를
+# 검증한다. 스택 기동이 무거워 PR/push 마다 도는 필수 게이트(ci.yml)에는 넣지 않고,
+# 야간 크론 + 수동 트리거로만 돈다. ci.yml 은 건드리지 않는다(별도 워크플로).
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 매일 UTC 18:00 = KST 03:00
+    - cron: "0 18 * * *"
+
+concurrency:
+  group: e2e-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: docker compose 전체 스택 + Playwright 스모크
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # --- 스택 기동 전제(README §1-2): 시크릿 파일 + .env ---
+      # CI 는 실제 브로커/외부 API 키가 없어도 된다(모의투자·미연동 상태로 충분 —
+      # 이 스모크는 로그인·전략 CRUD·자체 데이터 백테스트만 검증한다).
+      - name: 시크릿 파일 생성
+        run: |
+          mkdir -p secrets
+          openssl rand -hex 32 > secrets/secret_key.txt
+          python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" > secrets/credential_enc_key.txt
+          : > secrets/kis_app_key.txt;      : > secrets/kis_app_secret.txt
+          : > secrets/toss_app_key.txt;     : > secrets/toss_app_secret.txt
+          : > secrets/krx_id.txt;           : > secrets/krx_pw.txt
+          : > secrets/opendart_api_key.txt
+          : > secrets/telegram_bot_token.txt; : > secrets/telegram_chat_id.txt
+
+      - name: .env 준비
+        run: cp .env.example .env
+
+      - name: Docker Compose 스택 기동
+        run: docker compose up -d --build
+
+      - name: web healthy 대기
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sk --max-time 5 http://localhost:8080/health | grep -q '"status":"ok"'; then
+              echo "healthy"; exit 0
+            fi
+            echo "waiting for stack... ($i)"; sleep 5
+          done
+          echo "스택이 제한 시간 내에 기동하지 않음"; exit 1
+
+      - name: DB 마이그레이션
+        run: docker compose exec -T web alembic upgrade head
+
+      - name: 프론트 의존성 설치(Playwright 포함)
+        working-directory: frontend
+        run: npm ci
+
+      - name: Playwright 브라우저 설치
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Playwright 스모크 실행
+        working-directory: frontend
+        env:
+          E2E_BASE_URL: http://localhost:8080
+        run: npm run test:e2e
+
+      - name: Playwright 리포트 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: 컨테이너 로그 수집
+        if: always()
+        run: |
+          mkdir -p /tmp/compose-logs
+          for svc in web engine worker frontend proxy db redis; do
+            docker compose logs "$svc" > "/tmp/compose-logs/$svc.log" 2>&1 || true
+          done
+
+      - name: 컨테이너 로그 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-logs
+          path: /tmp/compose-logs
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: 스택 종료
+        if: always()
+        run: docker compose down -v

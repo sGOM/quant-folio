@@ -48,6 +48,12 @@ Thumbs.db
 # Playwright MCP 디버그 산출물(스냅샷·콘솔 로그)
 .playwright-mcp/
 
+# Playwright E2E 스모크(frontend/e2e) 실행 산출물 — 재생성 가능, 커밋 금지
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/
+frontend/playwright/.cache/
+
 # Data
 *.sqlite3
 *.db
