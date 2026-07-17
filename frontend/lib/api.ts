@@ -1016,6 +1016,45 @@ export interface OrderRow {
   created_at: string;
 }
 
+/**
+ * 전략 실측(모의투자/라이브) ↔ 백테스트 기대곡선 괴리 추적(improvements.md §6) 응답.
+ * GET /api/strategies/{id}/tracking. 체결이 하나도 없으면 404(잡히면 "아직 실측 데이터
+ * 없음"으로 처리), 비교 백테스트가 없으면 200이되 backtest_curve=[]·warning 채움.
+ */
+export interface TrackingResponse {
+  strategy_id: number;
+  backtest_id: number | null;
+  window: { date_from: string; date_to: string };
+  initial_capital: number;
+  /** 실측 일별 NAV(원). */
+  realized_curve: { t: string; v: number }[];
+  /** 백테스트 equity_curve(원). 비교 대상 없으면 []. */
+  backtest_curve: { t: string; v: number }[];
+  /** 실측 곡선을 자기 첫 값 기준 100으로 재기준. */
+  realized_index: { t: string; v: number }[];
+  /** 백테스트 곡선을 자기 첫 값 기준 100으로 재기준. */
+  backtest_index: { t: string; v: number }[];
+  metrics: {
+    /** 일수익률 차이의 연율화 표준편차(소수, 0.08=8%/yr). null=공통 거래일 부족. */
+    tracking_error: number | null;
+    /** 공통구간 첫날 대비 마지막날 실측/백테스트 상대 성과 격차(%). 양수=실측 초과. */
+    cumulative_divergence_pct: number | null;
+    realized_return_pct: number | null;
+    backtest_return_pct: number | null;
+    correlation: number | null;
+    n_common_days: number;
+  };
+  sample: {
+    n_executions: number;
+    n_symbols: number;
+    n_realized_days: number;
+    n_backtest_days: number;
+  };
+  /** 예: 비교할 백테스트가 없음. null이면 정상. */
+  warning: string | null;
+  notes: string[];
+}
+
 // ─────────────────────────── API ───────────────────────────
 export const api = {
   /**
@@ -1259,6 +1298,28 @@ export const api = {
    */
   getBacktestDsr: (backtestId: number) =>
     request<DsrAnalysis>(`/api/backtests/${backtestId}/dsr`),
+
+  /**
+   * 전략 실측(모의투자/라이브) NAV 곡선과 백테스트 기대곡선을 비교한다(improvements.md §6).
+   * 체결이 하나도 없으면 404(호출부는 "아직 실측 데이터 없음"으로 처리해야 함).
+   * @param strategyId 전략 ID
+   * @param opts.dateFrom    조회 시작일(YYYY-MM-DD). 미지정 시 첫 체결일까지 개방.
+   * @param opts.dateTo      조회 종료일(YYYY-MM-DD). 미지정 시 오늘.
+   * @param opts.backtestId  비교할 특정 백테스트 id. 미지정 시 최신 백테스트 자동 매칭.
+   */
+  getStrategyTracking: (
+    strategyId: number,
+    opts?: { dateFrom?: string; dateTo?: string; backtestId?: number },
+  ) => {
+    const params = new URLSearchParams();
+    if (opts?.dateFrom) params.set("date_from", opts.dateFrom);
+    if (opts?.dateTo) params.set("date_to", opts.dateTo);
+    if (opts?.backtestId !== undefined) params.set("backtest_id", String(opts.backtestId));
+    const qs = params.toString();
+    return request<TrackingResponse>(
+      `/api/strategies/${strategyId}/tracking${qs ? `?${qs}` : ""}`,
+    );
+  },
 
   // --- 매매 엔진 제어 ---
   /** 전략을 라이브(자동매매)로 전환하도록 엔진에 시작 명령을 보낸다. @param id 전략 ID */
