@@ -90,7 +90,7 @@
 
 ### 데이터 모델 (요약)
 
-`users` · `strategies` · `backtests` · `strategy_likes` · `orders` · `executions` · `positions` · `risk_limits` · `price_ticks`(TimescaleDB hypertable). 자세한 정의는 [`docs/PRD.md` §4](docs/PRD.md)와 `backend/app/models/models.py` 참고.
+`users` · `strategies` · `backtests` · `strategy_likes` · `orders` · `executions` · `positions` · `sector_map_snapshots` · `risk_limits` · `price_ticks`(TimescaleDB hypertable). 자세한 정의는 [`docs/PRD.md` §4](docs/PRD.md)와 `backend/app/models/models.py` 참고.
 
 ---
 
@@ -361,8 +361,18 @@ docker compose exec db pg_dump -U quant quant > backup.sql   # DB 백업
 
 ```bash
 docker compose exec web pytest             # 백엔드 — 신호·보안·장운영시간·멱등성·엔진 E2E
-docker compose exec frontend npm test      # 프론트 — Vitest 유닛 테스트(lib·전략 폼 검증)
+docker compose exec frontend npm test      # 프론트 — Vitest 유닛 테스트(lib·훅·컴포넌트·전략 폼 검증)
 docker compose exec frontend npm run lint  # 프론트 — ESLint
+```
+
+**E2E 스모크(Playwright)** — 실제로 스택을 띄운 뒤 브라우저로 핵심 경로
+(회원가입/로그인 → 전략 목록 → 전략 생성 → 백테스트 1회 → 모니터 표시)를 훑는다.
+전체 스택 기동이 필요해 CI 필수 게이트가 아니라 **야간 크론 + 수동 트리거**
+(`.github/workflows/e2e-smoke.yml`)로 돈다.
+
+```bash
+docker compose up -d --build               # 스택이 떠 있어야 한다(:8080)
+cd frontend && npm run test:e2e            # Playwright 스모크
 ```
 
 ---
