@@ -330,7 +330,7 @@ def test_volatility_breakout_exit_follows_entry():
     df = _ohlc(_OHLC_TREND, spread=1.0)
     entries, exits = generate_signals(df, {"type": "volatility_breakout", "k": 0.5})
     # 모든 청산은 직전 봉이 진입이었던 봉에서 발생(entries.shift(1)).
-    assert (exits.values <= entries.shift(1).fillna(False).values).all()
+    assert (exits.values <= entries.shift(1, fill_value=False).values).all()
 
 
 def test_obv_trend_signals_on_trend_reversal():

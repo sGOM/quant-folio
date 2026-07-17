@@ -71,6 +71,19 @@ def is_business_day(d: date) -> bool:
         return True  # 주말이 아니면 일단 영업일로 (시세/주문에서 자연 차단)
 
 
+async def is_market_open_async(now: datetime | None = None) -> bool:
+    """`is_market_open` 의 비동기 래퍼 — 이벤트 루프 블로킹 방지.
+
+    `is_business_day` 는 pykrx 네트워크 조회(최대 5초)를 동기로 수행하므로, 코루틴에서
+    직접 호출하면 그동안 프로세스의 이벤트 루프 전체(다른 러너·하트비트·reconcile)가
+    멈춘다. 러너 틱 등 async 경로에서는 이 래퍼로 스레드에 오프로드할 것.
+    lru_cache 는 스레드와 공유되므로 같은 날짜의 후속 동기 호출은 즉시 반환된다.
+    """
+    import asyncio
+
+    return await asyncio.to_thread(is_market_open, now)
+
+
 def is_market_open(now: datetime | None = None) -> bool:
     """현재 정규장 운영 중인지."""
     now = now or now_kst()

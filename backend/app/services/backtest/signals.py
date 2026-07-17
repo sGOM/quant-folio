@@ -271,7 +271,9 @@ def _donchian_squeeze_signals(close: pd.Series, cfg: dict) -> tuple[pd.Series, p
     squeeze_on = bb_mult * sigma_bb < kc_mult * sigma_kc
 
     mid = _sma(close, period)
-    released = (squeeze_on.shift(1).fillna(False)) & (~squeeze_on.fillna(False))
+    # shift(fill_value=False): bool dtype 을 유지해 object 승격·fillna downcasting
+    # (pandas FutureWarning, 향후 동작 변경 예정)을 피한다.
+    released = squeeze_on.shift(1, fill_value=False) & ~squeeze_on
     entries = (released & (close > mid)).fillna(False)
     exits = _cross_down(close, mid)
     exits = exits & ~entries
@@ -385,7 +387,8 @@ def _volatility_breakout_signals(data, cfg: dict) -> tuple[pd.Series, pd.Series]
     # 전일 range NaN(첫 봉) 구간 신호 제거
     entries = entries.where(prev_range.notna(), False)
     # 당일 종가 청산: 진입 다음 봉에서 청산(동일 봉 동시신호 금지 규약 준수)
-    exits = entries.shift(1).fillna(False).astype(bool)
+    # shift(fill_value=False): bool dtype 유지(fillna downcasting FutureWarning 회피)
+    exits = entries.shift(1, fill_value=False)
     # 진입과 청산이 같은 봉에 겹치면(연속 진입) 진입을 우선해 청산 제거
     exits = exits & ~entries
     return entries, exits
