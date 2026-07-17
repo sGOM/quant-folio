@@ -43,6 +43,12 @@ celery_app.conf.beat_schedule = {
         "task": "worker.snapshot_sector_map",
         "schedule": crontab(month_of_year="1,4,7,10", day_of_month="1", hour=19, minute=0),
     },
+    # DB 백업(E-2) — 매일 새벽 3시(KST). 장중·야간 배치(18:30 적재)와 겹치지 않고, 이용자
+    # 활동이 없는 시간대라 pg_dump 부하가 다른 작업과 경합하지 않는다.
+    "backup-database-nightly": {
+        "task": "worker.backup_database",
+        "schedule": crontab(hour=3, minute=0),
+    },
 }
 
 
