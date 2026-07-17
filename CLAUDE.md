@@ -2,6 +2,7 @@
 
 국내 주식(KRX) 퀀트 전략 **백테스팅** + 실시간 **자동매매** 웹 플랫폼 (QuantFolio).
 제품 정의는 [`docs/PRD.md`](docs/PRD.md), 백엔드 학습 가이드는 [`help/README.md`](help/README.md) 참고.
+**코드 작성·수정 시 [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md)(코드 컨벤션)를 따를 것.**
 
 ## 아키텍처 (한 줄 지도)
 
