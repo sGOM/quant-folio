@@ -48,10 +48,34 @@
   만성적자 제외) → 흑자전환·순이익YoY·F-Score·수급 종합점수 정렬. 라이브 검증 통과
   (예: 베셀 F6·흑자전환·부채41%). 키 없으면 재무필터 생략(수급 기준만).
 
+## 추가 배선(분기 TTM — 트레일링 4분기)
+
+- **`opendart.ttm_metrics(corp_code, bsns_year, reprt_code)`**: `latest_report_period`
+  가 반환한 분기(1Q/반기/3Q)에 대해 "전년 연간 − 전년 동기 누적 + 당해 동기 누적"
+  텔레스코핑으로 트레일링 4분기 flow(매출·영업이익·순이익·FCF·CFO·매출총이익)를
+  합성한다. OpenDART 분기 보고서 금액이 사업연도 초부터의 **누적치**라는 점을
+  이용한 표준 TTM 계산법이다. 재무상태표(자산·부채·자본 등 저량 항목)는 텔레스코핑
+  대상이 아니라 당해 분기 시점값을 그대로 쓰고, ROE/부채비율/ROA 는 텔레스코핑된
+  순이익과 최신 시점 자본/자산으로 재계산한다(비율 자체를 합산하지 않음).
+  reprt_code 가 사업보고서(연간)면 그 자체가 이미 TTM. 당해 분기 원자료가
+  없으면(상장 이력 짧음 등) 가장 최근 확정 연간으로 안전 폴백한다.
+- **`opendart.metrics_by_symbol(codes, as_of, use_ttm=False)`**: 기본값은 기존
+  연간(사업보고서 only, `announcement_lagged_year`) 경로 그대로다 — id=23/24 등
+  기존 등록 전략의 백테스트 재현성을 깨지 않기 위함. `use_ttm=True` 로 호출하면
+  `latest_report_period(as_of)` 로 PIT 안전한 최신 분기/연간을 정하고 `ttm_metrics`
+  로 조회한다. F-Score·YoY 성장·흑자전환·만성적자(3년) 판정도 전년·전전년
+  **동일 reprt_code 기준 TTM** 으로 비교해 계절성을 제거한다. 소비측
+  (`factors.py`/`screener.py`/`recommend.py`)은 출력 스키마(필드명)가 동일해
+  변경 없이 그대로 수용하며, TTM 전환은 신규 전략 config에서 명시적으로 옵트인
+  해야 한다.
+- PIT 안전성: TTM 이 참조하는 (당해분기, 전년동기, 전년연간) 은 모두
+  `latest_report_period` 가 이미 공시됐다고 판정한 시점이거나 그보다 과거뿐이라
+  룩어헤드가 없다. 단위테스트(`tests/test_opendart.py`)에 텔레스코핑 합산·저량
+  보존·연간 폴백·PIT 회귀(전년/전전년이 미래 분기를 절대 조회하지 않음) 검증 포함.
+
 ## 아직 남은 확장
 
 - 이익추정치 **리비전**(애널리스트 컨센서스): 무료 API 없음 → 발표 실적 YoY 서프라이즈로 근사.
-- 분기 **TTM**(트레일링 4분기) 지표로 팩터 신선도 향상(현재 연간 기준).
 - 상폐 포함 **Point-in-Time 유니버스**(생존편향): KIND 스크래핑 별도 과제.
 
 ## 왜 필요한가 (부족 데이터 → OpenDART로 해금)
@@ -78,7 +102,9 @@
   `.env.example`(`OPENDART_API_KEY_FILE`) + `secrets/README.md`.
 - `app/services/data/opendart.py`: `is_enabled()`(키 없으면 전 조회 비활성) ·
   `corp_code_map()` · `single_company_accounts()` · `derive_metrics()` ·
-  `announcement_lagged_year()`(룩어헤드 방지 공시지연 규칙) — 모두 구현 완료.
+  `announcement_lagged_year()`(룩어헤드 방지 공시지연 규칙) ·
+  `ttm_metrics()`/`metrics_by_symbol(..., use_ttm=True)`(분기 TTM, 위 "분기 TTM" 절
+  참고) — 모두 구현 완료.
   키 주입 검증: `docker compose exec -T web python -c "from app.services.data import opendart as o; print(o.is_enabled(), len(o.corp_code_map() or {}))"`
 
 ## 아직 OpenDART로도 안 되는 것
