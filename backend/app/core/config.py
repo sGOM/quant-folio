@@ -30,6 +30,8 @@ _SECRET_FILE_FIELDS = (
     "OPENDART_API_KEY",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
+    "S3_BACKUP_ACCESS_KEY_ID",
+    "S3_BACKUP_SECRET_ACCESS_KEY",
 )
 
 
@@ -141,6 +143,20 @@ class Settings(BaseSettings):
     # 기존 앱 내(WS) 알림만 동작(영향 없음).
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
+
+    # --- DB 백업 오프사이트 복제(§10, opt-in) ---
+    # 야간 pg_dump 백업(named volume db_backups)은 서버 로컬에만 있어 디스크 손상 시
+    # 복구 불가(docs/db-backup.md "오프사이트 보관 권장"). 성공한 백업을 S3 호환 스토리지
+    # (AWS S3/Cloudflare R2/Backblaze B2/MinIO 등)에 추가 업로드해 이를 해소한다.
+    # S3_BACKUP_ENDPOINT_URL 은 AWS 는 비워두고(기본 AWS 엔드포인트), R2/B2/MinIO 등은
+    # 해당 서비스의 S3 호환 엔드포인트를 넣는다. 버킷 미설정이면 업로드는 통째로 비활성
+    # (기존 로컬 전용 백업 동작에 영향 없음).
+    S3_BACKUP_BUCKET: str = ""
+    S3_BACKUP_ENDPOINT_URL: str = ""
+    S3_BACKUP_REGION: str = "auto"
+    S3_BACKUP_PREFIX: str = "quantfolio-db-backups/"
+    S3_BACKUP_ACCESS_KEY_ID: str = ""
+    S3_BACKUP_SECRET_ACCESS_KEY: str = ""
 
     # --- CORS ---
     FRONTEND_ORIGIN: str = "http://localhost:3000"
@@ -274,6 +290,15 @@ class Settings(BaseSettings):
     def has_telegram(self) -> bool:
         """텔레그램 봇 토큰·채팅ID 가 모두 주입되어 외부 알림 발송이 가능한지 여부."""
         return bool(self.TELEGRAM_BOT_TOKEN.strip() and self.TELEGRAM_CHAT_ID.strip())
+
+    @property
+    def has_s3_backup(self) -> bool:
+        """S3 백업 버킷·자격증명이 모두 주입되어 오프사이트 업로드가 가능한지 여부(§10)."""
+        return bool(
+            self.S3_BACKUP_BUCKET.strip()
+            and self.S3_BACKUP_ACCESS_KEY_ID.strip()
+            and self.S3_BACKUP_SECRET_ACCESS_KEY.strip()
+        )
 
 
 @lru_cache

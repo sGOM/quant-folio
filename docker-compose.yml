@@ -16,6 +16,8 @@ x-backend-secret-env: &backend-secret-env
   OPENDART_API_KEY_FILE: /run/secrets/opendart_api_key
   TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
   TELEGRAM_CHAT_ID_FILE: /run/secrets/telegram_chat_id
+  S3_BACKUP_ACCESS_KEY_ID_FILE: /run/secrets/s3_backup_access_key_id
+  S3_BACKUP_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_backup_secret_access_key
 
 x-backend-secrets: &backend-secrets
   - secret_key
@@ -29,6 +31,8 @@ x-backend-secrets: &backend-secrets
   - opendart_api_key
   - telegram_bot_token
   - telegram_chat_id
+  - s3_backup_access_key_id
+  - s3_backup_secret_access_key
 
 services:
   db:
@@ -193,6 +197,10 @@ secrets:
     file: ./secrets/telegram_bot_token.txt
   telegram_chat_id:
     file: ./secrets/telegram_chat_id.txt
+  s3_backup_access_key_id:
+    file: ./secrets/s3_backup_access_key_id.txt
+  s3_backup_secret_access_key:
+    file: ./secrets/s3_backup_secret_access_key.txt
 
 volumes:
   pgdata:
