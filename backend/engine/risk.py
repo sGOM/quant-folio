@@ -54,9 +54,9 @@ async def evaluate_buy(
     limit = await _get_limit(db, user_id, strategy_id)
     cash = desired_cash
     if limit and limit.max_position_size is not None:
-        # 이미 보유 중인 금액을 빼고 남은 한도까지만
-        pos = await _get_position(db, user_id, symbol)
-        held_value = (pos.qty * pos.avg_price) if pos else Decimal("0")
+        # 이미 보유 중인 금액(전 전략 합산)을 빼고 남은 한도까지만
+        held = await _aggregate_position(db, user_id, symbol)
+        held_value = (held.qty * held.avg_price) if held else Decimal("0")
         remaining = limit.max_position_size - held_value
         if remaining <= 0:
             return RiskDecision(False, 0, "최대 포지션 한도 도달")
@@ -69,13 +69,30 @@ async def evaluate_buy(
 
 
 async def evaluate_sell(
-    db: AsyncSession, user_id: int, symbol: str
+    db: AsyncSession, user_id: int, symbol: str, *, strategy_id: int | None = None
 ) -> RiskDecision:
-    """매도 리스크 평가. 보유 수량 전량 청산."""
-    pos = await _get_position(db, user_id, symbol)
-    if pos is None or pos.qty <= 0:
+    """매도 리스크 평가. 보유 수량 전량 청산.
+
+    :param strategy_id: 지정 시 그 전략에 귀속된 포지션 수량만 청산 대상으로 삼는다.
+        같은 종목을 여러 전략이 독립 보유할 수 있으므로(모델의 (user, strategy, symbol)
+        유니크), 전략 러너의 청산은 반드시 자기 전략 수량으로 좁혀야 다른 전략의
+        보유분을 함께 팔아버리지 않는다. None 이면 계좌 전체 합산 수량.
+    """
+    if strategy_id is not None:
+        pos = await db.scalar(
+            select(Position).where(
+                Position.user_id == user_id,
+                Position.strategy_id == strategy_id,
+                Position.symbol == symbol,
+            )
+        )
+        if pos is None or pos.qty <= 0:
+            return RiskDecision(False, 0, "보유 수량 없음")
+        return RiskDecision(True, int(pos.qty), "")
+    held = await _aggregate_position(db, user_id, symbol)
+    if held is None or held.qty <= 0:
         return RiskDecision(False, 0, "보유 수량 없음")
-    return RiskDecision(True, int(pos.qty), "")
+    return RiskDecision(True, int(held.qty), "")
 
 
 async def check_daily_loss_limit(
@@ -213,7 +230,7 @@ async def check_stop_loss(
     limit = await _get_limit(db, user_id, strategy_id)
     if not limit or limit.stop_loss_pct is None:
         return False
-    pos = await _get_position(db, user_id, symbol)
+    pos = await _aggregate_position(db, user_id, symbol)
     if pos is None or pos.qty <= 0 or pos.avg_price <= 0:
         return False
     drop = (pos.avg_price - current_price) / pos.avg_price
@@ -266,13 +283,32 @@ async def _get_strategy_limit(
     )
 
 
-async def _get_position(db: AsyncSession, user_id: int, symbol: str) -> Position | None:
-    """사용자의 특정 종목 포지션을 조회한다(없으면 None).
+@dataclass
+class _AggregatePosition:
+    """계좌 단위로 합산한 종목 익스포저(수량 합·수량가중 평균단가)."""
+    qty: Decimal
+    avg_price: Decimal
 
-    계좌 단위 리스크 판정(손절 게이트)이므로 strategy_id 로 좁히지 않는다 — 같은 종목을
-    여러 전략이 보유하면 여러 행이 반환될 수 있으나, 여기서는 계좌 전체 익스포저 관점의
-    보수적 게이트로 첫 행을 사용한다.
+
+async def _aggregate_position(
+    db: AsyncSession, user_id: int, symbol: str
+) -> _AggregatePosition | None:
+    """사용자의 특정 종목 포지션을 계좌 단위로 합산해 반환한다(없으면 None).
+
+    같은 종목을 여러 전략이 독립 보유할 수 있으므로(모델의 (user, strategy, symbol)
+    유니크) 단일 행 조회는 어느 전략의 행이 잡히는지 비결정적이다. 계좌 단위 리스크
+    판정(최대 포지션 한도·손절 게이트)은 전 행을 합산하고 평균단가는 수량가중으로
+    구해 결정적으로 판정한다.
     """
-    return await db.scalar(
-        select(Position).where(Position.user_id == user_id, Position.symbol == symbol)
-    )
+    rows = (
+        await db.scalars(
+            select(Position).where(
+                Position.user_id == user_id, Position.symbol == symbol
+            )
+        )
+    ).all()
+    total_qty = sum((p.qty for p in rows), Decimal("0"))
+    if not rows or total_qty <= 0:
+        return None
+    weighted = sum((p.qty * p.avg_price for p in rows), Decimal("0"))
+    return _AggregatePosition(qty=total_qty, avg_price=weighted / total_qty)

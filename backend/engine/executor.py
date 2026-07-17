@@ -146,16 +146,22 @@ async def _resolve_fill(
 ) -> tuple[int, Decimal]:
     """증권사 체결 조회로 실제 체결수량·평균체결가를 얻는다.
 
-    조회 실패 시(네트워크/스키마 변경) 신호가로 폴백하되 경고를 남긴다.
-    폴백은 정확성이 떨어지므로 추후 체결 통보(WebSocket)로 보정 대상이다.
+    조회 실패 시(네트워크/스키마 변경) 체결 여부를 알 수 없으므로 미체결(0)로
+    보고해 주문을 SUBMITTED 로 남긴다 — 이후 reconcile 루프(engine/reconcile.py)가
+    재조회해 실제 체결로 수렴시킨다. 여기서 요청 수량 전량을 체결로 간주하면
+    FILLED 로 확정돼 reconcile 대상에서 빠지고, 미체결이었을 경우 포지션 장부가
+    영구히 오염된다(자기 교정 불가).
     """
     if not order.kis_order_id:
         return 0, signal_price
     try:
         info = await broker.get_order_execution(order.kis_order_id, order.symbol)
     except BrokerError as e:
-        logger.warning("체결 조회 실패 — 신호가로 폴백 기록 %s: %s", order.idempotency_key, e)
-        return qty, signal_price
+        logger.warning(
+            "체결 조회 실패 — SUBMITTED 유지, reconcile 로 수렴 위임 %s: %s",
+            order.idempotency_key, e,
+        )
+        return 0, signal_price
 
     filled = int(info.filled_qty or 0)
     avg = info.avg_price

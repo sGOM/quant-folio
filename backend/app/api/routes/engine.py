@@ -20,6 +20,7 @@ from app.core.channels import (
 from app.core.database import get_db
 from app.core.redis import redis_client
 from app.models import Strategy, StrategyStatus, User
+from app.services.broker import user_has_credentials
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/engine", tags=["engine"])
@@ -36,8 +37,10 @@ async def start_strategy(
     KIS 자격증명이 없으면 400. 실제 매매는 분리된 엔진 프로세스가 수행한다.
     """
     s = await _get_owned(db, current, strategy_id)
-    if not current.kis_app_key:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "KIS 자격증명을 먼저 등록하세요.")
+    # 엔진(_load → user_has_credentials)과 동일한 판정을 재사용한다:
+    # DB 등록값 우선, 없으면 .env 폴백 — 라우트만 DB 컬럼을 직접 보면 드리프트가 생긴다.
+    if not user_has_credentials(current):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "증권사 자격증명을 먼저 등록하세요.")
     s.status = StrategyStatus.LIVE
     await db.commit()
     await redis_client.publish(

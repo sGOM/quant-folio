@@ -16,7 +16,11 @@ import {
   PRICE_SOURCE_LABELS,
 } from "@/lib/strategy";
 
-/** 입력/셀렉트 공용 스타일(StrategyForm 과 동일). text-foreground 로 select 글씨 대비를 명시한다. */
+/**
+ * 룰 빌더 전용 컴팩트 입력 스타일. 조건이 한 줄에 여러 칸 늘어서므로 폼 공용
+ * 스타일(strategy-form/fields 의 INPUT, h-9·px-3)보다 패딩을 줄인 변형이다.
+ * text-foreground 로 select 글씨 대비를 명시한다.
+ */
 const INPUT =
   "w-full rounded-md border border-input bg-background text-foreground px-2 py-1.5 text-sm outline-none focus:border-ring";
 

@@ -28,6 +28,8 @@ import {
 } from "@/lib/api";
 import { Nav } from "@/components/Nav";
 import { RequireAuth } from "@/components/RequireAuth";
+import { useCurrentUser } from "@/lib/useAuth";
+import { useSymbolNames } from "@/lib/useSymbolNames";
 import { useEventSocket } from "@/lib/useWebSocket";
 import { summarizeConfig } from "@/lib/strategy";
 import { Card } from "@/components/ui/card";
@@ -128,23 +130,11 @@ function MonitorContent() {
     undefined,
   );
 
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  // 인증 쿼리는 useCurrentUser 로 통일(retry:false 등 옵션이 화면마다 갈리지 않게).
+  const me = useCurrentUser();
   const strategies = useQuery({ queryKey: ["strategies"], queryFn: api.listStrategies });
-  // 종목코드 → 한글명 매핑(로그·표에 종목명 표시). 거의 불변이라 오래(1시간) 캐시하되,
-  // Infinity 는 피한다 — 서버가 최초에 불완전한 맵(외부 소스 일시 실패)을 준 경우
-  // 세션 내내 코드만 표시되는 문제를 막고, 서버 자가복구 후 갱신되도록 한다.
-  const names = useQuery({
-    queryKey: ["symbol-names"],
-    queryFn: api.symbolNames,
-    staleTime: 60 * 60 * 1000,
-    refetchOnWindowFocus: true,
-  });
-  // "종목명(코드)" 형태로 표기. 이름을 모르면 코드만 반환한다.
-  const nameOf = (code?: string | null) => {
-    const c = code == null ? "" : String(code);
-    const n = names.data?.[c];
-    return n ? `${n}(${c})` : c;
-  };
+  // 종목코드 → 한글명 매핑(로그·표에 종목명 표시). 캐시 정책은 훅 참조.
+  const { nameOf } = useSymbolNames();
   // WS 이벤트를 놓쳐도 화면이 영구히 stale 되지 않도록 보수적 폴백 폴링.
   const positions = useQuery({
     queryKey: ["positions"],
@@ -494,6 +484,9 @@ function Watchlist({
 }) {
   const [symbols, setSymbols] = useState<string[]>([]);
   const [input, setInput] = useState("");
+  // 복원 완료 전에는 저장 effect 가 초기값([])으로 저장분을 덮어쓰지 않게 가드
+  // (AlertCenter 와 동일 패턴 — effect 선언 순서에 대한 암묵적 의존 제거).
+  const hydrated = useRef(false);
 
   // 최초 마운트 시 localStorage 에서 복원.
   useEffect(() => {
@@ -503,10 +496,12 @@ function Watchlist({
     } catch {
       /* 손상된 값 무시 */
     }
+    hydrated.current = true;
   }, []);
 
-  // 변경 시 영속.
+  // 변경 시 영속(복원 전에는 쓰지 않는다).
   useEffect(() => {
+    if (!hydrated.current) return;
     localStorage.setItem(WATCHLIST_KEY, JSON.stringify(symbols));
   }, [symbols]);
 

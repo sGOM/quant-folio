@@ -29,10 +29,9 @@ from app.services.data.loader import (
     load_ohlcv,
     upsert_price_ticks,
 )
-from app.services.market import is_market_open
+from app.services.market import is_market_open_async
 from engine import risk
 from engine.base_runner import BaseRunner, _position_lock
-from engine.executor import execute_signal, make_idempotency_key
 
 logger = logging.getLogger("engine.runner")
 
@@ -120,7 +119,8 @@ class StrategyRunner(BaseRunner):
 
     async def _tick_once(self) -> None:
         # 장 운영시간이 아니면 신호 평가·주문을 건너뛴다(휴장일·시간외 보호).
-        if not is_market_open():
+        # async 래퍼: pykrx 영업일 조회(최대 5초)가 이벤트 루프를 멈추지 않게 한다.
+        if not await is_market_open_async():
             return
         price = await self._current_price()
         if price is None or self._series is None:
@@ -201,12 +201,9 @@ class StrategyRunner(BaseRunner):
                             f" · 진입 {decision.qty:,}주 @ {float(price):,.0f}"
                             f"(약 {decision.qty * float(price):,.0f}원)"
                         )
-                        await execute_signal(
-                            db, self.redis, self._broker,
-                            user_id=self._user_id, strategy_id=self.strategy_id,
-                            symbol=self._symbol, side="buy", qty=decision.qty, price=price,
-                            idempotency_key=make_idempotency_key(
-                                self.strategy_id, self._symbol, "buy", bar_ts),
+                        # _place: 실전(prod) 주문 단위 금액 캡 게이트를 거쳐 주문한다.
+                        await self._place(
+                            db, self._symbol, "buy", decision.qty, price, bar_ts,
                             reason=reason,
                         )
                     else:
@@ -313,14 +310,12 @@ class StrategyRunner(BaseRunner):
         :param bar_ts: 멱등성 키 구성용 신호봉 식별자(손절은 ":stop" 접미)
         :param reason: 감사 로그용 매도 사유(Order.reason 에 기록)
         """
-        decision = await risk.evaluate_sell(db, self._user_id, self._symbol)
+        decision = await risk.evaluate_sell(
+            db, self._user_id, self._symbol, strategy_id=self.strategy_id
+        )
         if not decision.approved:
             return
-        await execute_signal(
-            db, self.redis, self._broker,
-            user_id=self._user_id, strategy_id=self.strategy_id,
-            symbol=self._symbol, side="sell", qty=decision.qty, price=price,
-            idempotency_key=make_idempotency_key(
-                self.strategy_id, self._symbol, "sell", bar_ts),
-            reason=reason,
+        # _place: 실전(prod) 주문 단위 금액 캡 게이트를 거쳐 주문한다.
+        await self._place(
+            db, self._symbol, "sell", decision.qty, price, bar_ts, reason=reason
         )

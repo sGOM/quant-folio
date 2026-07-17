@@ -806,7 +806,10 @@ async def _make_runner(
     async def fake_has_holdings():
         return holdings
 
-    monkeypatch.setattr(rebalance_runner, "is_market_open", lambda now=None: True)
+    async def _open(now=None):
+        return True
+
+    monkeypatch.setattr(rebalance_runner, "is_market_open_async", _open)
     monkeypatch.setattr(rebalance_runner, "is_rebalance_due", lambda *a, **k: due)
     monkeypatch.setattr(r, "_rebalance_once", fake_rebalance_once)
     monkeypatch.setattr(r, "_set_last", fake_set_last)
@@ -1565,7 +1568,10 @@ async def test_tick_mdd_killed_liquidates_and_skips_regime(monkeypatch):
         "risk_layer": {"mdd_kill_pct": 0.2, "mdd_rearm_days": 5},
         "cadence": "monthly",
     }
-    monkeypatch.setattr(rebalance_runner, "is_market_open", lambda now=None: True)
+    async def _open(now=None):
+        return True
+
+    monkeypatch.setattr(rebalance_runner, "is_market_open_async", _open)
     monkeypatch.setattr(r, "_evaluate_mdd_kill", lambda pct, days: _async(True))
 
     calls: list = []
@@ -1596,7 +1602,10 @@ async def test_tick_mdd_not_killed_proceeds_to_cadence(monkeypatch):
         "risk_layer": {"mdd_kill_pct": 0.2, "mdd_rearm_days": 5},
         "cadence": "monthly",
     }
-    monkeypatch.setattr(rebalance_runner, "is_market_open", lambda now=None: True)
+    async def _open(now=None):
+        return True
+
+    monkeypatch.setattr(rebalance_runner, "is_market_open_async", _open)
     monkeypatch.setattr(rebalance_runner, "is_rebalance_due", lambda *a, **k: True)
     monkeypatch.setattr(r, "_evaluate_mdd_kill", lambda pct, days: _async(False))
 

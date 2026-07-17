@@ -8,6 +8,7 @@ import { api, SharedStrategy, SharedQuery } from "@/lib/api";
 import { Nav } from "@/components/Nav";
 import { RequireAuth } from "@/components/RequireAuth";
 import { summarizeConfig } from "@/lib/strategy";
+import { fmtPct } from "@/lib/format";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -28,11 +29,8 @@ const SORT_LABELS: Record<NonNullable<SharedQuery["sort"]>, string> = {
   recent: "최신순",
 };
 
-/** 비율(0~1)을 백분율 문자열로 변환. null/undefined 면 "-". */
-function pct(x: number | null | undefined): string {
-  if (x === null || x === undefined) return "-";
-  return `${(x * 100).toFixed(2)}%`;
-}
+// lib/format 공용 헬퍼에 이 화면의 표준 자릿수(2)만 입힌 별칭 — 포맷 로직 중복 금지.
+const pct = (x: number | null | undefined) => fmtPct(x, 2);
 
 /** 공유 전략 목록 라우트. 인증 게이트로 감싼 콘텐츠를 렌더한다. */
 export default function SharedStrategiesPage() {
