@@ -18,6 +18,7 @@ from app.api.routes import (
     screener,
     strategies,
     symbols,
+    tracking,
     trading,
     ws,
 )
@@ -91,6 +92,7 @@ app.include_router(kis.router)
 app.include_router(strategies.router)
 app.include_router(backtests.router)
 app.include_router(fill_quality.router)
+app.include_router(tracking.router)
 app.include_router(engine.router)
 app.include_router(trading.router)
 app.include_router(symbols.router)
