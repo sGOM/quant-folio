@@ -88,10 +88,18 @@
 
 ### worker — Celery 배치
 
-- **하는 일**: 무거운/주기적 배치 작업(데이터 적재, 대량 백테스트 등). 현재는 뼈대 +
-  헬스체크 태스크(`ping`)만 있고 PRD 후속 단계에서 본격 사용
-  (`worker/celery_app.py`).
-- **커맨드**: `celery -A worker.celery_app.celery_app worker --loglevel=info`
+- **하는 일**: 무거운/주기적 배치 작업. 헬스체크(`ping`) 외에 **beat 스케줄 3개**가
+  등록돼 있다 (`worker/celery_app.py` 의 `beat_schedule`, 구현은 `worker/tasks.py`):
+
+  | 태스크 | 주기 | 하는 일 |
+  |--------|------|---------|
+  | `ingest_daily_ohlcv` | 매일 18:30 | 장 마감·시세 확정 후 당일 일봉을 `price_ticks` 에 적재 |
+  | `check_fill_quality_drift` | 매주 월 09:00 | 체결 품질(슬리피지 실측) 드리프트 정기 점검 |
+  | `snapshot_sector_map` | 분기 1회(1/4/7/10월 1일 19:00) | 업종분류를 `sector_map_snapshots` 에 적재(섹터 캡 PIT화) |
+
+- **커맨드**: `celery -A worker.celery_app.celery_app worker --loglevel=info -B`
+  — `-B` 가 beat 스케줄러를 워커 프로세스에 **내장**한다(별도 beat 컨테이너 없음).
+  단일 워커 replica 전제이며, 워커를 여러 개로 늘리면 스케줄이 중복 발화한다.
 - **engine 과 차이**: engine 은 "항상 도는 실시간 데몬", worker 는 "요청받으면 처리하는
   작업 큐 컨슈머"(Spring 의 `@Async`/메시지 컨슈머). 브로커·백엔드 모두 Redis 사용.
 - **언제 만지나**: 시간이 오래 걸리거나 스케줄링이 필요한 작업을 추가할 때.
@@ -99,7 +107,8 @@
 ### db — PostgreSQL + TimescaleDB
 
 - **하는 일**: 모든 영속 데이터(users, strategies, backtests, orders, executions,
-  positions, risk_limits). `price_ticks` 는 **TimescaleDB hypertable**(시계열 최적화).
+  positions, sector_map_snapshots, risk_limits). `price_ticks` 는
+  **TimescaleDB hypertable**(시계열 최적화).
 - **이미지**: `timescale/timescaledb:latest-pg16` (PostgreSQL + 시계열 확장).
 - **영속성**: `pgdata` named volume 에 저장 → 컨테이너 지워도 데이터 유지.
 - **마이그레이션**: `docker compose exec web alembic upgrade head`
@@ -138,7 +147,7 @@ compose 에서 `command:` 로 **덮어쓴다**:
 ```yaml
 web:    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
 engine: command: python -m engine.main
-worker: command: celery -A worker.celery_app.celery_app worker --loglevel=info
+worker: command: celery -A worker.celery_app.celery_app worker --loglevel=info -B
 ```
 
 → 코드 한 벌, 의존성 한 벌. **역할만 커맨드로 분기**한다. 셋이 같은 코드베이스

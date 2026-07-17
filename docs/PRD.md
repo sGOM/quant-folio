@@ -64,10 +64,11 @@
 - **strategies**: `id, user_id, name, config(jsonb), status(draft/backtested/live), created_at, updated_at` — 전략 정의(진입·청산 조건, 리밸런싱 규칙)를 JSON으로 저장
 - **backtests**: `id, strategy_id, period_start, period_end, total_return, mdd, sharpe, result(jsonb), created_at` — 백테스팅 실행 결과 및 성과 지표
 - **strategy_likes**: `strategy_id, user_id, created_at` — 전략 즐겨찾기/좋아요(사용자↔전략 다대다)
-- **orders**: `id, user_id, strategy_id, symbol, side(buy/sell), qty, price, order_type, kis_order_id, status, idempotency_key, created_at` — 주문 요청 및 체결 상태(멱등성 키로 중복 주문 방지)
-- **executions**: `id, order_id, filled_qty, filled_price, fee, executed_at` — 실제 체결 내역(감사 로그)
+- **orders**: `id, user_id, strategy_id, symbol, side(buy/sell), qty, price, order_type, kis_order_id, kis_order_org_no, status, reason, idempotency_key, created_at` — 주문 요청 및 체결 상태(멱등성 키로 중복 주문 방지). `kis_order_org_no`는 체결통보 매칭용 주문조직번호, `reason`은 사람이 읽는 감사 로그
+- **executions**: `id, order_id, strategy_id, filled_qty, filled_price, fee, executed_at` — 실제 체결 내역(감사 로그). `strategy_id`는 order 조인 없이 전략별 조회하려는 비정규화 컬럼
 - **price_ticks** (TimescaleDB hypertable): `time, symbol, open, high, low, close, volume` — 시계열 시세 데이터(백테스팅·차트용)
-- **positions**: `id, user_id, symbol, qty, avg_price, updated_at` — 현재 보유 포지션 스냅샷
+- **positions**: `id, user_id, strategy_id, symbol, qty, avg_price, updated_at` — 현재 보유 포지션 스냅샷(전략별 분리 보유)
+- **sector_map_snapshots**: `id, symbol, sector, snapshot_date, created_at` — 업종분류 PIT 스냅샷. KRX가 현재 시점 분류만 제공해 과거 소급이 불가하므로, 분기 1회(Celery beat) 적재해 **적재 시점 이후 구간부터** 섹터 캡(`max_sector_pct`)이 point-in-time으로 동작하게 한다
 - **risk_limits**: `id, user_id, strategy_id, max_position_size, daily_loss_limit, stop_loss_pct` — 전략별 리스크 관리 한도
 
 ---
@@ -78,6 +79,7 @@
 - **전략 목록**: 사용자가 만든 전략 카드 리스트(상태 배지: 초안/백테스트 완료/운용 중), 신규 생성 버튼
 - **전략 빌더**: 진입·청산 조건, 종목 유니버스, 리밸런싱 주기, 리스크 한도 설정 폼
 - **백테스트 결과**: 수익률 곡선 차트, 성과 지표 테이블(수익률/MDD/샤프/승률), 매매 시점 마커
+- **실측 vs 백테스트**: 전략 상세에서 모의투자 실측 자산곡선과 백테스트 기대곡선을 100 기준 정규화해 겹쳐 보여주고(오버레이 차트), 트래킹 에러·누적 괴리율을 노출 — 실전 전환 판단 근거 및 알파 소멸 조기 감지용
 - **실시간 모니터링**: 실시간 시세·자산곡선(자체 SVG 차트), 미체결/체결 주문 테이블, 전략 ON/OFF 토글
 - **스크리너 / 추천 / 지표**: 팩터 기반 종목 스크리닝(`screener`), 전략 추천(`recommend`), 팩터·섹터 지표(`metrics`)
 - **설정**: 증권사(KIS/토스) API 키 등록(모의/실전 전환), 알림 설정, 계정 관리
