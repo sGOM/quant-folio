@@ -16,6 +16,9 @@ export function LineChart({
   height?: number;
   color?: string;
 }) {
+  // NaN/Infinity 가 섞이면 min/max→span→path 전부 NaN 이 되어 SVG 가 조용히
+  // 빈 화면이 된다(에러 없음). 유효하지 않은 포인트는 미리 걸러낸다.
+  data = data.filter((d) => Number.isFinite(d.v));
   if (data.length < 2) {
     return (
       <div className="flex h-40 items-center justify-center text-sm text-neutral-500">

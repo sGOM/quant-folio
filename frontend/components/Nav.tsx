@@ -116,7 +116,9 @@ export function Nav() {
       {/* 모바일: 아이콘 탭 바 */}
       <div className="flex items-center gap-1 overflow-x-auto px-2 pb-2 md:hidden">
         {LINKS.map((l) => {
-          const active = pathname.startsWith(l.href);
+          // 데스크톱과 동일한 판정: prefix 충돌(/strategies vs /strategies/shared) 시
+          // 더 구체적인 링크만 활성화한다.
+          const active = isActive(pathname, l.href);
           const Icon = l.icon;
           return (
             <Link

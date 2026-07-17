@@ -4,19 +4,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   GLOSSARY,
+  GLOSSARY_CATEGORIES,
   GlossaryCategory,
   GlossaryTerm,
 } from "@/lib/glossary";
 
-/** 카테고리 필터 칩 노출 순서. "전체"는 별도 처리. */
-const CATEGORIES: GlossaryCategory[] = [
-  "지표",
-  "전략",
-  "리스크",
-  "성과",
-  "시장",
-  "방법론",
-];
+/** 카테고리 필터 칩 노출 순서(단일 소스: lib/glossary). "전체"는 별도 처리. */
+const CATEGORIES = GLOSSARY_CATEGORIES;
 
 /**
  * 단일 용어가 검색어에 매칭되는지 판별한다(표제어·별칭·정의 본문, 대소문자 무시).

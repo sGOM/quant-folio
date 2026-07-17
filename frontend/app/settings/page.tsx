@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, AlertCircle, Loader2, Globe, Building2, UserCircle } from "lucide-react";
 import { api, type Broker } from "@/lib/api";
+import { useCurrentUser } from "@/lib/useAuth";
 import { Nav } from "@/components/Nav";
 import { RequireAuth } from "@/components/RequireAuth";
 import {
@@ -94,7 +95,7 @@ export default function SettingsPage() {
 /** 증권사 선택 + 자격증명을 등록·갱신하는 설정 본문. 저장 성공 시 관련 쿼리를 무효화한다. */
 function SettingsContent() {
   const qc = useQueryClient();
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const me = useCurrentUser();
 
   const [broker, setBroker] = useState<Broker>("kis");
   const [appKey, setAppKey] = useState("");
@@ -251,7 +252,7 @@ function SettingsContent() {
  */
 function ProfileCard() {
   const qc = useQueryClient();
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const me = useCurrentUser();
   const [name, setName] = useState("");
 
   // 사용자 정보 로드 시 현재 닉네임으로 초기화.

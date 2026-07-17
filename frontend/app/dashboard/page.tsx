@@ -9,6 +9,7 @@ import {
   Wallet,
 } from "lucide-react";
 import { api } from "@/lib/api";
+import { useCurrentUser } from "@/lib/useAuth";
 import { Nav } from "@/components/Nav";
 import { RequireAuth } from "@/components/RequireAuth";
 import {
@@ -32,7 +33,8 @@ export default function DashboardPage() {
 
 /** 계정 정보와 KIS 연동 상태 카드를 보여주는 대시보드 본문. */
 function DashboardContent() {
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  // 인증 쿼리는 useCurrentUser 로 통일(retry:false 등 옵션이 화면마다 갈리지 않게).
+  const me = useCurrentUser();
   const kis = useQuery({
     queryKey: ["kis-health"],
     queryFn: api.kisHealth,

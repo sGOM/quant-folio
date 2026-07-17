@@ -1,8 +1,18 @@
 // 프로젝트에서 사용하는 금융·퀀트 용어집 데이터.
 // 용어집 드로어(GlossaryDrawer)에서 검색·필터링해 보여준다.
 
+/** 용어 분류 목록(드로어 필터 칩 노출 순서 = 이 배열 순서). 타입은 여기서 파생된다. */
+export const GLOSSARY_CATEGORIES = [
+  "지표",
+  "전략",
+  "리스크",
+  "성과",
+  "시장",
+  "방법론",
+] as const;
+
 /** 용어 분류(드로어 상단 필터·섹션 구분에 사용). */
-export type GlossaryCategory = "지표" | "전략" | "리스크" | "성과" | "시장" | "방법론";
+export type GlossaryCategory = (typeof GLOSSARY_CATEGORIES)[number];
 
 /** 단일 용어 항목. */
 export interface GlossaryTerm {
