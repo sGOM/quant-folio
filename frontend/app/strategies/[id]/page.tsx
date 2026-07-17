@@ -4,14 +4,24 @@ import { use, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, Backtest, BacktestTrade, DsrAnalysis, FactorIC, StrategyConfig } from "@/lib/api";
+import {
+  api,
+  ApiError,
+  Backtest,
+  BacktestTrade,
+  DsrAnalysis,
+  FactorIC,
+  StrategyConfig,
+  TrackingResponse,
+} from "@/lib/api";
 import { Nav } from "@/components/Nav";
-import { LineChart } from "@/components/LineChart";
+import { LineChart, OverlayLineChart } from "@/components/LineChart";
 import { RequireAuth } from "@/components/RequireAuth";
 import { StrategyForm } from "@/components/StrategyForm";
 import { summarizeConfig } from "@/lib/strategy";
 import { useSymbolNames } from "@/lib/useSymbolNames";
 import { fmtNum, fmtPct, pctColor } from "@/lib/format";
+import { alignOverlaySeries, fmtTrackingError } from "@/lib/tracking";
 
 // lib/format 공용 헬퍼에 이 화면의 표준 자릿수(2)만 입힌 별칭 — 포맷 로직 중복 금지.
 const pct = (x: number | null | undefined) => fmtPct(x, 2);
@@ -330,6 +340,13 @@ function StrategyDetailContent({ sid }: { sid: number }) {
 
         <section className="mt-8">
           <h2 className="mb-2 text-sm text-muted-foreground">
+            실측 vs 백테스트 (모의투자/라이브 NAV 비교)
+          </h2>
+          <TrackingPanel sid={sid} />
+        </section>
+
+        <section className="mt-8">
+          <h2 className="mb-2 text-sm text-muted-foreground">
             백테스트 이력
             <span className="ml-2 text-xs">
               · ★ 대표로 지정하면 공유 시 성과가 함께 표시됩니다
@@ -562,6 +579,97 @@ function Metric({
       <p className="text-xs text-muted-foreground">{label}</p>
       <p className={`mt-1 text-lg font-semibold ${accent ? "text-primary" : ""}`}>
         {value}
+      </p>
+    </div>
+  );
+}
+
+/** 이미 %로 계산된 값을 부호 포함 문자열로. null → "-" (fmtPct 는 소수 비율 입력을 가정해 재사용 불가). */
+function pctStr(v: number | null | undefined, digits = 2): string {
+  return v == null ? "-" : `${v > 0 ? "+" : ""}${v.toFixed(digits)}%`;
+}
+
+/**
+ * 전략 실측(모의투자/라이브) NAV ↔ 백테스트 기대곡선 오버레이 패널(improvements.md §6).
+ * 체결이 하나도 없으면(404) "아직 실측 데이터 없음" 안내로 자연스럽게 처리하고,
+ * 그 밖의 실패만 에러로 보여준다. 비교할 백테스트가 없으면 warning 문구를 노출한다.
+ * @param sid 전략 ID
+ */
+function TrackingPanel({ sid }: { sid: number }) {
+  const tracking = useQuery({
+    queryKey: ["strategy-tracking", sid],
+    queryFn: () => api.getStrategyTracking(sid),
+    // 체결 없음(404)은 정상 상태(아직 실측 없음)라 재시도할 필요가 없다.
+    retry: (failureCount, err) =>
+      err instanceof ApiError && err.status === 404 ? false : failureCount < 2,
+  });
+
+  if (tracking.isLoading) {
+    return <p className="text-sm text-muted-foreground">실측 데이터 조회 중…</p>;
+  }
+  if (tracking.isError) {
+    const err = tracking.error;
+    if (err instanceof ApiError && err.status === 404) {
+      return (
+        <p className="text-sm text-muted-foreground">
+          아직 실측 데이터가 없습니다(모의투자/실거래 체결 후 이용 가능합니다).
+        </p>
+      );
+    }
+    return (
+      <p className="text-sm text-destructive">
+        실측 비교 리포트를 불러오지 못했습니다: {err instanceof Error ? err.message : "알 수 없는 오류"}
+      </p>
+    );
+  }
+
+  const data: TrackingResponse | undefined = tracking.data;
+  if (!data) return null;
+
+  // 백테스트 곡선은 보통 실측보다 훨씬 긴 기간이라, 실측 창으로 잘라 재기준한 뒤 겹친다.
+  const overlay = alignOverlaySeries(data.realized_index, data.backtest_index);
+  const m = data.metrics;
+
+  return (
+    <div className="space-y-3 rounded-lg border border-border bg-card p-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Metric label="연율화 트래킹에러" value={fmtTrackingError(m.tracking_error)} />
+        <Metric label="누적 괴리율" value={pctStr(m.cumulative_divergence_pct)} />
+        <Metric label="실측 수익률(공통구간)" value={pctStr(m.realized_return_pct)} />
+        <Metric label="백테스트 수익률(공통구간)" value={pctStr(m.backtest_return_pct)} />
+      </div>
+      <p className="text-xs text-muted-foreground">
+        공통 거래일 {m.n_common_days}일
+        {m.correlation != null && ` · 일수익률 상관 ${m.correlation.toFixed(2)}`}
+        {" · "}체결 {data.sample.n_executions}건 / 종목 {data.sample.n_symbols}개 / 실측{" "}
+        {data.sample.n_realized_days}거래일
+        {data.window && ` · 창 ${data.window.date_from} ~ ${data.window.date_to}`}
+      </p>
+
+      <OverlayLineChart
+        series={[
+          { name: "실측 NAV(정규화)", color: "#3b82f6", data: overlay.realized },
+          { name: "백테스트 기대(정규화)", color: "#f59e0b", data: overlay.backtest },
+        ]}
+      />
+
+      {data.warning && (
+        <p className="rounded-md border border-dashed border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
+          {data.warning}
+        </p>
+      )}
+      {data.notes.length > 0 && (
+        <ul className="list-inside list-disc text-xs text-muted-foreground">
+          {data.notes.map((n, i) => (
+            <li key={i}>{n}</li>
+          ))}
+        </ul>
+      )}
+      <p className="text-xs text-muted-foreground">
+        두 곡선 모두 100 기준으로 정규화했고, 백테스트 곡선은 실측 구간에 맞춰 잘라 다시
+        100으로 재기준했다(같은 출발선에서 벌어진 정도를 비교하기 위함). 트래킹에러는 공통
+        거래일 일수익률 차이의 연율화 표준편차, 누적 괴리율은 공통구간 첫날 대비 마지막날
+        상대 성과 격차다(양수=실측이 백테스트를 초과).
       </p>
     </div>
   );
