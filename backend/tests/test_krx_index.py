@@ -37,6 +37,10 @@ def _clear_cache(monkeypatch):
     krx_index._STOCKS_CACHE = None
     krx_index._MKTCAP_CACHE.clear()
     krx_index._SECTOR_CACHE = None
+    # 업종분류 PIT 스냅샷 조회(DB)는 순수 로직 테스트(네트워크·DB 목)와 무관하므로 기본은
+    # "스냅샷 없음"(빈 dict)으로 목 처리해 실제 DB 접속을 타지 않게 한다. 스냅샷 동작
+    # 자체를 검증하는 테스트는 개별적으로 이 목을 덮어쓴다.
+    monkeypatch.setattr(krx_index, "_lookup_pit_snapshot_sync", lambda as_of: {})
     yield
     krx_index._MEMBERS_CACHE.clear()
     krx_index._STOCKS_CACHE = None
@@ -310,6 +314,150 @@ def test_sector_map_failure_not_cached(monkeypatch):
     monkeypatch.setattr(krx_index, "_session", lambda: fake)
     assert krx_index.sector_map(date(2025, 6, 30)) == {}
     assert krx_index._SECTOR_CACHE is None  # 실패는 캐시 안 함(자가복구)
+
+
+# ───────────────────── 업종분류 PIT 스냅샷(sector_map_snapshots, C-2) ─────────────────────
+
+
+def test_sector_map_uses_pit_snapshot_when_available(monkeypatch):
+    """as_of 에 스냅샷이 있으면 KRX 조회 없이 스냅샷 매핑을 그대로 반환한다."""
+    calls = {"n": 0}
+
+    def _fake_snapshot(as_of):
+        calls["n"] += 1
+        return {"005930": "전기전자(스냅샷)"}
+
+    monkeypatch.setattr(krx_index, "_lookup_pit_snapshot_sync", _fake_snapshot)
+    # _session 이 호출되면 실패하도록 해 "스냅샷만으로 응답했는지"를 검증한다.
+    monkeypatch.setattr(
+        krx_index, "_session", lambda: (_ for _ in ()).throw(AssertionError("KRX 조회 금지"))
+    )
+
+    smap = krx_index.sector_map(as_of=date(2026, 7, 1))
+    assert smap == {"005930": "전기전자(스냅샷)"}
+    assert calls["n"] == 1
+
+
+def test_sector_map_falls_back_to_krx_when_no_snapshot(monkeypatch):
+    """스냅샷이 없으면(빈 dict) 기존처럼 KRX MDC 직접 조회로 폴백한다."""
+    monkeypatch.setattr(krx_index, "_lookup_pit_snapshot_sync", lambda as_of: {})
+    fake = _FakeSectorSession({"STK": [("005930", "전기전자")]})
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+
+    smap = krx_index.sector_map(as_of=date(2020, 1, 1))
+    assert smap == {"005930": "전기전자"}
+    assert fake.calls > 0  # 실제로 KRX 조회 경로를 탔다
+
+
+def test_sector_map_without_as_of_skips_snapshot_lookup(monkeypatch):
+    """as_of=None(기존 호출 방식)이면 스냅샷 조회 자체를 건너뛴다(과거 동작 그대로)."""
+    def _should_not_be_called(as_of):
+        raise AssertionError("as_of=None 이면 스냅샷 조회가 없어야 한다")
+
+    monkeypatch.setattr(krx_index, "_lookup_pit_snapshot_sync", _should_not_be_called)
+    fake = _FakeSectorSession({"STK": [("005930", "전기전자")]})
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+
+    smap = krx_index.sector_map()
+    assert smap == {"005930": "전기전자"}
+
+
+class _FakeAsyncScalarResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return list(self._rows)
+
+
+class _FakeSnapshotDB:
+    """SectorMapSnapshot 대상 scalar/execute/add_all/flush 만 지원하는 최소 대역."""
+
+    def __init__(self, *, existing_count: int = 0, latest_date=None, rows=None):
+        self._existing_count = existing_count
+        self._latest_date = latest_date
+        self._rows = rows or []
+        self.added: list = []
+        self.deleted_dates: list = []
+        self.flushed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def scalar(self, stmt):
+        # snapshot_sector_map 은 count(*) 쿼리 1회만 scalar() 로 던진다(멱등성 스킵 판단용).
+        return self._existing_count
+
+    async def execute(self, stmt):
+        text = str(stmt).lower()
+        if text.startswith("delete"):
+            self.deleted_dates.append("deleted")
+            return None
+        return _FakeAsyncScalarResult(self._rows)
+
+    def add_all(self, objs):
+        self.added.extend(objs)
+
+    async def flush(self):
+        self.flushed = True
+
+    async def commit(self):
+        return None
+
+    async def rollback(self):
+        return None
+
+
+def test_snapshot_sector_map_persists_current_mapping(monkeypatch):
+    monkeypatch.setattr(krx_index, "sector_map", lambda: {"005930": "전기전자", "005380": "운수장비"})
+    db = _FakeSnapshotDB(existing_count=0)
+
+    import asyncio as _asyncio
+    n = _asyncio.run(krx_index.snapshot_sector_map(db, as_of=date(2026, 7, 1)))
+
+    assert n == 2
+    assert {o.symbol for o in db.added} == {"005930", "005380"}
+    assert all(o.snapshot_date == date(2026, 7, 1) for o in db.added)
+    assert db.flushed
+
+
+def test_snapshot_sector_map_skips_when_already_exists(monkeypatch):
+    monkeypatch.setattr(krx_index, "sector_map", lambda: {"005930": "전기전자"})
+    db = _FakeSnapshotDB(existing_count=1)
+
+    import asyncio as _asyncio
+    n = _asyncio.run(krx_index.snapshot_sector_map(db, as_of=date(2026, 7, 1)))
+
+    assert n == 0
+    assert db.added == []
+
+
+def test_snapshot_sector_map_force_overwrites(monkeypatch):
+    monkeypatch.setattr(krx_index, "sector_map", lambda: {"005930": "전기전자"})
+    db = _FakeSnapshotDB(existing_count=1)
+
+    import asyncio as _asyncio
+    n = _asyncio.run(
+        krx_index.snapshot_sector_map(db, as_of=date(2026, 7, 1), force=True)
+    )
+
+    assert n == 1
+    assert db.deleted_dates  # 기존 스냅샷 삭제 후 재적재
+    assert len(db.added) == 1
+
+
+def test_snapshot_sector_map_returns_zero_when_krx_unavailable(monkeypatch):
+    monkeypatch.setattr(krx_index, "sector_map", lambda: {})
+    db = _FakeSnapshotDB(existing_count=0)
+
+    import asyncio as _asyncio
+    n = _asyncio.run(krx_index.snapshot_sector_map(db, as_of=date(2026, 7, 1)))
+
+    assert n == 0
+    assert db.added == []
 
 
 # ───────────────────── 팩터 커버리지 경고(_factor_coverage_warnings) ─────────────────────
