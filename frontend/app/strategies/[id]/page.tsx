@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useMemo, useState } from "react";
+import { use, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -8,7 +8,6 @@ import {
   api,
   ApiError,
   Backtest,
-  BacktestTrade,
   DsrAnalysis,
   FactorIC,
   StrategyConfig,
@@ -18,6 +17,8 @@ import { Nav } from "@/components/Nav";
 import { LineChart, OverlayLineChart } from "@/components/LineChart";
 import { RequireAuth } from "@/components/RequireAuth";
 import { StrategyForm } from "@/components/StrategyForm";
+import { TradeLogTable } from "@/components/TradeLogTable";
+import { DsrGradeBadge } from "@/components/DsrGradeBadge";
 import { summarizeConfig } from "@/lib/strategy";
 import { useSymbolNames } from "@/lib/useSymbolNames";
 import { fmtNum, fmtPct, pctColor } from "@/lib/format";
@@ -402,163 +403,6 @@ function StrategyDetailContent({ sid }: { sid: number }) {
   );
 }
 
-/** 체결 로그 페이지 단위: 기본 최근 60건, "더 보기"로 60건씩 추가 노출. */
-const TRADE_PAGE = 60;
-
-/**
- * 백테스트 체결 로그 테이블. 노출 건수(더 보기/전체/접기)와 정렬(일자·종목코드,
- * 헤더 클릭 토글) 상태를 자체 관리한다.
- * @param trades 백테스트 체결 목록(시간 오름차순)
- * @param nameOf 종목코드 → "종목명(코드)" 변환(useSymbolNames)
- */
-function TradeLogTable({
-  trades,
-  nameOf,
-}: {
-  trades: BacktestTrade[];
-  nameOf: (code: string) => string;
-}) {
-  const [limit, setLimit] = useState(TRADE_PAGE);
-  // 정렬: 일자(기본, 최근 우선) 또는 종목코드.
-  const [sort, setSort] = useState<{
-    key: "time" | "code";
-    dir: "asc" | "desc";
-  }>({ key: "time", dir: "desc" });
-  const total = trades.length;
-
-  // 표시할 체결: 최근 limit 건을 창으로 잡고, 선택한 기준으로 정렬한다.
-  // (limit=최근 몇 건을 볼지, sort=그 창 안의 정렬 순서 — 두 개념을 분리)
-  const shown = useMemo(() => {
-    const window = trades.slice(-limit);
-    const d = sort.dir === "asc" ? 1 : -1;
-    return [...window].sort((a, b) => {
-      if (sort.key === "code") {
-        const c = String(a.symbol).localeCompare(String(b.symbol));
-        // 같은 종목이면 시간 오름차순으로 안정 정렬
-        return c !== 0 ? c * d : String(a.t).localeCompare(String(b.t));
-      }
-      return String(a.t).localeCompare(String(b.t)) * d;
-    });
-  }, [trades, limit, sort]);
-
-  // 헤더 클릭: 같은 열이면 방향 토글, 다른 열이면 기본 방향으로 전환
-  // (일자=최근 우선 desc, 종목코드=오름차순 asc).
-  function toggleSort(key: "time" | "code") {
-    setSort((prev) =>
-      prev.key === key
-        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
-        : { key, dir: key === "time" ? "desc" : "asc" },
-    );
-  }
-  const sortArrow = (key: "time" | "code") =>
-    sort.key === key ? (sort.dir === "asc" ? " ↑" : " ↓") : "";
-
-  return (
-    <div className="rounded-lg border border-border bg-card p-4">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <h2 className="text-sm text-muted-foreground">
-          체결 로그 (매수/매도 · 최근 {Math.min(limit, total)}건 / 전체 {total}건)
-        </h2>
-        <div className="flex shrink-0 gap-1">
-          {limit < total && (
-            <button
-              type="button"
-              onClick={() => setLimit((n) => n + TRADE_PAGE)}
-              className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-            >
-              더 보기 (+{Math.min(TRADE_PAGE, total - limit)}건)
-            </button>
-          )}
-          {limit < total && (
-            <button
-              type="button"
-              onClick={() => setLimit(total)}
-              className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-            >
-              전체 보기
-            </button>
-          )}
-          {limit > TRADE_PAGE && (
-            <button
-              type="button"
-              onClick={() => setLimit(TRADE_PAGE)}
-              className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-            >
-              접기
-            </button>
-          )}
-        </div>
-      </div>
-      <div className="max-h-96 overflow-auto">
-        <table className="w-full text-xs">
-          <thead className="text-muted-foreground">
-            <tr className="border-b border-border">
-              <th className="py-1 text-left font-normal">
-                <button
-                  type="button"
-                  onClick={() => toggleSort("time")}
-                  className="font-normal transition-colors hover:text-foreground"
-                  title="일자순 정렬"
-                >
-                  일자{sortArrow("time")}
-                </button>
-              </th>
-              <th className="py-1 text-left font-normal">
-                <button
-                  type="button"
-                  onClick={() => toggleSort("code")}
-                  className="font-normal transition-colors hover:text-foreground"
-                  title="종목코드순 정렬"
-                >
-                  종목{sortArrow("code")}
-                </button>
-              </th>
-              <th className="py-1 text-center font-normal">구분</th>
-              <th className="py-1 text-right font-normal">거래대금</th>
-              <th className="py-1 text-right font-normal">체결가</th>
-              <th className="py-1 text-right font-normal">포지션손익</th>
-            </tr>
-          </thead>
-          <tbody>
-            {shown.map((tr, i) => (
-              <tr key={i} className="border-b border-border/50">
-                <td className="py-1">{tr.t.slice(0, 10)}</td>
-                <td className="py-1">{nameOf(tr.symbol)}</td>
-                <td className="py-1 text-center">
-                  <span
-                    className={
-                      tr.side === "buy"
-                        ? "text-profit"
-                        : tr.reason === "regime_exit" || tr.reason === "mdd_kill"
-                          ? "text-amber-500"
-                          : "text-loss"
-                    }
-                  >
-                    {tr.side === "buy"
-                      ? "매수"
-                      : tr.reason === "mdd_kill"
-                        ? "킬스위치"
-                        : tr.reason === "regime_exit"
-                          ? "청산"
-                          : "매도"}
-                  </span>
-                </td>
-                <td className="py-1 text-right">{tr.amount.toLocaleString()}원</td>
-                <td className="py-1 text-right">{tr.price?.toLocaleString() ?? "-"}</td>
-                <td className={`py-1 text-right ${pctColor(tr.position_return)}`}>
-                  {tr.position_return === null || tr.position_return === undefined
-                    ? "-"
-                    : pct(tr.position_return)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
 /**
  * 성과 지표 카드(라벨 + 값).
  * @param label  지표 이름
@@ -675,37 +519,6 @@ function TrackingPanel({ sid }: { sid: number }) {
   );
 }
 
-/** DSR 등급 → (배지 라벨, 색상 클래스). */
-const DSR_GRADE_STYLE: Record<
-  string,
-  { label: string; className: string }
-> = {
-  strong: {
-    label: "강함(≥0.95)",
-    className:
-      "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300",
-  },
-  marginal: {
-    label: "경계(≥0.90)",
-    className:
-      "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300",
-  },
-  inconclusive: {
-    label: "불확실(≥0.50)",
-    className:
-      "bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300",
-  },
-  overfit_suspected: {
-    label: "과최적화 의심(<0.50)",
-    className: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
-  },
-  insufficient_trials: {
-    label: "시행 부족",
-    className:
-      "bg-muted text-muted-foreground",
-  },
-};
-
 /**
  * DSR(Deflated Sharpe Ratio, P2-1) 카드 — 과최적화(다중검정 selection bias) 방어 지표.
  * 같은 전략·같은 기간의 백테스트 이력(파라미터 탐색 시행들)이 쌓일수록 추정이
@@ -713,7 +526,6 @@ const DSR_GRADE_STYLE: Record<
  * 통계의 취지를 살린다.
  */
 function DsrCard({ dsr }: { dsr: DsrAnalysis }) {
-  const style = DSR_GRADE_STYLE[dsr.grade] ?? DSR_GRADE_STYLE.insufficient_trials;
   const hasDsr = dsr.status === "ok" && dsr.dsr !== null && dsr.dsr !== undefined;
 
   return (
@@ -722,11 +534,7 @@ function DsrCard({ dsr }: { dsr: DsrAnalysis }) {
         <h2 className="text-sm text-muted-foreground">
           Deflated Sharpe Ratio(DSR)
         </h2>
-        <span
-          className={`rounded-full px-2 py-0.5 text-xs font-medium ${style.className}`}
-        >
-          {style.label}
-        </span>
+        <DsrGradeBadge grade={dsr.grade} />
       </div>
 
       {hasDsr ? (
