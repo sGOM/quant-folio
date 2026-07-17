@@ -1118,7 +1118,7 @@ async def test_rebalance_once_pit_narrows_and_scores_injected_universe(monkeypat
 
     captured: dict = {}
 
-    def fake_scores(universe, as_of, factor_weights, neutralize="none"):
+    def fake_scores(universe, as_of, factor_weights, neutralize="none", financial_period="annual"):
         captured["universe"] = list(universe)
         return {sym: 1.0 for sym in universe}
 
@@ -1167,7 +1167,9 @@ async def test_preview_returns_orders_without_executing(monkeypatch):
     monkeypatch.setattr(r, "_seed_history", lambda pool, min_bars=0: _async(hist))
     monkeypatch.setattr(
         rebalance_runner, "compute_universe_scores",
-        lambda universe, as_of, fw, neutralize="none": {sym: 1.0 for sym in universe},
+        lambda universe, as_of, fw, neutralize="none", financial_period="annual": {
+            sym: 1.0 for sym in universe
+        },
     )
     monkeypatch.setattr(rebalance_runner, "AsyncSessionLocal", lambda: _FakeDbCtx())
     monkeypatch.setattr(r, "_holdings", lambda db, pool: _async({}))

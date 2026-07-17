@@ -471,8 +471,10 @@ class RebalanceRunner(BaseRunner):
             # (rebalance_time 은 통상 장중이라 당일 종가는 아직 미확정).
             factor_weights = selection.get("factor_weights")
             neutralize = selection.get("neutralize", "none")
+            financial_period = self._cfg.get("financial_period", "annual")
             scores = await asyncio.to_thread(
-                compute_universe_scores, universe, as_of, factor_weights, neutralize
+                compute_universe_scores,
+                universe, as_of, factor_weights, neutralize, financial_period,
             )
             logger.info("전략 %d 종합점수 산정 완료: %d종목", self.strategy_id, len(scores))
         targets = compute_target_weights(history, cfg, scores=scores)
