@@ -264,6 +264,24 @@ def _sum_pick(
     return total
 
 
+def _ratios(
+    net_income: float | None,
+    equity: float | None,
+    liabilities: float | None,
+    assets: float | None,
+) -> tuple[float | None, float | None, float | None]:
+    """(roe, debt_ratio, roa) 를 계산한다. 자본/자산이 0 이하이면 정의 불가(None).
+
+    derive_metrics 와 TTM 합성(_combine_ttm) 양쪽에서 재사용한다 — TTM 은
+    순이익만 텔레스코핑(합산)하고 자본/자산은 최신 분기 시점값을 그대로 쓰므로
+    비율 계산 공식 자체는 연간·TTM 이 동일하다.
+    """
+    roe = net_income / equity if (net_income is not None and equity and equity > 0) else None
+    debt_ratio = liabilities / equity if (liabilities is not None and equity and equity > 0) else None
+    roa = net_income / assets if (net_income is not None and assets and assets > 0) else None
+    return roe, debt_ratio, roa
+
+
 def derive_metrics(accounts: list[dict]) -> dict[str, float | None]:
     """전체 재무제표 원계정에서 핵심 재무지표를 파생한다.
 
@@ -278,6 +296,9 @@ def derive_metrics(accounts: list[dict]) -> dict[str, float | None]:
       - fcf         = 영업활동현금흐름 − (유형자산 취득 + 무형자산 취득)
       - roa         = 당기순이익 / 자산총계        (F-Score 등 확장용, 자산>0)
 
+    equity(자본총계)도 함께 반환한다 — TTM 합성(_combine_ttm)이 최신 분기 시점값을
+    그대로 이어받기 위해 필요하다.
+
     또한 F-Score(Piotroski) 계산을 위한 원자료도 함께 반환한다: cfo(영업활동현금흐름),
     assets·liabilities·current_assets·current_liabilities(재무상태표), revenue·gross_profit
     (손익). 이들은 다년치 비교(f_score)에서 사용된다.
@@ -288,7 +309,7 @@ def derive_metrics(accounts: list[dict]) -> dict[str, float | None]:
     empty = {
         "roe": None, "debt_ratio": None, "op_income": None,
         "net_income": None, "fcf": None, "roa": None,
-        "cfo": None, "assets": None, "liabilities": None,
+        "cfo": None, "assets": None, "liabilities": None, "equity": None,
         "current_assets": None, "current_liabilities": None,
         "revenue": None, "gross_profit": None,
     }
@@ -329,9 +350,7 @@ def derive_metrics(accounts: list[dict]) -> dict[str, float | None]:
     if gross_profit is None:
         gross_profit = _pick(accounts, "CIS", account_id=_GROSS_PROFIT_ID, name_contains="매출총이익")
 
-    roe = net_income / equity if (net_income is not None and equity and equity > 0) else None
-    debt_ratio = liabilities / equity if (liabilities is not None and equity and equity > 0) else None
-    roa = net_income / assets if (net_income is not None and assets and assets > 0) else None
+    roe, debt_ratio, roa = _ratios(net_income, equity, liabilities, assets)
     fcf = ocf - capex if (ocf is not None and capex is not None) else None
 
     return {
@@ -344,6 +363,7 @@ def derive_metrics(accounts: list[dict]) -> dict[str, float | None]:
         "cfo": ocf,
         "assets": assets,
         "liabilities": liabilities,
+        "equity": equity,
         "current_assets": current_assets,
         "current_liabilities": current_liabilities,
         "revenue": revenue,
@@ -470,11 +490,13 @@ def announcement_lagged_year(as_of: date) -> int:
 # ─────────────────────── 캐시된 PIT 지표 provider ───────────────────────
 # OpenDART 는 일 20,000건 요율에 종목당 개별 호출이라, 백테스트(리밸런싱일마다
 # 유니버스 전 종목 조회)에서 그대로 호출하면 금방 한도를 넘고 느리다. 그래서
-# corp_code 매핑(하루 1회 수준)과 연간 재무제표(사업연도 단위 불변)를 프로세스 내
-# 캐시한다. 워커 수명 동안 유지되며, 실패(None)는 캐시하지 않아 다음에 재시도된다.
+# corp_code 매핑(하루 1회 수준)과 연간·분기 재무제표(사업연도·보고서 단위 불변)를
+# 프로세스 내 캐시한다. 워커 수명 동안 유지되며, 실패(None)는 캐시하지 않아 다음에
+# 재시도된다.
 _CORP_MAP_CACHE: dict[str, str] | None = None
 _ACCOUNTS_CACHE: dict[tuple, list[dict]] = {}
 _METRICS_CACHE: dict[tuple, dict[str, float | None]] = {}
+_PERIOD_METRICS_CACHE: dict[tuple, dict[str, float | None]] = {}
 
 
 def cached_corp_code_map() -> dict[str, str] | None:
@@ -513,12 +535,123 @@ def annual_metrics(corp_code: str, bsns_year: int) -> dict[str, float | None]:
     return metrics
 
 
-def metrics_by_symbol(codes: list[str], as_of: date) -> dict[str, dict[str, float | None]]:
+# ─────────────────────── 분기 TTM(트레일링 4분기) ───────────────────────
+# flow(손익/현금흐름) 항목은 텔레스코핑(합산) 대상, stock(재무상태표) 항목은
+# 최신 분기 시점값을 그대로 쓴다 — derive_metrics 의 출력 키와 정확히 일치시켜
+# 소비측(factors.py 등) 스키마를 변경 없이 그대로 수용하게 한다.
+_TTM_FLOW_FIELDS = ("op_income", "net_income", "fcf", "cfo", "revenue", "gross_profit")
+_TTM_STOCK_FIELDS = ("assets", "liabilities", "equity", "current_assets", "current_liabilities")
+
+
+def _period_metrics(corp_code: str, bsns_year: int, reprt_code: str) -> dict[str, float | None]:
+    """단일 (법인·사업연도·보고서코드) 조합의 파생 재무지표(연결 우선·개별 폴백).
+
+    annual_metrics 와 동일한 CFS→OFS 폴백 규칙을 reprt_code 일반(1Q/반기/3Q/연간)에
+    적용한 버전. 원자료는 _ACCOUNTS_CACHE 를 공유해 중복 네트워크 호출을 피하고,
+    파생결과는 (corp_code, bsns_year, reprt_code) 로 _PERIOD_METRICS_CACHE 에 캐시한다.
+    ttm_metrics/annual_metrics 양쪽에서 쓰인다.
+    """
+    key = (corp_code, bsns_year, reprt_code)
+    cached = _PERIOD_METRICS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    accounts: list[dict] | None = None
+    for fs_div in (FS_CONSOLIDATED, FS_SEPARATE):
+        acc_key = (corp_code, bsns_year, reprt_code, fs_div)
+        acc = _ACCOUNTS_CACHE.get(acc_key)
+        if acc is None:
+            acc = single_company_accounts(corp_code, bsns_year, reprt_code, fs_div)
+            if acc:
+                _ACCOUNTS_CACHE[acc_key] = acc
+        if acc:
+            accounts = acc
+            break
+
+    metrics = derive_metrics(accounts or [])
+    _PERIOD_METRICS_CACHE[key] = metrics
+    return metrics
+
+
+def _combine_ttm(
+    cur: dict[str, float | None],
+    prev_same: dict[str, float | None],
+    prev_annual: dict[str, float | None],
+) -> dict[str, float | None]:
+    """분기 누적치 3개를 텔레스코핑해 TTM(트레일링 4분기) 지표를 합성한다.
+
+    OpenDART 분기 보고서의 금액(thstrm_amount)은 사업연도 초부터의 **누적치**다
+    (예: 3분기보고서의 매출 = 1~9월 누적, 반기보고서의 영업이익 = 1~6월 누적).
+    따라서 TTM(직전 4개분기 합) = 전년 연간(prev_annual) − 전년 동기 누적(prev_same)
+    + 당해 동기 누적(cur) 로 계산할 수 있다(= 전년 나머지 분기 + 당해 누적분기).
+    fcf 도 ocf−capex 로 선형 결합된 flow 이므로 같은 공식이 그대로 성립한다.
+
+    재무상태표(저량) 항목은 텔레스코핑 대상이 아니라 당해 분기 시점값(cur)을
+    그대로 쓴다. roe/debt_ratio/roa 는 텔레스코핑된 net_income 과 최신 시점의
+    equity/liabilities/assets 로 재계산한다(비율 자체를 합산하면 안 된다).
+    """
+    result: dict[str, float | None] = {}
+    for f in _TTM_FLOW_FIELDS:
+        c, s, a = cur.get(f), prev_same.get(f), prev_annual.get(f)
+        result[f] = (a - s + c) if (c is not None and s is not None and a is not None) else None
+    for f in _TTM_STOCK_FIELDS:
+        result[f] = cur.get(f)
+    roe, debt_ratio, roa = _ratios(
+        result.get("net_income"), result.get("equity"),
+        result.get("liabilities"), result.get("assets"),
+    )
+    result["roe"] = roe
+    result["debt_ratio"] = debt_ratio
+    result["roa"] = roa
+    return result
+
+
+def ttm_metrics(corp_code: str, bsns_year: int, reprt_code: str) -> dict[str, float | None]:
+    """(corp_code, bsns_year, reprt_code) 시점의 TTM(트레일링 4분기) 재무지표.
+
+    reprt_code 가 사업보고서(REPORT_ANNUAL)면 그 자체가 이미 연간 누적이라
+    TTM == 연간이다. 분기 보고서(1Q/반기/3Q)면 전년 연간·전년 동기 누적을 함께
+    조회해 텔레스코핑한다(_combine_ttm). 당해 분기 원자료가 아예 없거나(상장
+    이력이 짧아 비교분기가 없는 등) 텔레스코핑 재료가 부족하면 가장 최근 확정
+    연간 재무제표로 안전하게 폴백한다.
+
+    PIT 안전성: 여기서 참조하는 (bsns_year, reprt_code), (bsns_year-1, reprt_code),
+    (bsns_year-1, REPORT_ANNUAL) 은 모두 latest_report_period(as_of) 가 PIT 안전
+    (이미 공시됨)하다고 판정한 reprt_code 와 그보다 과거 시점뿐이다 — 전년치는
+    과거이므로 항상 이미 공시돼 있어 룩어헤드가 없다.
+    """
+    if reprt_code == REPORT_ANNUAL:
+        return _period_metrics(corp_code, bsns_year, REPORT_ANNUAL)
+
+    cur = _period_metrics(corp_code, bsns_year, reprt_code)
+    if not any(v is not None for v in cur.values()):
+        # 당해 분기 원자료 없음(상장 이력 짧음 등) → 가장 최근 확정 연간으로 폴백.
+        return _period_metrics(corp_code, bsns_year - 1, REPORT_ANNUAL)
+
+    prev_same = _period_metrics(corp_code, bsns_year - 1, reprt_code)
+    prev_annual = _period_metrics(corp_code, bsns_year - 1, REPORT_ANNUAL)
+    combined = _combine_ttm(cur, prev_same, prev_annual)
+    if not any(v is not None for v in combined.values()):
+        # 텔레스코핑 재료(전년치)가 전혀 없음 → 당해 분기 원자료(단일분기 누적치)
+        # 라도 있으면 그대로 쓴다(완전 TTM 대비 신선도만 낮음). cur 도 비어 있을
+        # 리는 없지만(위에서 이미 검사) 방어적으로 유지.
+        return cur
+    return combined
+
+
+def metrics_by_symbol(
+    codes: list[str], as_of: date, use_ttm: bool = False
+) -> dict[str, dict[str, float | None]]:
     """유니버스 종목들의 PIT 재무지표를 {종목코드: {roe,debt_ratio,fcf,...}} 로 반환한다.
 
-    미래참조 방지: as_of 기준으로 announcement_lagged_year 가 산정한 '이미 공시된'
-    사업연도의 연간 재무제표만 사용한다. 키 미승인/조회 실패 종목은 결과에서 제외된다
-    (호출부가 중립 처리). 블로킹 함수이므로 호출자는 스레드풀에서 실행한다.
+    기본은 기존 연간(사업보고서 only, use_ttm=False) 경로 — 기존 등록 전략(id=23,
+    24 등)의 백테스트 재현성을 깨지 않기 위해 기본값을 유지한다. use_ttm=True 로
+    호출하면 분기 TTM(트레일링 4분기) — latest_report_period 로 as_of 시점에 이미
+    공시된 가장 최신 분기/연간 보고서를 정하고, 분기면 ttm_metrics 로 텔레스코핑한다.
+    어느 경로든 미래참조는 없다 — as_of 시점에 이미
+    공시가 끝난 보고서만 사용한다(latest_report_period/announcement_lagged_year).
+    키 미승인/조회 실패 종목은 결과에서 제외된다(호출부가 중립 처리). 블로킹
+    함수이므로 호출자는 스레드풀에서 실행한다.
     """
     if not is_enabled() or not codes:
         return {}
@@ -526,22 +659,34 @@ def metrics_by_symbol(codes: list[str], as_of: date) -> dict[str, dict[str, floa
     if not corp_map:
         return {}
 
-    year = announcement_lagged_year(as_of)
+    if use_ttm:
+        year, reprt_code = latest_report_period(as_of)
+    else:
+        year, reprt_code = announcement_lagged_year(as_of), REPORT_ANNUAL
+
     out: dict[str, dict[str, float | None]] = {}
     for raw in codes:
         code = str(raw).strip().zfill(6)
         corp = corp_map.get(code)
         if not corp:
             continue
-        m = dict(annual_metrics(corp, year))
-        # 전년 실적으로 YoY 성장·흑자전환(실적상향/턴어라운드 팩터)·F-Score를 파생한다.
-        prev = annual_metrics(corp, year - 1)
+        if use_ttm:
+            m = dict(ttm_metrics(corp, year, reprt_code))
+            # 전년(동일 reprt_code 기준 TTM)·전전년으로 YoY 성장·흑자전환·F-Score·
+            # 만성적자 판정을 파생한다. 모두 이미 공시된 과거 구간이라 PIT 안전.
+            prev = ttm_metrics(corp, year - 1, reprt_code)
+            prev2 = ttm_metrics(corp, year - 2, reprt_code)
+        else:
+            m = dict(annual_metrics(corp, year))
+            # 전년 실적으로 YoY 성장·흑자전환(실적상향/턴어라운드 팩터)·F-Score를 파생한다.
+            prev = annual_metrics(corp, year - 1)
+            prev2 = annual_metrics(corp, year - 2)
         m["op_growth"] = _yoy_growth(m.get("op_income"), prev.get("op_income"))
         m["net_growth"] = _yoy_growth(m.get("net_income"), prev.get("net_income"))
         m["turnaround"] = _turnaround_flag(m.get("net_income"), prev.get("net_income"))
         m["f_score"] = piotroski_f_score(m, prev)
-        # 최근 3년 순이익(만성 적자 판정용). 전 항목 None(조회 실패)이면 미수록.
-        prev2 = annual_metrics(corp, year - 2)
+        # 최근 3년(TTM 경로는 최근 3개 동일분기 TTM) 순이익(만성 적자 판정용).
+        # 전 항목 None(조회 실패)이면 미수록.
         m["loss_years_3"] = _count_losses(
             [m.get("net_income"), prev.get("net_income"), prev2.get("net_income")]
         )

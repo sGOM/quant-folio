@@ -67,7 +67,8 @@ def test_quality_zero_weight_does_not_change_score():
 
 
 def test_metrics_by_symbol_pit_and_mapping(monkeypatch):
-    """metrics_by_symbol: 공시지연 연도로 조회하고 corp_code 매핑을 통과시킨다."""
+    """metrics_by_symbol(use_ttm=False, 연간 경로): 공시지연 연도로 조회하고
+    corp_code 매핑을 통과시킨다(TTM 기본 경로는 test_opendart.py 에서 별도 검증)."""
     monkeypatch.setattr(opendart, "is_enabled", lambda: True)
     monkeypatch.setattr(opendart, "cached_corp_code_map",
                         lambda: {"005930": "00126380", "035420": "00266961"})
@@ -81,7 +82,9 @@ def test_metrics_by_symbol_pit_and_mapping(monkeypatch):
     monkeypatch.setattr(opendart, "annual_metrics", fake_annual)
 
     # as_of 2025-05 → 공시지연 연도 2024 (4월 이후). 성장 파생 위해 전년(2023)도 조회.
-    out = opendart.metrics_by_symbol(["005930", "035420", "999999"], date(2025, 5, 20))
+    out = opendart.metrics_by_symbol(
+        ["005930", "035420", "999999"], date(2025, 5, 20), use_ttm=False
+    )
     assert set(out) == {"005930", "035420"}  # 매핑 없는 999999 제외
     years = {y for _, y in calls}
     assert max(years) == 2024  # PIT 최신 사용연도
@@ -117,7 +120,7 @@ def test_growth_absent_columns_neutral():
 
 
 def test_metrics_by_symbol_adds_growth_and_turnaround(monkeypatch):
-    """metrics_by_symbol 이 당해·전년 재무로 YoY 성장·흑자전환을 파생한다."""
+    """metrics_by_symbol(use_ttm=False) 이 당해·전년 재무로 YoY 성장·흑자전환을 파생한다."""
     monkeypatch.setattr(opendart, "is_enabled", lambda: True)
     monkeypatch.setattr(opendart, "cached_corp_code_map", lambda: {"000000": "00000000"})
 
@@ -130,7 +133,7 @@ def test_metrics_by_symbol_adds_growth_and_turnaround(monkeypatch):
                 "debt_ratio": 0.6, "fcf": -1.0, "roa": None}
 
     monkeypatch.setattr(opendart, "annual_metrics", fake_annual)
-    out = opendart.metrics_by_symbol(["000000"], date(2025, 6, 1))["000000"]
+    out = opendart.metrics_by_symbol(["000000"], date(2025, 6, 1), use_ttm=False)["000000"]
     assert out["op_growth"] == pytest.approx(0.2)  # 120/100 - 1
     assert out["net_growth"] is None  # 전년 순이익 ≤0 → 성장률 정의불가
     assert out["turnaround"] == 1.0   # 적자(-50) → 흑자(100)
