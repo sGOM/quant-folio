@@ -667,6 +667,13 @@ class RebalanceConfig(BaseModel):
         " 절사(미체결, 다음 리밸런싱에서 재평가)한다. None(기본)이면 유동성 무제한(구 동작)."
         " 백테스트 호출자가 거래량 패널(volume_panel)을 공급하지 않으면 설정돼 있어도 미적용.",
     )
+    # 체결 모델 정밀화(§4, opt-in) — 호가단위 라운딩 + 상하한가 체결 불가.
+    price_limit_model: bool = Field(
+        default=False,
+        description="True 면 체결가를 KRX 호가단위로 라운딩하고, 전일종가 대비 ±30%"
+        " 상하한가에 도달한 방향의 주문을 그날 체결 불가(다음 리밸런싱 이월)로 막는다."
+        " False(기본)면 구 동작(슬리피지에 근사 흡수) 유지 — 기존 결과 재현성 보존.",
+    )
     # 벤치마크 상대성과(alpha·beta·IR)용 지수. 위험조정지표 무위험수익률(연).
     benchmark_index: Literal["KOSPI200", "KOSPI", "KOSDAQ"] = Field(
         default="KOSPI200", description="벤치마크 상대성과 산출용 지수"

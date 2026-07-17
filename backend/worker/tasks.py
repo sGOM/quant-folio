@@ -1,12 +1,17 @@
-"""배치 작업 태스크 — 일봉 로컬 적재(C-1)·체결 정합 정기 점검(B-2) 등.
+"""배치 작업 태스크 — 일봉 로컬 적재(C-1)·체결 정합 정기 점검(B-2)·DB 백업(E-2) 등.
 
 Celery 태스크는 동기 함수라, 비동기 DB 세션을 쓰는 적재 로직은 asyncio.run 으로 감싼다.
 """
 from __future__ import annotations
 
 import asyncio
+import gzip
 import logging
+import os
+import subprocess
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urlparse
 
 from worker.celery_app import celery_app
 
@@ -191,3 +196,123 @@ def snapshot_sector_map() -> dict:
     같은 분기에 이미 스냅샷이 있으면 멱등하게 스킵한다(snapshot_sector_map 내부 정책).
     """
     return asyncio.run(_snapshot_sector_map_async())
+
+
+# DB 백업(E-2) — 저장 위치·보존기간. worker 컨테이너에 마운트된 named volume(db_backups)에
+# 쓴다(docker-compose.yml 참고). scripts/backup_db.sh(호스트 crontab용)와 별도 구현이지만
+# 파일명 규칙(quant_YYYYMMDD_HHMMSS.sql.gz)·보존정책은 그대로 맞춘다.
+_BACKUP_DIR = Path("/backups")
+_BACKUP_RETENTION_DAYS = 14
+# 마지막 성공 백업 시각(ISO). TTL 없이 최신값만 유지 — /health 등에서 노출할 수 있게 남겨둔다.
+_BACKUP_LAST_SUCCESS_REDIS_KEY = "backup:last_success_at"
+
+
+def _parse_database_url(url: str) -> dict:
+    """asyncpg 형식 DATABASE_URL(postgresql+asyncpg://user:pw@host:port/db)에서 pg_dump 접속 정보를 뽑는다.
+
+    urlparse 는 scheme 접두사(+asyncpg)와 무관하게 user/password/hostname/port/path 를
+    그대로 파싱하므로 스킴 자체를 손질할 필요가 없다.
+    """
+    parsed = urlparse(url)
+    return {
+        "user": parsed.username or "quant",
+        "password": parsed.password or "",
+        "host": parsed.hostname or "db",
+        "port": str(parsed.port or 5432),
+        "dbname": parsed.path.lstrip("/") or "quant",
+    }
+
+
+def _run_pg_dump_gzip(conn: dict, out_path: Path) -> int:
+    """pg_dump 를 실행해 stdout 을 gzip 압축하며 out_path 에 스트리밍 저장하고, 바이트 크기를 반환한다.
+
+    `pg_dump | gzip` 을 shell=True 없이 재현한다 — 비밀번호는 커맨드라인 인자가 아니라
+    PGPASSWORD 환경변수로만 전달해 프로세스 목록(ps)·로그에 노출되지 않게 한다.
+    """
+    env = {**os.environ, "PGPASSWORD": conn["password"]}
+    cmd = [
+        "pg_dump",
+        "-h", conn["host"],
+        "-p", conn["port"],
+        "-U", conn["user"],
+        "-d", conn["dbname"],
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    assert proc.stdout is not None
+    with open(out_path, "wb") as f, gzip.GzipFile(fileobj=f, mode="wb") as gz:
+        while True:
+            chunk = proc.stdout.read(1024 * 1024)
+            if not chunk:
+                break
+            gz.write(chunk)
+    returncode = proc.wait()
+    if returncode != 0:
+        stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+        raise RuntimeError(f"pg_dump 종료코드 {returncode}: {stderr.strip()}")
+    return out_path.stat().st_size
+
+
+def _prune_old_backups(backup_dir: Path, retention_days: int) -> list[str]:
+    """보존기간(retention_days)을 넘은 백업 파일을 삭제하고 삭제된 파일명 목록을 반환한다."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    removed: list[str] = []
+    for p in backup_dir.glob("quant_*.sql.gz"):
+        mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+        if mtime < cutoff:
+            p.unlink(missing_ok=True)
+            removed.append(p.name)
+    return removed
+
+
+async def _backup_database_async() -> dict:
+    from redis.asyncio import Redis
+
+    from app.core.config import settings
+    from app.services.market import now_kst
+    from engine.alerts import publish_alert
+
+    conn = _parse_database_url(settings.DATABASE_URL)
+    _BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ts = now_kst().strftime("%Y%m%d_%H%M%S")
+    out_path = _BACKUP_DIR / f"quant_{ts}.sql.gz"
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+
+    redis = Redis.from_url(settings.REDIS_URL)
+    try:
+        try:
+            size = _run_pg_dump_gzip(conn, tmp_path)
+            tmp_path.rename(out_path)
+        except Exception as e:  # noqa: BLE001 — 백업 실패는 무인 운영 중 알아야 하는 critical.
+            tmp_path.unlink(missing_ok=True)
+            logger.error("DB 백업 실패: %s", e)
+            # strategy_id 는 이 알림에 의미가 없지만 publish_alert 시그니처가 요구하는 필수값이라
+            # 0(전략 무관 sentinel)을 쓴다. user_id=None 이면 WS 전송은 스킵되고 텔레그램만 나간다.
+            await publish_alert(
+                redis, user_id=None, strategy_id=0, severity="critical",
+                message=f"야간 DB 백업 실패: {e}", code="db_backup_failed",
+            )
+            return {"ok": False, "error": str(e)}
+
+        removed = _prune_old_backups(_BACKUP_DIR, _BACKUP_RETENTION_DAYS)
+        await redis.set(_BACKUP_LAST_SUCCESS_REDIS_KEY, now_kst().isoformat())
+
+    finally:
+        await redis.aclose()
+
+    result = {"ok": True, "path": str(out_path), "size_bytes": size, "removed": removed}
+    logger.info("DB 백업 완료: %s", result)
+    return result
+
+
+@celery_app.task(name="worker.backup_database")
+def backup_database() -> dict:
+    """DB 전체를 pg_dump+gzip 으로 백업한다(E-2, 야간 배치).
+
+    호스트 crontab(scripts/backup_db.sh) 대신 worker 컨테이너 안에서 pg_dump 로 db 서비스에
+    직접 접속해 덤프한다(등록을 잊어도 조용히 안 도는 일이 없게). 성공하면 Redis
+    (backup:last_success_at)에 마지막 성공 시각을 남기고, 실패하면 critical 알림을 발행한다
+    (텔레그램, docs/db-backup.md 참고). 개별 pg_dump 실패는 예외 전파 대신 결과 dict로
+    표현한다 — Celery 재시도보다는 다음날 스케줄에서 재시도되는 편이 안전(중간 상태 tmp 파일
+    정리까지 마친 뒤 반환).
+    """
+    return asyncio.run(_backup_database_async())

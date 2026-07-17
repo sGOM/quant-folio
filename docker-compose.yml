@@ -125,6 +125,9 @@ services:
     command: celery -A worker.celery_app.celery_app worker --loglevel=info -B
     volumes:
       - ./backend:/app
+      # 야간 DB 백업(worker.backup_database, E-2) 산출물 저장 위치. 서버 디스크 손상 시
+      # 이 볼륨도 함께 사라지므로 오프사이트 반출은 별도 필요(docs/db-backup.md 참고).
+      - db_backups:/backups
 
   frontend:
     build: ./frontend
@@ -194,3 +197,4 @@ secrets:
 volumes:
   pgdata:
   caddy_data:
+  db_backups:

@@ -9,15 +9,19 @@
 ────────────────────────────────────────────────────────────────────────
 실측 NAV 재구성 방법(코드 사실)
 ────────────────────────────────────────────────────────────────────────
-- 계좌는 tracking 창 시작 시점에 initial_capital 원의 현금만 보유(사전 포지션 0)한다고
-  가정한다. positions 테이블은 히스토리가 없어 스냅샷만 있으므로, executions 를 시간순으로
-  재생(replay)해 각 거래일 종가(price_ticks)로 시가평가한 NAV 를 만든다.
+- 계좌는 **첫 체결 거래일**에 initial_capital 원의 현금만 보유(사전 포지션 0)한다고
+  가정한다. positions 테이블은 히스토리가 없어 '지금' 스냅샷만 있으므로, 대신 executions
+  를 시간순으로 재생(replay)해 각 거래일 종가(price_ticks)로 시가평가한 NAV 를 만든다.
 - 매수 체결: cash -= filled_qty·filled_price + fee, 보유수량 += filled_qty.
   매도 체결: cash += filled_qty·filled_price − fee, 보유수량 −= filled_qty.
   fee 는 Execution.fee(수수료+세금)를 그대로 반영한다(있을 때만).
 - 거래일 d 의 NAV = cash(d) + Σ 보유수량_i(d)·종가_i(d). 종가는 그날 값이 없으면 직전
   거래일 종가로 이월(ffill/bfill)한다.
-- 곡선은 첫 체결 거래일부터 시작한다(그 이전은 전액 현금이라 비교 가치가 없다).
+- **창(window)과 재생 구간은 다르다(§5)**: 호출자(app.api.routes.tracking)가 date_from 으로
+  조회 범위를 좁혀도, 이 함수는 항상 '진짜 첫 체결'부터 재생해 현금·보유수량을 정확히
+  누적한다. display_from 을 주면 재생은 그대로 처음부터 하되 **반환 곡선만** display_from
+  이후로 잘라낸다 — date_from 이전부터 보유하던 종목이 있어도 NAV 레벨이 어긋나지 않는다
+  (긴 운용 기간의 재기동·기간 필터 조회에서도 괴리 지표가 오염되지 않는다).
 
 ────────────────────────────────────────────────────────────────────────
 비교 지표(부호·정규화 규약)
@@ -31,7 +35,10 @@
 ────────────────────────────────────────────────────────────────────────
 한계(가정)
 ────────────────────────────────────────────────────────────────────────
-- 사전 포지션 0·전액 현금 가정: 창 이전부터 보유하던 종목이 있으면 NAV 레벨이 어긋난다.
+- 사전 포지션 0·전액 현금 가정은 '진짜 첫 체결일' 시점에만 적용된다(§5로 해소). 다만 그
+  전략의 **가장 이른 체결 이전부터** 보유하던 포지션(예: 수동으로 미리 사둔 종목, 다른
+  전략에서 이관된 보유)은 여전히 잡히지 않는다 — executions 로그 자체가 유일한 재생 소스라,
+  로그 밖의 보유는 원천적으로 알 수 없다.
 - 유휴 현금은 NAV 레벨에 그대로 반영된다(initial_capital 이 실제 투입자본보다 크면 곡선이
   둔감해짐). 궤적 비교는 정규화 인덱스로 보정되나 절대 레벨은 initial_capital 에 의존한다.
 - 백테스트 곡선은 익일종가 체결·슬리피지 가정 위에서 산출된 것이라, 체결가·타이밍·유니버스
@@ -100,14 +107,20 @@ def reconstruct_realized_curve(
     close_panel: pd.DataFrame,
     *,
     initial_capital: float,
+    display_from: Any = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """체결 이력으로 일별 실측 자산가치(NAV) 곡선을 재구성한다(순수 함수).
 
-    :param executions: 정규화된 체결 리스트. 각 dict 키:
+    :param executions: 정규화된 체결 리스트(진짜 첫 체결부터 빠짐없이 — display_from 으로
+        걸러내지 말 것, §5). 각 dict 키:
         symbol(str), side('buy'|'sell'), qty(float>0), price(float>0),
         fee(float>=0), date(pd.Timestamp|date, 체결일 KST).
     :param close_panel: 일봉 종가 패널(columns=종목, index=DatetimeIndex). price_ticks 종가.
-    :param initial_capital: 창 시작 시점 현금(원). NAV 절대 레벨의 기준.
+        진짜 첫 체결일부터의 시세를 포함해야 재생이 정확하다.
+    :param initial_capital: 진짜 첫 체결일 시점 현금(원). NAV 절대 레벨의 기준.
+    :param display_from: 지정 시 이 날짜(포함) 이후만 반환 곡선에 담는다(조회 창 필터, §5).
+        재생 자체(현금·보유수량 누적)는 언제나 executions 전체로 하므로, display_from 이전
+        보유가 있어도 NAV 레벨이 어긋나지 않는다. None(기본)이면 첫 체결일부터 전부 반환.
     :return: (realized_curve=[{t,v}], notes) — t 는 날짜 ISO, v 는 원화 NAV.
         notes 는 데이터 한계 경고(예: 종가 누락 종목) 리스트.
     """
@@ -120,6 +133,7 @@ def reconstruct_realized_curve(
     exec_dates = [pd.Timestamp(e["date"]).normalize() for e in execs]
     first_day = exec_dates[0]
     last_day = exec_dates[-1]
+    display_from_ts = pd.Timestamp(display_from).normalize() if display_from is not None else None
 
     # 종가 패널 준비: 날짜 정규화·정렬. 종목별 종가가 아예 없으면 경고.
     panel = close_panel.copy() if not close_panel.empty else pd.DataFrame()
@@ -179,7 +193,8 @@ def reconstruct_realized_curve(
             if pd.notna(px):
                 holdings += q * float(px)
 
-        curve.append({"t": d.date().isoformat(), "v": cash + holdings})
+        if display_from_ts is None or d >= display_from_ts:
+            curve.append({"t": d.date().isoformat(), "v": cash + holdings})
 
     return curve, notes
 

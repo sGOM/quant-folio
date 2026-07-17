@@ -7,8 +7,9 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 빌드 의존성 (asyncpg, cryptography, vectorbt 등)
+# postgresql-client: worker 의 야간 DB 백업(E-2)이 pg_dump 로 db 서비스에 직접 접속한다.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl \
+    build-essential curl postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
