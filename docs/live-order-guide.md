@@ -94,7 +94,37 @@ docker compose run --rm web python scripts/paper_rebalance.py --strategy 23 --ex
   - `COOKIE_SECURE=true` 아니면 **부팅 거부**(토큰 탈취 방지).
 - [ ] 전략 config 의 `capital`·`drift_band_pct`·리스크 한도(`RiskLimit`)를 실계좌 규모에 맞게 재확인.
 - [ ] 모의(vts)에서 동일 전략을 충분히 검증 완료.
+- [ ] **실전 전환 게이트(`app/services/live_gate.py`) 승인** — 아래 2-1-0 절 참고.
 - [ ] **실시간 체결통보(`engine/fill_notice.py`) 전환 체크리스트** — 아래 2-1-A 절 참고.
+
+### 2-1-0. 실전 전환 게이트(`live_gate.py`) — 승인 플래그·운영 절차
+
+부팅 검증(`_ensure_prod_approval`, `app/core/config.py`)과는 별개로, **주문·전략 기동 시점**마다
+`evaluate_live_gate(db, user_id, strategy_id, order_notional=...)`가 다음 3조건을 순차 평가해
+하나라도 실패하면 주문/기동을 거부한다(`engine/base_runner.py`의 `_place` 직전, `engine/main.py`의
+`_start_strategy` 진입점에 배선됨). **vts(모의투자)에서는 체크는 수행하되 로깅만 하고 항상 통과**시켜
+실거래 이전에 게이트 동작을 미리 관찰할 수 있다.
+
+1. **체결 정합 실측 등급** — 최근 90일 리밸런스 표본의 M1(실행 슬리피지)/M3(총 정합 괴리)
+   등급이 RED면 차단. 표본이 `DEFAULT_MIN_SAMPLE`(기본 30) 미만이면 "판단 불가"로 **보수적으로 차단**
+   (표본이 쌓일 때까지는 실전 전환 자체가 불가능하다는 뜻 — §4 캘리브레이션 카드로 표본·등급을 모니터링할 것).
+2. **주문 금액 상한** — 1회 주문은 `RiskLimit.max_position_size`(전략별 우선, 없으면 사용자 공통),
+   일일 누적은 `KIS_DAILY_ORDER_NOTIONAL_CAP`(`.env`, 원 단위, None/0이면 미적용) 대비 당일 체결 합계.
+3. **prod 2단계 승인** — `KIS_PROD_APPROVED`(기본 `False`)가 꺼져 있으면 실전 주문 자체를 거부.
+   부팅 시에도 `KIS_ENV=prod`인데 이 플래그가 꺼져 있으면 프로세스가 아예 기동을 거부한다
+   (`_ensure_prod_approval`) — 게이트와 부팅 검증 이중 방어.
+
+**운영 절차:**
+- [ ] 모의(vts)에서 전략을 충분히 돌려 정합 실측 표본을 `DEFAULT_MIN_SAMPLE` 이상 확보한다
+  (§4 monitor 페이지 정합 리포트 카드에서 표본 수·등급 확인).
+- [ ] M1/M3 등급이 RED가 아님을 확인한다. RED면 §4 캘리브레이션 제안을 검토·적용하거나
+  전략 로직을 재점검한 뒤 재측정한다.
+- [ ] `KIS_DAILY_ORDER_NOTIONAL_CAP`을 실계좌 규모에 맞게 `.env`에 설정한다(미설정 시 무제한이므로
+  반드시 값을 넣을 것).
+- [ ] 위 조건을 모두 확인한 뒤에만 `KIS_PROD_APPROVED=true`를 `.env`에 설정하고 재기동한다
+  (§2-2 실전 전환 절차의 일부로 함께 적용).
+- [ ] 전환 후에도 게이트는 매 주문·기동마다 계속 평가된다 — 정합 등급이 나중에 RED로 떨어지면
+  `KIS_PROD_APPROVED`가 켜져 있어도 신규 주문이 자동으로 차단된다(운영 중 안전망).
 
 ### 2-1-A. 실시간 체결통보(fill_notice) 실계정 전환 체크리스트
 
@@ -228,6 +258,50 @@ curl http://localhost:8000/api/engine/status    # {"engine_alive": true}
 변경이라 별도 논의·구현 작업으로 남겨둔다(현재는 위 "실시탭 stop→점검→start" 수동
 절차로 동일한 효과를 낼 수 있으니, 쿨다운을 기다리지 않고 점검하고 싶다면 이 절차를
 쓸 것).
+
+---
+
+## 3-2. 다중 전략 병행 운용 전 — 마이그레이션 0008 백필 감사
+
+`0008_multi_strategy_positions`(Position/Execution에 `strategy_id` 추가)는 기존 데이터를
+`orders` 이력으로 역산해 백필했다. 같은 (user, symbol)에 **복수 전략의 주문 이력이 섞여
+있어 소유 전략을 유일하게 특정할 수 없는 경우 보수적으로 `strategy_id=NULL`**(비귀속)로
+남겼다. id=23+24처럼 종목이 겹칠 수 있는 전략을 **병행 운용하기 전** 이 목록을 반드시 감사한다.
+
+### 감사 절차
+
+```bash
+# 1) NULL로 남은 포지션 확인 (미청산만 — qty=0인 과거 청산분은 무관)
+docker compose exec db psql -U quantfolio -d quantfolio -c "
+  SELECT user_id, symbol, qty, avg_price
+  FROM positions
+  WHERE strategy_id IS NULL AND qty > 0
+  ORDER BY user_id, symbol;"
+
+# 2) 해당 (user, symbol)의 주문 이력에서 실제로 몇 개 전략이 관여했는지 확인
+docker compose exec db psql -U quantfolio -d quantfolio -c "
+  SELECT user_id, symbol, strategy_id, side, count(*), min(created_at), max(created_at)
+  FROM orders
+  WHERE (user_id, symbol) IN (
+    SELECT user_id, symbol FROM positions WHERE strategy_id IS NULL AND qty > 0
+  )
+  GROUP BY user_id, symbol, strategy_id, side
+  ORDER BY user_id, symbol, strategy_id;"
+```
+
+### 판단 가이드
+- **주문 이력의 모든 행이 사실상 전략 하나에서만 나왔다면** — 사람이 확인 후 수동으로
+  `UPDATE positions SET strategy_id = <id> WHERE ...`로 귀속시킬 수 있다. 이 경우
+  `uq_positions_user_strategy_symbol` 제약과 충돌하지 않는지(같은 전략의 다른 행 존재 여부)
+  먼저 확인할 것.
+- **정말로 여러 전략이 같은 종목을 거래한 이력이 섞여 있다면** — 귀속 전략을 확정할 수
+  없으므로 NULL로 유지하고, 실제로는 계좌 뷰(`GET /api/trading/positions` 등)에서만 보이는
+  "수동/레거시" 포지션으로 취급한다. 이 포지션은 §1 전략 삭제 가드나 §3 전략별 리스크
+  집계에서 자동으로 제외된다(전략 스코프 계산에 포함되지 않음, 계좌 스코프에는 계속 포함).
+- id=23+24 등 종목이 겹칠 수 있는 조합을 병행 운용하기 시작한 **이후**에는 신규 주문이
+  항상 `strategy_id`를 명시적으로 채우므로(§2 이전 스프린트에서 확인, `executor.py`의
+  `execute_signal`이 `strategy_id: int`를 필수로 받음) 이 문제가 재발하지 않는다 — 감사는
+  **과거 이력에 한해 1회성**으로 충분하다.
 
 ---
 
