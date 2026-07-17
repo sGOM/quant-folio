@@ -147,6 +147,44 @@ describe("api client", () => {
     );
   });
 
+  it("getStrategyTracking: 옵션 없으면 쿼리스트링 없이 호출한다", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ strategy_id: 23 }));
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await api.getStrategyTracking(23);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/strategies/23/tracking`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
+  it("getStrategyTracking: dateFrom/dateTo/backtestId 를 쿼리스트링으로 구성한다", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ strategy_id: 23 }));
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await api.getStrategyTracking(23, {
+      dateFrom: "2026-01-01",
+      dateTo: "2026-06-01",
+      backtestId: 5,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/strategies/23/tracking?date_from=2026-01-01&date_to=2026-06-01&backtest_id=5`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
+  it("getStrategyTracking: 체결 없음(404)이면 ApiError 를 던진다", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ detail: "해당 기간 실측 체결이 없습니다." }, 404));
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(api.getStrategyTracking(23)).rejects.toMatchObject({
+      name: "ApiError",
+      status: 404,
+    });
+  });
+
   it("204 응답은 undefined 를 반환한다(deleteStrategy)", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
     global.fetch = fetchMock as unknown as typeof fetch;
