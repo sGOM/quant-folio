@@ -66,9 +66,35 @@ gunzip -c backups/quant_20260716_030000.sql.gz | docker compose exec -T db psql 
 나올 수 있다 — Timescale 확장 자체의 메타데이터 구조 때문이며, 이 프로젝트가 실제로 쓰는
 테이블(`price_ticks` 등 하이퍼테이블 데이터 포함)의 백업·복구에는 영향이 없다.
 
-## 오프사이트 보관 권장
+## 오프사이트 복제 (S3 호환 스토리지, 기본 비활성)
 
 named volume `db_backups`(야간 자동 백업) · `BACKUP_DIR`(수동 스크립트) 모두 서버 디스크
-위에 있다 — 서버 디스크 자체가 손상되면 로컬 백업만으로는 복구할 수 없다. `docker volume
-inspect quantfolio_db_backups` 로 실제 경로를 찾아 `rclone`/`rsync` 등으로 주기적으로
-NAS·클라우드 스토리지에 원격 복사하는 것을 권장한다.
+위에 있다 — 서버 디스크 자체가 손상되면 로컬 백업만으로는 복구할 수 없다. `worker.backup_database`
+태스크(`backend/worker/tasks.py::_upload_backup_to_s3`)가 pg_dump 성공 직후 S3 호환
+스토리지(AWS S3·Cloudflare R2·Backblaze B2·MinIO 등)에 자동 업로드하는 경로를 opt-in으로
+제공한다.
+
+설정(`secrets/s3_backup_access_key_id.txt`·`secrets/s3_backup_secret_access_key.txt` 둘 다
+비어 있지 않아야 활성화):
+
+```bash
+# 액세스 키 발급 후 시크릿 파일에 기록
+echo "<ACCESS_KEY_ID>" > secrets/s3_backup_access_key_id.txt
+echo "<SECRET_ACCESS_KEY>" > secrets/s3_backup_secret_access_key.txt
+```
+
+버킷·엔드포인트는 `.env`(평문, 비밀 아님)로 설정한다:
+
+```bash
+S3_BACKUP_BUCKET=my-quantfolio-backups
+# AWS S3 는 비워둔다. R2/B2/MinIO 등은 해당 서비스의 S3 호환 엔드포인트를 넣는다.
+S3_BACKUP_ENDPOINT_URL=https://<account-id>.r2.cloudflarestorage.com
+S3_BACKUP_REGION=auto
+S3_BACKUP_PREFIX=quantfolio-db-backups/
+```
+
+`docker compose up -d --build worker` 로 재기동하면 그날 새벽 백업부터 로컬 저장 직후
+같은 파일을 위 버킷에 업로드한다. 업로드 실패는 로컬 백업 성공을 무효화하지 않는다 —
+warning 알림(`db_backup_s3_upload_failed`)만 발행하고 태스크는 정상 종료한다(다음날
+재시도). 버킷·자격증명 중 하나라도 비어 있으면 업로드 자체를 건너뛴다(기존 로컬 전용
+동작에 영향 없음).
