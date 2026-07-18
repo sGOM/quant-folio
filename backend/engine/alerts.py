@@ -49,32 +49,60 @@ async def publish_alert(
     severity: str,
     message: str,
     code: str | None = None,
+    dedup_window_hours: float | None = None,
 ) -> None:
     """엔진 이상 알림을 사용자별 이벤트 채널로 발행한다.
 
     :param severity: "warning" | "critical".
     :param message: 사람이 읽을 한국어 문장(프론트 토스트/배너에 그대로 노출 가능).
     :param code: 알림 종류 식별자(프론트 dedup·필터용, 예 "runner_failures").
+    :param dedup_window_hours: 지정 시(§21), 같은 (user_id, strategy_id, code)의
+        미확인(is_read=False) 알림이 이 시간(시간 단위) 안에 이미 있으면 DB 적재·
+        텔레그램 재발송을 건너뛴다. `db_backup_stale`처럼 원인이 해소될 때까지 매
+        beat 주기마다 재발행되는 상태형 배치 경보의 테이블 증식·알림 피로를 막기
+        위함 — WS 토스트는 dedup 여부와 무관하게 항상 통과시켜 실시간성은 유지한다.
+        None(기본)이면 기존 동작(매번 적재+발송)과 동일.
     """
     logger.warning(
         "엔진 알림[%s] 전략 %s%s: %s",
         severity, strategy_id, f"({code})" if code else "", message,
     )
+    is_dup = False
     try:
         async with AsyncSessionLocal() as db:
-            db.add(
-                Alert(
-                    user_id=user_id,
-                    strategy_id=strategy_id,
-                    severity=severity,
-                    code=code,
-                    message=message,
+            if dedup_window_hours is not None and code is not None:
+                from datetime import timedelta
+
+                from sqlalchemy import select
+
+                cutoff = now_kst() - timedelta(hours=dedup_window_hours)
+                existing = await db.execute(
+                    select(Alert.id).where(
+                        Alert.user_id == user_id,
+                        Alert.strategy_id == strategy_id,
+                        Alert.code == code,
+                        Alert.is_read.is_(False),
+                        Alert.created_at >= cutoff,
+                    ).limit(1)
                 )
-            )
-            await db.commit()
+                is_dup = existing.scalar_one_or_none() is not None
+            if not is_dup:
+                db.add(
+                    Alert(
+                        user_id=user_id,
+                        strategy_id=strategy_id,
+                        severity=severity,
+                        code=code,
+                        message=message,
+                    )
+                )
+                await db.commit()
     except Exception:  # noqa: BLE001 — 영속화 실패가 WS·텔레그램 알림을 막으면 안 된다.
         logger.warning("알림 DB 영속화 실패", exc_info=True)
-    if severity == "critical" and settings.has_telegram:
+    if is_dup:
+        # 창 안에 미확인 알림이 이미 있음 — DB 재적재·텔레그램 재발송 생략(WS는 계속 발송).
+        logger.info("알림[%s] dedup 창 내 미확인 알림 존재 — DB/텔레그램 생략", code)
+    elif severity == "critical" and settings.has_telegram:
         # 심각도 필터: critical 만 외부 발송해 소음을 막는다. WS 채널 유무(user_id)와
         # 무관하게 발송 — 앱 미접속 상황을 위한 채널이므로 여기서 걸러지면 의미가 없다.
         await _send_telegram(

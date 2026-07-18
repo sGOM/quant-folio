@@ -371,10 +371,15 @@ class RebalanceSelection(BaseModel):
     #   none(기본): 중립화 없음(기존 동작).
     #   size: 시가총액(로그) 축에 대해 각 팩터를 중립화 → 팩터가 대형/소형주 베팅으로
     #         변질되는 것을 막는다(순수 팩터 노출). 시가총액(PIT)이 필요하다.
-    # 섹터 중립화는 신뢰할 종목→섹터 매핑 소스 확보 시 추가한다(현재 미지원).
-    neutralize: Literal["none", "size"] = Field(
+    #   sector: 업종(KRX MDC, PIT 스냅샷) 그룹 평균을 제거 → 팩터가 특정 업종 베팅
+    #           (예: 저변동=유틸리티/통신 쏠림)으로 변질되는 것을 막는다.
+    #   size_sector: 사이즈 잔차화 후 그 위에 섹터 demean 을 순차 적용(둘 다 제거).
+    neutralize: Literal["none", "size", "sector", "size_sector"] = Field(
         default="none",
-        description="팩터 중립화 축(method=score). size=시가총액 중립화(순수 팩터 노출).",
+        description=(
+            "팩터 중립화 축(method=score). size=시가총액 중립화, sector=업종 중립화, "
+            "size_sector=둘 다(순수 팩터 노출)."
+        ),
     )
     universe_rule: UniverseRule | None = Field(
         default=None,

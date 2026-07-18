@@ -153,27 +153,50 @@ def _fundamentals_provider(as_of_date, codes, use_ttm: bool = False):
     return fdf.join(qdf, how="left")
 
 
-def _fundamentals_provider_with_market_cap(as_of_date, codes, use_ttm: bool = False):
-    """_fundamentals_provider 결과에 as_of 시점 시가총액(원) 컬럼을 덧붙인다(사이즈 중립화용).
+def _fundamentals_provider_with_neutralize_cols(
+    as_of_date, codes, use_ttm: bool = False, neutralize: str = "size",
+):
+    """_fundamentals_provider 결과에 중립화 축 컬럼(시가총액/업종)을 덧붙인다.
 
-    krx_index.market_caps(PIT)를 재사용한다. 미인증/실패로 시총이 비면 컬럼을 붙이지
-    않으므로 스코어러가 중립화를 자연히 생략한다(순수 팩터 그대로).
+    :param neutralize: "size"(시가총액만) / "sector"(업종명만) / "size_sector"(둘 다).
+        krx_index.market_caps·sector_map(둘 다 PIT)를 재사용한다. 미인증/실패로 해당
+        축이 비면 그 컬럼만 붙이지 않으므로 스코어러가 그 축의 중립화를 자연히
+        생략한다(순수 팩터 그대로, §20).
     """
     from app.services.data import krx_index
 
     fdf = _fundamentals_provider(as_of_date, codes, use_ttm=use_ttm)
     norm_codes = [str(c).zfill(6) for c in codes]
-    try:
-        caps = krx_index.market_caps(as_of_date)
-    except Exception:  # noqa: BLE001
-        caps = {}
-    if not caps:
+    cols: dict[str, pd.Series] = {}
+
+    if neutralize in ("size", "size_sector"):
+        try:
+            caps = krx_index.market_caps(as_of_date)
+        except Exception:  # noqa: BLE001
+            caps = {}
+        if caps:
+            cols["market_cap"] = pd.Series(
+                {c: caps.get(c) for c in norm_codes}, dtype="float64"
+            )
+
+    if neutralize in ("sector", "size_sector"):
+        try:
+            smap = krx_index.sector_map(as_of_date)
+        except Exception:  # noqa: BLE001
+            smap = {}
+        if smap:
+            cols["sector"] = pd.Series(
+                {c: smap.get(c) for c in norm_codes}, dtype="object"
+            )
+
+    if not cols:
         return fdf
-    cap_series = pd.Series({c: caps.get(c) for c in norm_codes}, dtype="float64")
+    extra = pd.DataFrame(cols)
     if fdf is None:
-        return cap_series.to_frame("market_cap")
+        return extra
     fdf = fdf.copy()
-    fdf["market_cap"] = cap_series.reindex(fdf.index)
+    for col, s in cols.items():
+        fdf[col] = s.reindex(fdf.index)
     return fdf
 
 
@@ -274,10 +297,14 @@ async def _run_rebalance_backtest(
     method = config.get("selection", {}).get("method", "momentum")
     use_ttm = config.get("financial_period", "annual") == "ttm"
     provider = partial(_fundamentals_provider, use_ttm=use_ttm) if method == "score" else None
-    # 사이즈 중립화(P1-3): 시가총액(PIT)을 펀더멘털 프레임에 실어 스코어러가 각 팩터를
-    # 로그 시총 축에 직교화하게 한다. 중립화가 꺼진 전략에는 추가 조회를 하지 않는다.
-    if provider is not None and config.get("selection", {}).get("neutralize") == "size":
-        provider = partial(_fundamentals_provider_with_market_cap, use_ttm=use_ttm)
+    # 중립화(P1-3 사이즈, §20 섹터): 시가총액·업종(PIT)을 펀더멘털 프레임에 실어
+    # 스코어러가 각 팩터를 해당 축에 직교화하게 한다. 중립화가 꺼진 전략(neutralize=
+    # "none")에는 추가 조회를 하지 않는다.
+    _neutralize = config.get("selection", {}).get("neutralize", "none")
+    if provider is not None and _neutralize in ("size", "sector", "size_sector"):
+        provider = partial(
+            _fundamentals_provider_with_neutralize_cols, use_ttm=use_ttm, neutralize=_neutralize,
+        )
 
     # 현금화 오버레이(레짐 필터): 켜져 있으면 기준지수 종가 시리즈를 적재해 주입한다.
     regime_series = None
@@ -339,7 +366,32 @@ async def _run_rebalance_backtest(
     warnings = await run_in_threadpool(_factor_coverage_warnings, config, universe, req.period_end)
     if warnings:
         result["factor_warnings"] = warnings
+
+    # 유니버스 지문(§22, DSR 동질 시행 집합 정밀화): 실행 시점의 실제 유니버스(PIT
+    # 해소 결과 포함)+universe_rule 파라미터를 해시로 남긴다. 전략 config 는 수정
+    # 가능한 가변 객체라 백테스트 시점의 유니버스를 사후에 복원할 수 없으므로,
+    # 실행 시점에 저장해두지 않으면 영영 알 수 없다.
+    result["universe_fingerprint"] = _universe_fingerprint(
+        universe, config.get("selection", {}).get("universe_rule")
+    )
     return result
+
+
+def _universe_fingerprint(universe: list[str], universe_rule: dict | None) -> str:
+    """실행 시점 유니버스(정렬된 종목코드 리스트)+universe_rule 파라미터의 해시(§22).
+
+    DSR 동질 시행 집합 필터에서 "같은 유니버스로 실행된 백테스트인지"를 판별하는 데
+    쓴다. 종목 구성(동적 유니버스는 PIT 해소 결과가 실행마다 달라질 수 있음)과 규칙
+    파라미터 둘 다 동일해야 같은 지문이 나오도록 둘 다 포함한다.
+    """
+    import hashlib
+    import json
+
+    payload = json.dumps(
+        {"universe": sorted(universe), "universe_rule": universe_rule or {}},
+        sort_keys=True, default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _factor_coverage_warnings(config: dict, universe: list[str], as_of) -> list[str]:
@@ -471,8 +523,11 @@ async def get_backtest_dsr(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "백테스트 결과 데이터가 없습니다."
         )
 
-    # 동질 집합: 같은 전략 + 같은 기간(period_start/period_end)의 모든 백테스트 이력.
-    # (result 에 유니버스 식별 정보가 없어 기간 동일성으로만 필터한다 — 방법론 한계.)
+    # 동질 집합: 같은 전략 + 같은 기간(period_start/period_end)의 모든 백테스트 이력을
+    # 1차 후보로 잡고, 대상에 유니버스 지문(§22)이 있으면 지문까지 일치하는 행으로
+    # 더 좁힌다 — 서로 다른 유니버스/설정의 백테스트가 섞여 N 과대·V 왜곡되는 것을
+    # 막는다. 지문이 없는 과거 행(§22 도입 이전 실행)은 대상 자체에 지문이 없을 때만
+    # 기간 필터로 폴백한다(하위호환 — 신규 백테스트가 쌓일수록 집합 순도가 개선된다).
     rows = await db.scalars(
         select(Backtest).where(
             Backtest.strategy_id == bt.strategy_id,
@@ -480,7 +535,12 @@ async def get_backtest_dsr(
             Backtest.period_end == bt.period_end,
         )
     )
-    homogeneous = [r.result for r in rows if r.result]
+    candidates = [r.result for r in rows if r.result]
+    target_fp = (bt.result or {}).get("universe_fingerprint")
+    if target_fp:
+        homogeneous = [r for r in candidates if r.get("universe_fingerprint") == target_fp]
+    else:
+        homogeneous = candidates
 
     analysis = await run_in_threadpool(analyze_backtest_dsr, bt.result, homogeneous)
     return {

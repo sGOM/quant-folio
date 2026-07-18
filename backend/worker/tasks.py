@@ -66,6 +66,7 @@ async def _ingest_daily_ohlcv_async() -> dict:
                     f"{', '.join(failed[:10])}{' 외' if len(failed) > 10 else ''}"
                 ),
                 code="ohlcv_ingest_failure_rate",
+                dedup_window_hours=20.0,  # §21: 원인 해소 전까지 매일 배치마다 반복 발행 억제
             )
         finally:
             await redis.aclose()
@@ -426,6 +427,9 @@ async def _check_backup_freshness_async() -> dict:
             await publish_alert(
                 redis, user_id=None, strategy_id=0, severity="critical",
                 message=f"DB 백업이 최신이 아닙니다: {reason}", code="db_backup_stale",
+                dedup_window_hours=20.0,  # §21: 이 태스크는 매일 09:00 1회 실행 — 해소 전까지
+                # 하루 한 번씩만 재적재·재발송(20h로 다음 실행까지 겹치지 않으면서 재부팅
+                # 등으로 스케줄이 살짝 밀려도 중복 발행되지 않게 24h보다 약간 짧게 잡음).
             )
         return {"ok": not stale, "last_success_at": raw, "age_hours": age_hours}
     finally:
@@ -440,3 +444,46 @@ def check_backup_freshness() -> dict:
     beat 스케줄러 중단 등 backup_database 가 아예 실행되지 못하는 경우)다.
     """
     return asyncio.run(_check_backup_freshness_async())
+
+
+# alerts 테이블 보존정책(§21) — §17로 모든 publish_alert 가 영속화되기 시작했는데 정리
+# 경로가 없어 무한 증식했다. backup_database 의 _BACKUP_RETENTION_DAYS(14일) 정리
+# 패턴을 그대로 따르되, 알림은 확인(읽음) 여부에 따라 보존기간을 이원화한다 — 읽지
+# 않은 알림은 사용자가 아직 못 본 것일 수 있어 더 길게 보존한다.
+_ALERT_RETENTION_READ_DAYS = 90
+_ALERT_RETENTION_UNREAD_DAYS = 180
+
+
+async def _cleanup_old_alerts_async() -> dict:
+    from sqlalchemy import delete
+
+    from app.core.database import AsyncSessionLocal
+    from app.models import Alert
+
+    now = datetime.now(timezone.utc)
+    read_cutoff = now - timedelta(days=_ALERT_RETENTION_READ_DAYS)
+    unread_cutoff = now - timedelta(days=_ALERT_RETENTION_UNREAD_DAYS)
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            delete(Alert).where(
+                (Alert.is_read.is_(True) & (Alert.created_at < read_cutoff))
+                | (Alert.is_read.is_(False) & (Alert.created_at < unread_cutoff))
+            )
+        )
+        await db.commit()
+        deleted = result.rowcount
+
+    logger.info("alerts 보존정책 정리 완료: %d건 삭제", deleted)
+    return {"deleted": deleted}
+
+
+@celery_app.task(name="worker.cleanup_old_alerts")
+def cleanup_old_alerts() -> dict:
+    """오래된 alerts 를 보존정책(§21)에 따라 삭제한다.
+
+    확인(읽음) 처리된 알림은 90일, 미확인 알림은 180일을 넘기면 삭제한다 — 사용자가
+    아직 못 봤을 수 있는 미확인 알림을 더 오래 보존한다. §17 도입 이후 정리 경로가
+    없어 테이블이 무한 증식하던 것을 해소한다.
+    """
+    return asyncio.run(_cleanup_old_alerts_async())

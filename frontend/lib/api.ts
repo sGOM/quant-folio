@@ -321,10 +321,11 @@ export interface RebalanceSelection {
   /** method="score": 종합점수 카테고리 가중치(합=1.0). */
   factor_weights?: FactorWeights;
   /**
-   * method="score": 팩터 중립화 축(P1-3). "none"(기본) / "size"(시가총액 중립화 →
-   * 각 팩터를 로그 시총 축에 직교화해 대형/소형주 베팅으로 변질되는 것을 막음).
+   * method="score": 팩터 중립화 축(P1-3 사이즈, §20 섹터). "none"(기본) / "size"(시가총액
+   * 중립화 → 각 팩터를 로그 시총 축에 직교화해 대형/소형주 베팅으로 변질되는 것을 막음) /
+   * "sector"(업종 중립화 → 업종 쏠림을 막음) / "size_sector"(둘 다).
    */
-  neutralize?: "none" | "size";
+  neutralize?: "none" | "size" | "sector" | "size_sector";
   /** method="custom": 편입(매수) 논리식. 각 종목에 독립 적용. */
   entry?: ConditionGroup;
   /** method="custom": 청산(매도) 논리식. 각 종목에 독립 적용. */
@@ -929,9 +930,13 @@ export interface AlertListOut {
   unread_count: number;
 }
 
-/** 본인 + 전역(user_id=NULL) 알림 목록(최신순). */
-export function listAlerts(unreadOnly = false, limit = 50): Promise<AlertListOut> {
-  const params = new URLSearchParams({ unread_only: String(unreadOnly), limit: String(limit) });
+/** 본인 + 전역(user_id=NULL) 알림 목록(최신순). offset으로 이전 이력을 더 조회한다(§21). */
+export function listAlerts(
+  unreadOnly = false, limit = 50, offset = 0,
+): Promise<AlertListOut> {
+  const params = new URLSearchParams({
+    unread_only: String(unreadOnly), limit: String(limit), offset: String(offset),
+  });
   return request<AlertListOut>(`/api/alerts?${params.toString()}`);
 }
 
