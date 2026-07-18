@@ -14,6 +14,7 @@ import {
   Globe,
   HelpCircle,
   HeartPulse,
+  Star,
 } from "lucide-react";
 import {
   api,
@@ -145,6 +146,8 @@ function MonitorContent() {
   const [fillQualityStrategyId, setFillQualityStrategyId] = useState<number | undefined>(
     undefined,
   );
+  // 전략 ON/OFF 목록을 즐겨찾기 전략만으로 좁혀 보는 토글.
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
 
   // 인증 쿼리는 useCurrentUser 로 통일(retry:false 등 옵션이 화면마다 갈리지 않게).
   const me = useCurrentUser();
@@ -304,16 +307,43 @@ function MonitorContent() {
         />
 
         <section className="mt-8">
-          <h2 className="mb-2 text-sm font-medium text-muted-foreground">
-            전략 ON/OFF
-          </h2>
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-sm font-medium text-muted-foreground">
+              전략 ON/OFF
+            </h2>
+            <button
+              type="button"
+              onClick={() => setFavoritesOnly((v) => !v)}
+              aria-pressed={favoritesOnly}
+              className={cn(
+                "flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                favoritesOnly
+                  ? "border-amber-400/40 bg-amber-400/10 text-amber-500"
+                  : "border-border text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+            >
+              <Star
+                className={cn("h-3.5 w-3.5", favoritesOnly && "fill-amber-400 text-amber-400")}
+              />
+              즐겨찾기만
+            </button>
+          </div>
           <div className="space-y-2">
-            {strategies.data?.map((s) => (
-              <StrategyToggle key={s.id} strategy={s} />
-            ))}
+            {(favoritesOnly
+              ? strategies.data?.filter((s) => s.is_favorite)
+              : strategies.data
+            )?.map((s) => <StrategyToggle key={s.id} strategy={s} />)}
             {strategies.data?.length === 0 && (
               <p className="text-sm text-muted-foreground">전략이 없습니다.</p>
             )}
+            {favoritesOnly &&
+              strategies.data &&
+              strategies.data.length > 0 &&
+              !strategies.data.some((s) => s.is_favorite) && (
+                <p className="text-sm text-muted-foreground">
+                  즐겨찾기한 전략이 없습니다. 전략 메뉴에서 별표를 눌러 추가하세요.
+                </p>
+              )}
           </div>
         </section>
 
