@@ -53,13 +53,14 @@ def _visible_filter(current: User):
 async def list_alerts(
     unread_only: Annotated[bool, Query()] = False,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
     current: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> AlertListOut:
     stmt = select(Alert).where(_visible_filter(current))
     if unread_only:
         stmt = stmt.where(Alert.is_read.is_(False))
-    stmt = stmt.order_by(Alert.created_at.desc()).limit(limit)
+    stmt = stmt.order_by(Alert.created_at.desc()).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
 
     unread_stmt = select(func.count()).select_from(Alert).where(

@@ -346,13 +346,15 @@ export function RebalanceFields({
               value={config.selection.neutralize ?? "none"}
               onChange={(e) =>
                 patchSelection({
-                  neutralize: e.target.value as "none" | "size",
+                  neutralize: e.target.value as "none" | "size" | "sector" | "size_sector",
                 })
               }
               className={INPUT}
             >
               <option value="none">없음</option>
               <option value="size">시가총액 중립화</option>
+              <option value="sector">업종 중립화</option>
+              <option value="size_sector">시가총액 + 업종 중립화</option>
             </select>
           </Field>
           <p className="text-[11px] leading-relaxed text-muted-foreground">

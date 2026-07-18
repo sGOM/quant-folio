@@ -243,3 +243,55 @@ def test_compute_scores_size_neutralize_reduces_size_tilt():
     c_plain = abs(np.corrcoef(plain["score_momentum"], logz)[0, 1])
     c_neut = abs(np.corrcoef(neut["score_momentum"], logz)[0, 1])
     assert c_plain > 0.5 and c_neut < 0.01
+
+
+# ───────────────────── 섹터 중립화(§20) ─────────────────────
+
+
+def test_neutralize_sector_removes_group_mean_exposure():
+    """_neutralize_sector 는 섹터별 평균을 제거해 그룹 간 점수 차이를 없앤다."""
+    codes = [f"{i:06d}" for i in range(12)]
+    sectors = (["금융"] * 6) + (["철강"] * 6)
+    # 금융 섹터가 철강보다 체계적으로 높은 점수를 받도록 구성(섹터 베팅 시뮬레이션).
+    scores = [1.0, 1.2, 0.8, 1.1, 0.9, 1.3] + [-1.0, -0.8, -1.2, -0.9, -1.1, -0.7]
+    df = pd.DataFrame({"score_lowvol": scores, "sector": sectors}, index=codes)
+    metrics._neutralize_sector(df, ["score_lowvol"])
+    means = df.groupby("sector")["score_lowvol"].mean()
+    assert abs(means["금융"]) < 1e-9 and abs(means["철강"]) < 1e-9
+
+
+def test_neutralize_sector_preserves_factor_nan():
+    """팩터 NaN(랭킹 제외) 행을 보존한다."""
+    codes = [f"{i:06d}" for i in range(6)]
+    df = pd.DataFrame(
+        {
+            "score_value": [1.0, -0.5, np.nan, 0.3, 0.8, np.nan],
+            "sector": ["금융", "금융", "금융", "철강", "철강", "철강"],
+        },
+        index=codes,
+    )
+    nan_mask = df["score_value"].isna()
+    metrics._neutralize_sector(df, ["score_value"])
+    assert df["score_value"].isna().equals(nan_mask)
+
+
+def test_neutralize_sector_noop_without_sector_column():
+    """sector 컬럼이 없으면 원본을 그대로 둔다(중립화 생략)."""
+    df = pd.DataFrame({"score_momentum": [1.0, 2.0, 3.0]}, index=["A", "B", "C"])
+    orig = df["score_momentum"].tolist()
+    metrics._neutralize_sector(df, ["score_momentum"])
+    assert df["score_momentum"].tolist() == orig
+
+
+def test_neutralize_sector_preserves_singleton_group():
+    """표본 1개뿐인 섹터는 demean 하면 정보가 소거되므로 원값을 보존한다."""
+    codes = [f"{i:06d}" for i in range(5)]
+    df = pd.DataFrame(
+        {
+            "score_value": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "sector": ["금융", "금융", "금융", "금융", "단독섹터"],
+        },
+        index=codes,
+    )
+    metrics._neutralize_sector(df, ["score_value"])
+    assert df.loc["000004", "score_value"] == 5.0

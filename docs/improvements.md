@@ -288,6 +288,69 @@ worker의 `check_backup_freshness`(§9)와 동일 임계인 26시간을 초과�
 
 ---
 
+## 신규 발굴 (2026-07-18 4차 재점검, §20~§22)
+
+발굴 근거: §17~§19 완료(PR #74) 직후 재점검. 각 모듈이 스스로 문서화한 한계 중
+**전제조건이 그 사이 해소돼 코드로 풀 수 있게 된 것**(§20), 직전 배치가 새로 만든
+경로의 운영 후속 부재(§21), 방법론 docstring이 명시한 잔존 한계(§22)를 훑었다.
+
+## 20. 팩터 섹터 중립화 (`neutralize="sector"`) — 전제조건 해소로 승격 ✅
+
+`app/schemas/strategy.py::SelectionRule.neutralize`에 `"sector"`·`"size_sector"`를
+추가했다(`Literal["none","size","sector","size_sector"]`). `app/services/metrics/
+factors.py::_neutralize_sector`를 신설 — `_neutralize_size`(연속축 OLS 잔차화)와
+달리 섹터는 범주형이라 섹터별 그룹 평균을 빼는 demean 방식을 쓴다(표본 1개뿐인
+섹터는 자기 평균=자기 자신이라 demean 하면 정보가 소거되므로 원값 보존).
+`"size_sector"`는 사이즈 잔차화 후 그 결과 위에 섹터 demean 을 순차 적용한다.
+
+라이브 경로: `compute_universe_scores`가 `neutralize`에 `sector`/`size_sector`가
+있으면 `krx_index.sector_map(as_of)`(PIT)를 조회해 `sector` 컬럼을 주입한다.
+백테스트 경로: `backtests.py::_fundamentals_provider_with_market_cap`를
+`_fundamentals_provider_with_neutralize_cols`로 일반화해 시총·업종 컬럼을 필요한
+축만 선택적으로 붙이고, `portfolio.py::_targets_at`의 펀더멘털 병합 컬럼 목록에
+`"sector"`를 추가해 스코어링 프레임까지 흘러가게 했다. 프론트(`RebalanceFields.tsx`)
+select 에도 "업종 중립화"/"시가총액 + 업종 중립화" 옵션을 추가.
+
+`_neutralize_sector`(그룹평균 제거·NaN 보존·단독섹터 보존 3건)의 유닛테스트를
+`tests/test_quality_factor.py`에 추가, 전체 pytest(422건) 통과 확인. id=23 PIT
+A/B(업종 쏠림 분리 효과 판정)는 코드는 완료됐고 리서치는 후속(남은 과제 참고).
+
+## 21. alerts 테이블 보존정책·반복 알림 억제 부재 (§17 운영 후속) ✅
+
+`worker/tasks.py::cleanup_old_alerts`(신규, beat 매일 04:00 KST — 백업 03:00과
+겹치지 않는 시간대) — 읽음 처리 90일·미읽음 180일 초과분을 삭제한다
+(`_ALERT_RETENTION_READ_DAYS`/`_ALERT_RETENTION_UNREAD_DAYS`). `celery_app.py`
+beat_schedule 에 `cleanup-old-alerts` 등록.
+
+`engine/alerts.py::publish_alert`에 옵트인 `dedup_window_hours` 파라미터를
+추가했다 — 같은 `(user_id, strategy_id, code)`의 미확인(is_read=False) 알림이
+창 안에 이미 있으면 DB 재적재·텔레그램 재발송을 건너뛴다(WS 토스트는 dedup 여부와
+무관하게 항상 통과시켜 실시간성 유지). 상태형 배치 경보 `db_backup_stale`
+(`check_backup_freshness`, 매일 1회 실행이라 20시간 창)·`ohlcv_ingest_failure_rate`
+(야간 배치, 20시간 창)에 적용했다.
+
+`GET /api/alerts`에 `offset` 쿼리 파라미터를 추가(`limit`은 기존 그대로)해 이전
+이력 조회 수단을 붙였고, `frontend/lib/api.ts::listAlerts`에도 `offset` 인자를
+추가했다(프론트 UI의 "더보기" 버튼 연동은 아직 없음 — 함수 시그니처만 준비).
+
+## 22. DSR 동질 시행 집합의 유니버스 식별 부재 ✅
+
+`backtests.py::_universe_fingerprint` — 백테스트 실행 시점의 실제 유니버스(PIT
+해소 결과 포함, 정렬)+`universe_rule` 파라미터를 sha256 해시(16자)로 만들어
+`result["universe_fingerprint"]`에 저장한다. `run_strategy_backtest`가 결과를
+저장하기 직전에 채운다.
+
+DSR 라우트(`GET /backtests/{id}/dsr`)의 동질 집합 조회를 2단계로 바꿨다: 기존과
+동일하게 `strategy_id + period_start/period_end`로 1차 후보를 뽑은 뒤, 대상
+백테스트에 지문이 있으면 지문까지 일치하는 행으로 좁힌다. 지문이 없는 과거
+이력(§22 도입 이전 실행)은 대상 자체에 지문이 없을 때만 기존 기간 필터로
+폴백한다(하위호환 — 신규 백테스트가 쌓일수록 집합 순도가 자연 개선). Backtest 테이블
+스키마 변경은 불필요(`result` JSONB에 필드 추가만). `deflated_sharpe.py` 모듈
+docstring·"한계" 절도 갱신해 잔존 한계(지문 없는 이력이 섞인 구간만 영향)를
+명시했다.
+
+---
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |
@@ -296,7 +359,9 @@ worker의 `check_backup_freshness`(§9)와 동일 임계인 26시간을 초과�
 | 2 | 0008 백필 감사 (§2) | id=23+24 병행 운용의 남은 전제(§5 해소로 긴급도는 낮아짐). 운영 DB 필요 |
 | 3 | TTM A/B 재검증 (§3) | §8에서 `financial_period` 실배선이 끝나 UI 토글만으로 수행 가능해짐 — 코드 리스크 없이 전략 개선 여지 확인 |
 | 4 | 체결 모델 정밀화 id=23/24 재검증 | §4 코드는 완료 — `price_limit_model=True` 로 영향도 판정(성과 변화 미미하면 근사 유지로 종결) |
-| 5 | S3 오프사이트 백업 자격증명 발급·활성화 (§10) | 코드는 완료, 버킷·키 준비는 운영자 몫(외부 계정 필요) |
-| 6 | 패닉셀 S9 신저가 비율 임계값 캘리브레이션 | §19 구현 시 잠정값(warn 0.10/panic 0.25)으로 둔 임계값 — 캐시가 충분히 쌓인 뒤 역사적 사례로 검증 필요 |
+| 5 | 팩터 섹터 중립화 id=23 A/B (§20) | §20 코드는 완료 — `neutralize="sector"`로 PIT KOSPI200 A/B(판정은 alpha/Sharpe)해 업종 쏠림 분리 효과 확정 |
+| 6 | S3 오프사이트 백업 자격증명 발급·활성화 (§10) | 코드는 완료, 버킷·키 준비는 운영자 몫(외부 계정 필요) |
+| 7 | 패닉셀 S9 신저가 비율 임계값 캘리브레이션 | §19 구현 시 잠정값(warn 0.10/panic 0.25)으로 둔 임계값 — 캐시가 충분히 쌓인 뒤 역사적 사례로 검증 필요 |
+| 8 | alerts "더보기" 프론트 UI (§21 부수) | 백엔드·`listAlerts` offset 지원은 완료, `AlertCenter.tsx`에 이전 이력 로드 버튼 연동은 미착수 |
 
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.

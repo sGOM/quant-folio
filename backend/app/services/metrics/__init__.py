@@ -37,6 +37,7 @@ from app.services.metrics.common import (
 from app.services.metrics.factors import (
     DEFAULT_FACTOR_WEIGHTS,
     _compute_stock_scores,
+    _neutralize_sector,
     _neutralize_size,
     _winsorize_zscore,
     compute_universe_scores,
@@ -84,7 +85,7 @@ __all__ = [
     "_fetch_price_change", "_get_index_name",
     # factors
     "DEFAULT_FACTOR_WEIGHTS", "_compute_stock_scores", "_neutralize_size",
-    "_winsorize_zscore", "compute_universe_scores",
+    "_neutralize_sector", "_winsorize_zscore", "compute_universe_scores",
     # sectors
     "SECTORS_CACHE_TTL", "_KOSDAQ_REF_TICKER", "_KOSPI_REF_TICKER",
     "_compute_one_sector", "compute_sectors",

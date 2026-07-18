@@ -95,6 +95,41 @@ def _neutralize_size(df: pd.DataFrame, factor_cols: list[str]) -> pd.DataFrame:
     return df
 
 
+def _neutralize_sector(df: pd.DataFrame, factor_cols: list[str]) -> pd.DataFrame:
+    """각 팩터 카테고리 z-score 에서 섹터(업종) 평균을 제거한다(섹터 중립화, §20).
+
+    residual = s − mean(s | sector). 범주형 축이라 사이즈처럼 연속 회귀를 쓰지 않고
+    섹터별 그룹 평균을 빼는 demean 방식을 쓴다 — 그룹 내 상대 순위만 남겨, 팩터
+    점수가 특정 업종 쏠림(예: 저변동=유틸리티/통신)으로 변질되는 것을 막는다.
+    df["sector"](업종명 문자열) 이 없으면 원본을 그대로 둔다(중립화 생략). 표본이
+    1개뿐인 섹터는 평균을 빼면 자기 자신이 0이 되어 정보가 사라지므로 건드리지
+    않는다(그 섹터는 원값 유지). NaN 인 팩터/섹터 행은 보존한다. df 를 제자리
+    수정하고 반환한다.
+    """
+    sector = df.get("sector")
+    if sector is None:
+        return df
+    valid = sector.notna()
+    if int(valid.sum()) < 5:
+        return df
+    for col in factor_cols:
+        if col not in df.columns:
+            continue
+        s = df[col]
+        m = valid & s.notna()
+        if int(m.sum()) < 5:
+            continue
+        grp = sector[m]
+        sv = s[m]
+        group_mean = sv.groupby(grp).transform("mean")
+        group_size = sv.groupby(grp).transform("size")
+        # 표본 1개뿐인 섹터는 자기 평균=자기 자신이라 demean 하면 0으로 소거된다 —
+        # 정보 소실 방지를 위해 그 그룹만 원값을 보존한다.
+        residual = (sv - group_mean).where(group_size > 1, sv)
+        df.loc[m, col] = residual
+    return df
+
+
 def _compute_stock_scores(
     df: pd.DataFrame,
     weights: dict[str, float] | None = None,
@@ -189,10 +224,14 @@ def _compute_stock_scores(
     result["score_quality"] = score_quality
     result["score_growth"] = score_growth
 
-    # ── 팩터 중립화(P1-3): 종합 전에 각 카테고리 점수를 지정 축에 직교화한다 ──
+    # ── 팩터 중립화(P1-3 사이즈, §20 섹터): 종합 전에 각 카테고리 점수를 지정 축에
+    # 직교화한다. "size_sector"는 둘 다 순차 적용(사이즈 먼저 — 연속축 잔차화 후
+    # 범주형 demean 이 사이즈 조정된 값 위에서 섹터 쏠림만 추가로 제거한다).
     cat_cols = ["score_momentum", "score_value", "score_lowvol", "score_quality", "score_growth"]
-    if neutralize == "size":
+    if neutralize in ("size", "size_sector"):
         result = _neutralize_size(result, cat_cols)
+    if neutralize in ("sector", "size_sector"):
+        result = _neutralize_sector(result, cat_cols)
 
     # ── 종합 점수(중립화 후 카테고리 점수로 합성) ──
     score = (
@@ -314,7 +353,7 @@ def compute_universe_scores(
                 df[col] = qdf[col].reindex(df.index)
 
     # 사이즈 중립화(P1-3): 시가총액(PIT)을 붙여 스코어러가 로그 시총 축에 직교화한다.
-    if neutralize == "size":
+    if neutralize in ("size", "size_sector"):
         try:
             from app.services.data import krx_index
 
@@ -325,6 +364,20 @@ def compute_universe_scores(
         if caps:
             df["market_cap"] = pd.Series(
                 {c: caps.get(c) for c in df.index}, dtype="float64"
+            ).reindex(df.index)
+
+    # 섹터 중립화(§20): 업종명(PIT)을 붙여 스코어러가 섹터 그룹 평균을 제거한다.
+    if neutralize in ("sector", "size_sector"):
+        try:
+            from app.services.data import krx_index
+
+            smap = krx_index.sector_map(as_of)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("섹터 중립화용 업종분류 조회 실패 — 중립화 생략: %s", e)
+            smap = {}
+        if smap:
+            df["sector"] = pd.Series(
+                {c: smap.get(c) for c in df.index}, dtype="object"
             ).reindex(df.index)
 
     scored = _compute_stock_scores(df, weights=factor_weights, neutralize=neutralize)

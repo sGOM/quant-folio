@@ -55,6 +55,12 @@ celery_app.conf.beat_schedule = {
         "task": "worker.check_backup_freshness",
         "schedule": crontab(hour=9, minute=0),
     },
+    # alerts 테이블 보존정책 정리(§21) — §17 도입 이후 정리 경로가 없어 무한 증식하던
+    # 것을 해소. 야간 백업(03:00)과 겹치지 않는 시간대에 실행.
+    "cleanup-old-alerts": {
+        "task": "worker.cleanup_old_alerts",
+        "schedule": crontab(hour=4, minute=0),
+    },
 }
 
 

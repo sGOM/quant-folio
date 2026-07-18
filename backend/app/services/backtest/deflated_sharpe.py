@@ -31,10 +31,13 @@ PSR(SR*) = Φ( (SR_hat − SR*)·√(n−1) / √(1 − γ3·SR_hat + ((γ4−1)
 버그가 된다(test_deflated_sharpe 로 못박음).
 
 ────────────────────── N·V 추정(동질 시행 집합) ──────────────────────
-- 동질 집합: 같은 strategy_id + 같은 period_start/period_end 의 Backtest 이력
-  (현재 result 에 유니버스 식별 정보가 없어 기간 동일성으로만 필터). 이 집합이
-  "파라미터 탐색 시행들"이다. 조회·필터는 API 라우트(backtests.py)에서 수행하고,
-  이 모듈은 각 시행의 (sharpe_annual, daily_returns) 만 받아 통계를 낸다.
+- 동질 집합: 같은 strategy_id + 같은 period_start/period_end 의 Backtest 이력을
+  1차 후보로 잡고, 대상 result 에 유니버스 지문(§22, universe_fingerprint —
+  실행 시점 유니버스+universe_rule 파라미터의 해시)이 있으면 지문까지 일치하는
+  행으로 좁힌다. 지문이 없는 과거 이력(§22 도입 이전 실행)은 대상 자체에 지문이
+  없을 때만 기간 필터로 폴백한다(하위호환). 이 집합이 "파라미터 탐색 시행들"이다.
+  조회·필터는 API 라우트(backtests.py)에서 수행하고, 이 모듈은 각 시행의
+  (sharpe_annual, daily_returns) 만 받아 통계를 낸다.
 - N = 동질 집합 행 수(현재 대상 자신 포함). N<2 이면 DSR 미정의.
 - V_daily = 각 행 sharpe_annual/√252 의 표본분산(ddof=1). N<5 면 불안정
   (v_low_confidence=True).
@@ -49,8 +52,9 @@ PSR(SR*) = Φ( (SR_hat − SR*)·√(n−1) / √(1 − γ3·SR_hat + ((γ4−1)
   전략이 저빈도로 값이 찍히면 연율화 252 가정과 어긋날 수 있으나, 과도한 정교화
   대신 관측치 수를 그대로 n 에 쓴다(방법론 신뢰도 "낮음" 한계로 문서화).
 - N_eff 보정은 participation-ratio(고윳값) 대신 평균 쌍상관 간이식이다.
-- 유니버스 동일성을 result 로 확인할 수 없어 기간만으로 동질 집합을 정의한다
-  (서로 다른 유니버스의 백테스트가 섞이면 N 이 과대·V 가 왜곡될 수 있다).
+- 유니버스 동일성은 §22(universe_fingerprint)로 해소됐으나, 지문이 없는 과거
+  이력이 섞인 동질 집합(대상 자체가 구지문 이전 실행인 경우)은 여전히 기간만으로
+  필터되어 서로 다른 유니버스가 섞일 수 있다 — 신규 백테스트가 쌓일수록 자연 해소.
 """
 from __future__ import annotations
 
