@@ -16,15 +16,25 @@
 - S6 급락종목 비율    cr5 = #(등락률<=-5%)/#유효  (cr10=#(<=-10%)는 하드트리거)
 - S7 변동성 z-score   z   = r1/std(daily_ret[-21:-1])
 - S8 종가위치(CLV)    clv = (close-low)/(high-low)   (보조, 저가중)
+- S9 52주 신저가 비율 nlr = #(종가<=trailing 252일 최저)/#유효 (docs/improvements.md §19)
 
 지수 신호(S1~S4,S7,S8)는 `_fetch_index_ohlcv` 한 번, 브레드스(S5·S6)는
-`_fetch_price_change` 한 번으로 확보한다(시장당 조회 2회). 종목 단위 신저가
-브레드스(S9)는 호출량이 커 후속 최적화 과제로 남겨 여기서는 계산하지 않는다.
+`_fetch_price_change` 한 번으로 확보한다(시장당 조회 2회). S9는 전 종목 OHLCV 일별
+스냅샷(`_fetch_market_ohlcv_snapshot`, 시장당 1회/일)을 로컬 파일 캐시에 누적해
+종목별 종가 시계열을 재구성한다 — 매일 신규 스냅샷 1건만 추가로 조회하면 되므로
+과거 252일치를 매번 재조회하지 않는다(브레드스 롤링 캐시와 동일한 절충).
+**단, 캐시가 없는 상태(최초 배포 직후)에서는 트레일링 윈도우가 짧아(며칠~몇 주)
+정확한 52주 저점 판정이 아니다 — 캐시가 매일 누적되며 최대 252거래일까지 자연히
+채워진다. 윈도우가 `_S9_MIN_WINDOW`(60거래일) 미만이면 S9 자체를 계산하지 않고
+결측 처리한다.** 백테스트 롤링(`compute_panic_series`)에는 S9를 연동하지 않았다
+(실거래 대시보드 전용 — 과거 재현성 있는 백테스트 점수에 영향 주지 않기 위함).
 
 ## 한계 (UI/문서 고지 대상)
 - 일봉 종가 한계: 장중 급락 후 종가 회복(V자)이면 감지 실패. "종가 확정 후 판정".
-- 생존편향: `_fetch_price_change`는 현재 상장 종목 기준(과거 상폐 미포함).
+- 생존편향: `_fetch_price_change`/S9 캐시는 현재 상장 종목 기준(과거 상폐 미포함).
 - 매매 신호 아님: 자본항복은 통계적으로 바닥 근처에 발생 → 투매 동참은 최악 타이밍.
+- S9 신저가 비율의 임계값(warn/panic)은 다른 시그널과 달리 역사적 사례로 캘리브레이션된
+  것이 아니라 다른 브레드스 시그널과 유사한 자릿수로 잡은 잠정값이다.
 """
 from __future__ import annotations
 
@@ -45,7 +55,11 @@ from app.services.metrics.common import (
     _safe_float,
     _ymd,
 )
-from app.services.metrics.fetch import _fetch_index_ohlcv, _fetch_price_change
+from app.services.metrics.fetch import (
+    _fetch_index_ohlcv,
+    _fetch_market_ohlcv_snapshot,
+    _fetch_price_change,
+)
 
 logger = logging.getLogger("app.services.metrics")
 
@@ -79,11 +93,25 @@ _TH_COMMON = {
     "cr5": (0.15, 0.30),   # -5% 이하 급락종목 비율
     "cr10": (0.05, 0.10),  # -10% 이하 폭락종목 비율(하드트리거 0.10)
     "clv": (0.40, 0.15),   # 종가위치: 낮을수록(저가마감) 패닉 방향
+    # 잠정값(역사적 캘리브레이션 없음) — cr5와 유사한 자릿수로 설정. §19.
+    "nlr": (0.10, 0.25),   # 52주 신저가 비율
 }
 
 # ── 종합점수 가중 (합계 100) ──
-# 가격축 35(S1 20 + S2 15) · 참여 20(S4) · 브레드스 30(S5 15 + S6 15) · 변동성 10(S7) · 종가 5(S8)
-_W = {"s1": 20.0, "s2": 15.0, "s4": 20.0, "s5": 15.0, "s6": 15.0, "s7": 10.0, "s8": 5.0}
+# 가격축 35(S1 20 + S2 15) · 참여 20(S4) · 브레드스 30(S5 10 + S6 10 + S9 10) · 변동성 10(S7) · 종가 5(S8)
+# S9 편입으로 기존 S5/S6(각 15)를 10으로 나눠 S9(10)에 배분(§19, 브레드스 축 총량 30 유지).
+_W = {
+    "s1": 20.0, "s2": 15.0, "s4": 20.0,
+    "s5": 10.0, "s6": 10.0, "s9": 10.0,
+    "s7": 10.0, "s8": 5.0,
+}
+
+# S9 계산에 필요한 최소 트레일링 윈도우(거래일). 캐시 누적이 이보다 적으면 계산하지
+# 않는다(초기 배포 직후 짧은 윈도우로 "신저가"를 오판정하지 않기 위한 가드).
+_S9_MIN_WINDOW = 60
+# 52주 = 약 252거래일. 캐시는 이보다 여유 있게(260) 보관 후 트리밍한다.
+_S9_WINDOW = 252
+_S9_CACHE_KEEP = 260
 
 # 라벨 임계
 _SCORE_CAUTION = 35.0   # 주의 진입
@@ -99,8 +127,9 @@ CAVEATS: list[str] = [
     "(과거 상장폐지 종목은 반영되지 않습니다).",
     "매매 신호가 아닙니다. 자본항복(capitulation)은 통계적으로 바닥 근처에서 발생하는 "
     "경향이 있어, 패닉 국면에 동반 매도하는 것은 오히려 최악의 타이밍일 수 있습니다.",
-    "종목 단위 신저가 비율(브레드스 S9)은 호출 비용이 커 아직 계산에 포함하지 않습니다 "
-    "(현재는 8개 시그널로만 판정).",
+    "종목 단위 신저가 비율(브레드스 S9)은 매일 스냅샷을 누적하는 캐시 기반이라, 캐시가 "
+    "충분히 쌓이기 전(약 60거래일 미만)에는 판정에서 제외됩니다. 또한 이 신호의 "
+    "경계·패닉 임계값은 역사적 사례로 검증된 것이 아니라 잠정값입니다.",
 ]
 
 
@@ -223,12 +252,53 @@ def _breadth_signals(pc: pd.DataFrame | None) -> dict:
     return dict(bdr=bdr, cr5=cr5, cr10=cr10, universe=universe)
 
 
+def _new_low_signal(mkt: str, as_of_ymd: str, cache_dir: str | None = None) -> float | None:
+    """52주(트레일링 252거래일) 신저가 종목 비율(S9)을 계산한다(§19).
+
+    전 종목 종가 스냅샷을 날짜별로 로컬 캐시(`_breadth_cache_path` 패턴 재사용)에
+    누적하며, 오늘 스냅샷을 추가한 뒤 트레일링 윈도우 내 최저 종가와 오늘 종가를
+    비교한다. 캐시가 `_S9_MIN_WINDOW` 거래일 미만이면 계산하지 않고 None을 반환한다
+    (초기 배포 직후 짧은 윈도우로 오판정하는 것을 막기 위함).
+    """
+    cache = _load_breadth_cache(f"{mkt}_closes", cache_dir)
+    if as_of_ymd not in cache:
+        snap = _fetch_market_ohlcv_snapshot(as_of_ymd, mkt)
+        if snap is None or snap.empty or "종가" not in snap.columns:
+            logger.warning("패닉 지표: S9 스냅샷 조회 실패 (market=%s %s)", mkt, as_of_ymd)
+            return None
+        cache[as_of_ymd] = snap["종가"].astype(float).to_dict()
+        # 트레일링 윈도우보다 오래된 날짜는 트리밍(파일 크기·조회 비용 상한).
+        if len(cache) > _S9_CACHE_KEEP:
+            for old_date in sorted(cache.keys())[: len(cache) - _S9_CACHE_KEEP]:
+                del cache[old_date]
+        _save_breadth_cache(f"{mkt}_closes", cache_dir, cache)
+
+    if len(cache) < _S9_MIN_WINDOW:
+        return None
+
+    hist = pd.DataFrame(cache).T
+    hist.index = pd.to_datetime(hist.index)
+    hist = hist.sort_index().tail(_S9_WINDOW)
+    if as_of_ymd not in {d.strftime("%Y%m%d") for d in hist.index}:
+        return None
+
+    today = hist.iloc[-1]
+    counts = hist.notna().sum()
+    mins = hist.min()
+    eligible = counts >= _S9_MIN_WINDOW
+    if eligible.sum() == 0:
+        return None
+    new_low = today <= mins
+    return _safe_float(float((new_low & eligible).sum()) / float(eligible.sum()))
+
+
 def _score_and_label(mkt: str, sig: dict) -> dict:
     """지수+브레드스 신호(dict)로 종합점수·라벨·게이팅·하드트리거를 산출한다(공통 로직)."""
     th = _TH[mkt]
     r1, r5, dd60 = sig.get("r1"), sig.get("r5"), sig.get("dd60")
     vr, z, clv = sig.get("vr"), sig.get("z"), sig.get("clv")
     bdr, cr5, cr10 = sig.get("bdr"), sig.get("cr5"), sig.get("cr10")
+    nlr = sig.get("nlr")
 
     s1 = _ramp(r1, *th["r1"])
     s2 = _ramp(r5, *th["r5"])
@@ -239,10 +309,11 @@ def _score_and_label(mkt: str, sig: dict) -> dict:
     s6 = _max_opt(s6_cr5, s6_cr10)
     s7 = _ramp(z, *th["z"])
     s8 = _ramp(clv, *_TH_COMMON["clv"])
+    s9 = _ramp(nlr, *_TH_COMMON["nlr"])
 
     weighted = [
         (_W["s1"], s1), (_W["s2"], s2), (_W["s4"], s4),
-        (_W["s5"], s5), (_W["s6"], s6), (_W["s7"], s7), (_W["s8"], s8),
+        (_W["s5"], s5), (_W["s6"], s6), (_W["s9"], s9), (_W["s7"], s7), (_W["s8"], s8),
     ]
     avail_w = sum(w for w, s in weighted if s is not None)
     score_raw = (
@@ -258,7 +329,7 @@ def _score_and_label(mkt: str, sig: dict) -> dict:
     score = float(min(100.0, max(0.0, score_raw * mult)))
 
     price_sub = _wavg([(_W["s1"], s1), (_W["s2"], s2)])
-    breadth_sub = _wavg([(_W["s5"], s5), (_W["s6"], s6)])
+    breadth_sub = _wavg([(_W["s5"], s5), (_W["s6"], s6), (_W["s9"], s9)])
 
     gated = (
         price_sub is not None and price_sub >= _GATE_SUB
@@ -288,7 +359,8 @@ def _score_and_label(mkt: str, sig: dict) -> dict:
     return dict(
         score=score, level=level, gated=gated, hard_trigger=hard_trigger,
         price_sub=price_sub, breadth_sub=breadth_sub,
-        s1=s1, s2=s2, s4=s4, s5=s5, s6=s6, s6_cr5=s6_cr5, s6_cr10=s6_cr10, s7=s7, s8=s8,
+        s1=s1, s2=s2, s4=s4, s5=s5, s6=s6, s6_cr5=s6_cr5, s6_cr10=s6_cr10,
+        s7=s7, s8=s8, s9=s9,
     )
 
 
@@ -320,6 +392,12 @@ def _compute_one_market(
     breadth = _breadth_signals(pc)
     sig.update(breadth)
 
+    try:
+        sig["nlr"] = _new_low_signal(mkt, as_of_ymd)
+    except Exception:
+        logger.warning("패닉 지표: S9 신저가 비율 계산 실패 (market=%s)", mkt, exc_info=True)
+        sig["nlr"] = None
+
     res = _score_and_label(mkt, sig)
 
     signals = [
@@ -331,6 +409,8 @@ def _compute_one_market(
                     weight=_W["s4"], warn=_TH_COMMON["vr"][0], panic=_TH_COMMON["vr"][1]),
         PanicSignal(key="bdr", label="하락종목 비율", value=sig.get("bdr"), subscore=res["s5"],
                     weight=_W["s5"], warn=_TH_COMMON["bdr"][0], panic=_TH_COMMON["bdr"][1]),
+        PanicSignal(key="nlr", label="52주 신저가 비율", value=sig.get("nlr"), subscore=res["s9"],
+                    weight=_W["s9"], warn=_TH_COMMON["nlr"][0], panic=_TH_COMMON["nlr"][1]),
         # cr5 행은 -5% 램프 자체 서브스코어(s6_cr5)를 표시한다. 종합점수 가중항은
         # s6=max(s6_cr5, s6_cr10) 를 쓰지만(weight=_W["s6"]), 표시 막대까지 max 를
         # 쓰면 cr10 이 드라이버일 때 -5% 값과 어긋나 오해를 준다 → 표시는 자기 값 기준.

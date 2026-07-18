@@ -48,6 +48,7 @@ from app.services.metrics.fetch import (
     _fetch_index_ohlcv,
     _fetch_index_tickers,
     _fetch_market_cap,
+    _fetch_market_ohlcv_snapshot,
     _fetch_price_change,
     _get_index_name,
 )
@@ -79,7 +80,8 @@ __all__ = [
     "_safe_bool", "_safe_float", "_ymd", "logger",
     # fetch
     "_FUND_CACHE", "_FUND_CACHE_MAX", "_fetch_fundamentals", "_fetch_index_ohlcv",
-    "_fetch_index_tickers", "_fetch_market_cap", "_fetch_price_change", "_get_index_name",
+    "_fetch_index_tickers", "_fetch_market_cap", "_fetch_market_ohlcv_snapshot",
+    "_fetch_price_change", "_get_index_name",
     # factors
     "DEFAULT_FACTOR_WEIGHTS", "_compute_stock_scores", "_neutralize_size",
     "_winsorize_zscore", "compute_universe_scores",

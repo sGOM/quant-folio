@@ -86,6 +86,17 @@ const ORDER_STATUS: Record<
   },
 };
 
+/** DB 백업 신선도 판정 임계(시간) — worker.check_backup_freshness(§9)와 동일 기준. */
+const BACKUP_STALE_HOURS = 26;
+
+/** 백업 신선도 배지 톤 판정. null(백업 이력 없음)·임계 초과는 위험, 그 외 정상. */
+function backupFreshnessTone(lastSuccessAt: string | null | undefined): "ok" | "bad" | "unknown" {
+  if (lastSuccessAt === undefined) return "unknown";
+  if (lastSuccessAt === null) return "bad";
+  const hoursSince = (Date.now() - new Date(lastSuccessAt).getTime()) / 3_600_000;
+  return hoursSince > BACKUP_STALE_HOURS ? "bad" : "ok";
+}
+
 /** 매매 엔진 상태 배지에 붙일 상세 설명(툴팁). */
 function engineStatusDesc(loading: boolean, alive?: boolean): string {
   if (loading) return "매매 엔진의 가동 여부를 확인하는 중입니다.";
@@ -259,6 +270,33 @@ function MonitorContent() {
             </TooltipContent>
           </Tooltip>
         </div>
+
+        {!engine.isLoading && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                tabIndex={0}
+                className={cn(
+                  "mt-2 flex w-fit cursor-help items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium",
+                  backupFreshnessTone(engine.data?.backup_last_success_at) === "ok"
+                    ? "border-status-ok/30 bg-status-ok/10 text-status-ok"
+                    : "border-status-bad/30 bg-status-bad/10 text-status-bad",
+                )}
+              >
+                DB 백업{" "}
+                {engine.data?.backup_last_success_at
+                  ? `마지막 성공 ${formatRelativeTime(engine.data.backup_last_success_at)}`
+                  : "성공 이력 없음"}
+                <HelpCircle className="h-3 w-3 opacity-60" />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>
+              worker 컨테이너가 매일 새벽 03:00 KST 에 DB 를 백업합니다(§9). 마지막 성공이
+              {BACKUP_STALE_HOURS}시간을 넘으면 백업이 밀렸다는 뜻이므로 worker 로그와
+              Celery beat 스케줄을 확인하세요.
+            </TooltipContent>
+          </Tooltip>
+        )}
 
         <Watchlist
           broker={me.data?.broker}

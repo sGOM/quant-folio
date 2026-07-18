@@ -332,3 +332,32 @@ class RiskLimit(Base):
     max_position_size: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
     daily_loss_limit: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
     stop_loss_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 4), nullable=True)
+
+
+# ─────────────────────────── alerts ───────────────────────────
+class Alert(Base):
+    """engine/alerts.py::publish_alert 의 영속화 사본(docs/improvements.md §17 해소).
+
+    WS·텔레그램은 순간 전송이라 미접속 중이거나(WS) warning 심각도(텔레그램)면 알림이
+    유실된다. 이 테이블은 발행되는 모든 알림을 그대로 적재해 `GET /api/alerts` 로
+    나중에 조회·확인 처리할 수 있게 한다. user_id NULL 은 특정 사용자가 아닌 전역/운영
+    알림(배치 작업 실패 등)을 의미하며, `GET /api/alerts` 는 요청자 알림 + 전역 알림을
+    함께 반환한다.
+    """
+    __tablename__ = "alerts"
+    __table_args__ = (
+        Index("ix_alerts_user_read_created", "user_id", "is_read", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    strategy_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    severity: Mapped[str] = mapped_column(String(20), nullable=False)
+    code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

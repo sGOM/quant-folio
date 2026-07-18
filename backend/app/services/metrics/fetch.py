@@ -145,6 +145,26 @@ def _fetch_price_change(start_ymd: str, end_ymd: str, mkts: list[str]) -> pd.Dat
     )
 
 
+def _fetch_market_ohlcv_snapshot(date_ymd: str, mkt: str) -> pd.DataFrame | None:
+    """단일 거래일의 전 종목 OHLCV 스냅샷을 조회한다(패닉셀 S9 신저가 브레드스 등).
+
+    컬럼: 시가/고가/저가/종가/거래량/거래대금/등락률/시가총액. 티커 인덱스.
+    기간 조회(_fetch_price_change)와 달리 "그 날짜 하루"만 반환하므로, 여러 날짜를
+    누적하면(캐시) 종목별 종가 시계열을 재구성할 수 있다. 1회 호출로 시장 전체를
+    받아오므로 브레드스 계열 호출과 비용이 같은 급(시장당 1회)이다.
+    """
+    stock = _pykrx_stock()
+    try:
+        with bounded_socket_timeout(20):
+            df = stock.get_market_ohlcv(date_ymd, market=mkt)
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception:
+        logger.warning("전종목 OHLCV 스냅샷 조회 실패 (%s %s)", mkt, date_ymd, exc_info=True)
+        return None
+
+
 def _fetch_index_ohlcv(start_ymd: str, end_ymd: str, ticker: str) -> pd.DataFrame | None:
     """업종지수 OHLCV를 조회한다. 실패 시 None 반환.
 
