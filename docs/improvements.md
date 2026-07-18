@@ -203,7 +203,7 @@ worker·web이 동일 키 참조)이 없거나 26시간 초과면 `publish_alert
 strategy_id=0` sentinel — 전략 무관 배치 알림)을 따랐다. `app/core/channels.py`의
 알림 코드 예시 목록에도 추가.
 
-## 13. 패닉셀 지표의 문서화된 한계가 API/UI에 미노출 (백엔드 완료, 프론트 별도)
+## 13. 패닉셀 지표의 문서화된 한계가 API/UI에 미노출 ✅
 
 `app/schemas/metrics.py`의 `PanicMarket`·`PanicOut`에 `caveats: list[str]` 필드를
 추가하고, `app/services/metrics/panic.py`에 모듈 docstring "## 한계" 절을 그대로 옮긴
@@ -211,33 +211,80 @@ strategy_id=0` sentinel — 전략 무관 배치 알림)을 따랐다. `app/core
 S9 브레드스 미계산 4개 문구)를 정의해 `compute_panic`이 반환하는 `PanicOut`과 각
 `PanicMarket` 양쪽에 채워 넣는다. `/api/metrics/panic` 라우트는 `compute_panic`
 결과를 그대로 직렬화/캐시하므로 별도 배선 없이 응답에 실린다. S9 자체는 계산에
-추가하지 않았다(별도 과제로 유지). 프론트 고지 배너 노출은 별도 작업.
+추가하지 않았다(별도 과제로 유지 → §19). 프론트 고지 배너도 PR #71에서 완료 —
+`frontend/app/metrics/page.tsx`가 응답 `caveats`를 접기 가능한 고지 배너로 렌더링한다.
 
-## 14. 종목 지표 서브스코어(가치·모멘텀·저변동성) 미노출
+## 14. 종목 지표 서브스코어(가치·모멘텀·저변동성) 미노출 ✅
 
 `StockMetric.score_value`/`score_momentum`/`score_lowvol`(`app/schemas/metrics.py`)이
 백엔드에서 계산·응답까지 되고 `frontend/lib/api.ts`에 타입도 있으나,
 `frontend/app/metrics/page.tsx`의 `ScoreCell`은 합성 `score`만 렌더링해 서브스코어
 분해가 화면 어디에도 안 뜬다. 사용자가 "왜 이 점수인지" 근거를 볼 수 없어 스크리닝
-신뢰도에 영향. → `ScoreCell`에 호버/확장 시 서브스코어 분해 표시 추가.
+신뢰도에 영향. → PR #71에서 `ScoreCell` 툴팁으로 서브스코어 분해 표시 구현 완료.
 
-## 15. 턴어라운드 스크리너 `smallcap_pct` 조정 불가
+## 15. 턴어라운드 스크리너 `smallcap_pct` 조정 불가 ✅
 
 `/api/screener/turnaround`(`app/api/routes/screener.py`)는 `smallcap_pct`(소형주
 판정 시총 하위 %, 기본 0.20)를 받고 `frontend/lib/api.ts`에도 파라미터가 정의돼
 있지만, `frontend/app/screener/page.tsx`는 `surge`/`maxDebt`만 입력 필드로 노출하고
 `smallcap_pct`는 UI 컨트롤이 없어 항상 기본값 고정이다("시총 하위 20%" 문구도 고정
-텍스트). → 다른 두 파라미터와 같은 방식으로 슬라이더/입력 필드 추가.
+텍스트). → PR #71에서 다른 두 파라미터와 같은 방식의 입력 필드 추가 완료.
 
-## 16. 모니터 페이지 오류 메시지·엔진 이벤트 로그 세분화 부족
+## 16. 모니터 페이지 오류 메시지·엔진 이벤트 로그 세분화 부족 ✅
 
 `frontend/app/screener/page.tsx`는 조회 실패 시 백엔드가 반환하는 실제 오류 사유(예:
 OpenDART 재무 조회 실패)를 버리고 "스크리너 조회에 실패했습니다"로 뭉뚱그린다 —
 `FillQualityPanel` 등 세부 오류를 보여주는 다른 화면과 일관성이 떨어진다. 또
 `frontend/app/monitor/page.tsx`의 WS `execution`/`order` 이벤트 로그는
 `side`/`symbol`/`qty`/`price`/`status`만 뽑아 텍스트 로그로 남기고 나머지 페이로드
-필드는 구독만 하고 버린다 — 상세 진단이 필요한 사용자에게는 정보 부족. → 두 화면
-모두 백엔드 오류/페이로드 원문을 (접기 가능한 형태로) 노출.
+필드는 구독만 하고 버린다 — 상세 진단이 필요한 사용자에게는 정보 부족. → PR #71에서
+두 화면 모두 백엔드 오류 사유·페이로드 원문 노출(접기 가능) 구현 완료.
+
+---
+
+## 신규 발굴 (2026-07-18 3차 재점검, §17~§19)
+
+발굴 근거: §12~§16 완료(PR #71·#72) 직후 재점검. 알림 발행 경로(`engine/alerts.py`)의
+전달 보장을 종단까지 추적하고, 백엔드 API 응답 필드와 프론트 타입(`lib/api.ts`)을
+재대조하고, 이전 배치에서 "별도 과제로 유지"라 명시해 둔 항목을 승격했다.
+
+## 17. 알림 유실 경로 2건 — 영속화·수신 보장 부재 ✅
+
+`app/models/models.py::Alert`(`alerts` 테이블, 마이그레이션 `0011_alerts.py`,
+`user_id` nullable — NULL이면 전역/운영 알림)를 추가하고, `engine/alerts.py::
+publish_alert`가 WS·텔레그램 발송과 함께 항상 이 테이블에 적재하도록 확장했다
+(영속화 실패는 로그만 남기고 기존 WS·텔레그램 흐름을 막지 않음 — 하위호환).
+`GET /api/alerts`(본인+전역 알림, `unread_only` 필터)·`POST /api/alerts/{id}/read`·
+`POST /api/alerts/read-all`(`app/api/routes/alerts.py`)로 조회·확인 처리를 노출했다.
+프론트는 기존 `AlertCenter.tsx`(WS 실시간 토스트, 우하단 고정 종 버튼)를 서버 영속화
+소스로 전환 — TanStack Query로 `GET /api/alerts`를 폴링(60초, WS 이벤트 수신 시 즉시
+무효화)하고, 배지는 서버 `unread_count`를, 패널 항목은 클릭 시 개별 확인 처리·"모두
+읽음" 버튼으로 전체 확인 처리를 수행한다. 원안의 "헤더 벨 아이콘"은 `Nav`가 9개
+페이지에 개별 임포트되는 구조라 전면 이동 대신 기존 전역 마운트(우하단 고정, 모든
+보호 페이지에서 `RequireAuth` 경유 노출)를 유지했다 — 위치만 다를 뿐 알림함 기능
+자체(서버 영속화·읽음 처리·배지)는 원안대로 구현. 로그인 세션으로 실제 렌더·
+확인 처리 동작까지 검증 완료.
+
+## 18. 백업 신선도의 프론트 미노출 ✅
+
+`frontend/lib/api.ts::engineStatus` 반환 타입에 `backup_last_success_at: string | null`
+을 추가하고, 모니터 페이지 엔진 상태 배지 옆에 백업 신선도 배지를 새로 노출했다
+(`frontend/app/monitor/page.tsx`) — 마지막 성공 시각을 상대시간으로 표시하고,
+worker의 `check_backup_freshness`(§9)와 동일 임계인 26시간을 초과하거나 성공 이력이
+없으면 경고색(빨강)으로 전환한다.
+
+## 19. 패닉셀 브레드스 S9(신저가 비율) 계산 편입 ✅
+
+`app/services/metrics/fetch.py::_fetch_market_ohlcv_snapshot`(전 종목 단일일자 OHLCV
+스냅샷, 시장당 1회 호출)을 추가하고, `app/services/metrics/panic.py::_new_low_signal`이
+이를 기존 브레드스 로컬 파일 캐시 패턴(`_breadth_cache_path` 재사용, 날짜별 종가 스냅샷
+누적)으로 매일 1건씩만 신규 조회해 트레일링 최대 252거래일 종가 시계열을 재구성한다.
+오늘 종가가 그 종목의 트레일링 윈도우 최저가면 신저가로 집계해 비율(S9)을 산출 —
+윈도우가 `_S9_MIN_WINDOW`(60거래일) 미만이면 결측 처리(초기 배포 직후 오판정 방지).
+가중치는 기존 브레드스 축 30을 S5/S6/S9 각 10으로 재배분(총량 유지)했고, `CAVEATS`
+문구를 "캐시 워밍업 전 결측·임계값은 잠정치" 취지로 갱신했다. 백테스트 롤링
+(`compute_panic_series`)에는 연동하지 않아(실거래 대시보드 전용) 과거 백테스트
+점수의 재현성에는 영향 없다. 전체 pytest(418건) 통과 확인.
 
 ---
 
@@ -250,7 +297,6 @@ OpenDART 재무 조회 실패)를 버리고 "스크리너 조회에 실패했습
 | 3 | TTM A/B 재검증 (§3) | §8에서 `financial_period` 실배선이 끝나 UI 토글만으로 수행 가능해짐 — 코드 리스크 없이 전략 개선 여지 확인 |
 | 4 | 체결 모델 정밀화 id=23/24 재검증 | §4 코드는 완료 — `price_limit_model=True` 로 영향도 판정(성과 변화 미미하면 근사 유지로 종결) |
 | 5 | S3 오프사이트 백업 자격증명 발급·활성화 (§10) | 코드는 완료, 버킷·키 준비는 운영자 몫(외부 계정 필요) |
-| 6 | 패닉셀 caveat 프론트 노출 (§13) | 백엔드 `caveats` 필드 배선 완료 — 프론트 고지 배너/툴팁만 남음 |
-| 7 | 스크리너/모니터 UI 세분화 (§14~§16) | 프론트 단독 작업, 백엔드 리스크 없음 — 우선순위는 사용 빈도에 따라 조정 가능 |
+| 6 | 패닉셀 S9 신저가 비율 임계값 캘리브레이션 | §19 구현 시 잠정값(warn 0.10/panic 0.25)으로 둔 임계값 — 캐시가 충분히 쌓인 뒤 역사적 사례로 검증 필요 |
 
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.

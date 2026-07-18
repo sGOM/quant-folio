@@ -1,6 +1,7 @@
 """SQLAlchemy ORM 모델 — PRD §4 데이터 모델 8종 + 업종분류 PIT 스냅샷(C-2)."""
 from app.models.base import Base
 from app.models.models import (
+    Alert,
     Backtest,
     Execution,
     Order,
@@ -31,4 +32,5 @@ __all__ = [
     "Position",
     "RiskLimit",
     "SectorMapSnapshot",
+    "Alert",
 ]

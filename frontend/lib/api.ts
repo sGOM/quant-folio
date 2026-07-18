@@ -901,10 +901,47 @@ export type AlertCode =
   | "pit_fallback"
   | "mdd_kill"
   | "factor_outage"
-  | "fill_quality_drift";
+  | "fill_quality_drift"
+  | "slippage_calibration_proposed"
+  | "ohlcv_ingest_failure_rate"
+  | "db_backup_failed"
+  | "db_backup_stale"
+  | "db_backup_s3_upload_failed"
+  | "live_gate_blocked";
 
 /** 알림 심각도. critical=파국/치명, warning=주의(자동 폴백 등). */
 export type AlertSeverity = "warning" | "critical";
+
+/** GET /api/alerts 응답 항목 — DB 영속화된 알림(§17). */
+export interface AlertRecord {
+  id: number;
+  user_id: number | null;
+  strategy_id: number;
+  severity: AlertSeverity;
+  code: AlertCode | string | null;
+  message: string;
+  is_read: boolean;
+  created_at: string;
+}
+
+export interface AlertListOut {
+  items: AlertRecord[];
+  unread_count: number;
+}
+
+/** 본인 + 전역(user_id=NULL) 알림 목록(최신순). */
+export function listAlerts(unreadOnly = false, limit = 50): Promise<AlertListOut> {
+  const params = new URLSearchParams({ unread_only: String(unreadOnly), limit: String(limit) });
+  return request<AlertListOut>(`/api/alerts?${params.toString()}`);
+}
+
+export function markAlertRead(alertId: number): Promise<AlertRecord> {
+  return request<AlertRecord>(`/api/alerts/${alertId}/read`, { method: "POST" });
+}
+
+export function markAllAlertsRead(): Promise<{ updated: number }> {
+  return request<{ updated: number }>(`/api/alerts/read-all`, { method: "POST" });
+}
 
 /** 전략 러너 1개의 헬스 상태(백엔드 /api/engine/strategies/health 응답 항목). */
 export interface StrategyHealth {
@@ -1356,9 +1393,15 @@ export const api = {
   /** 최근 주문 내역(감사 로그). */
   orders: () => request<OrderRow[]>("/api/trading/orders"),
 
-  /** 매매 엔진 생존 여부(heartbeat) 조회. */
+  /**
+   * 매매 엔진 생존 여부(heartbeat) + 마지막 DB 백업 성공 시각(§9/§18) 조회.
+   * `backup_last_success_at` 은 ISO 문자열(worker.backup_database 가 기록) 또는 백업이
+   * 한 번도 성공한 적 없으면 null.
+   */
   engineStatus: () =>
-    request<{ engine_alive: boolean }>("/api/engine/status"),
+    request<{ engine_alive: boolean; backup_last_success_at: string | null }>(
+      "/api/engine/status",
+    ),
 
   /**
    * 현재 사용자 소유의 라이브 전략별 러너 헬스(마지막 성공 틱·연속 실패 횟수 등)를 조회한다.

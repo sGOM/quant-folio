@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.routes import (
+    alerts,
     auth,
     backtests,
     engine,
@@ -99,6 +100,7 @@ app.include_router(symbols.router)
 app.include_router(metrics.router)
 app.include_router(recommend.router)
 app.include_router(screener.router)
+app.include_router(alerts.router)
 app.include_router(ws.router)
 
 
