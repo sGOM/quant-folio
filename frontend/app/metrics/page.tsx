@@ -595,14 +595,23 @@ function StockRow({ row }: { row: StockMetric }) {
       </td>
       {/* 종합점수 */}
       <td className="px-3 py-2 text-right">
-        <ScoreCell score={row.score} />
+        <ScoreCell row={row} />
       </td>
     </tr>
   );
 }
 
-/** 종합점수 강조 셀. score 는 z-score 합성값(대략 -2~+2)으로, 0 이상이 평균 이상이다. */
-function ScoreCell({ score }: { score: number | null }) {
+/** 서브스코어 한 줄(라벨 + z-score 값). null 은 "-"로 표시. */
+function fmtSubscore(v: number | null): string {
+  return v == null ? "-" : v.toFixed(2);
+}
+
+/**
+ * 종합점수 강조 셀. score 는 z-score 합성값(대략 -2~+2)으로, 0 이상이 평균 이상이다.
+ * 호버(포커스)하면 가치·모멘텀·저변동성 서브스코어 분해를 툴팁으로 보여준다(§14).
+ */
+function ScoreCell({ row }: { row: StockMetric }) {
+  const { score, score_value, score_momentum, score_lowvol } = row;
   if (score == null) return <span className="text-muted-foreground">-</span>;
   const color =
     score >= 0.5
@@ -610,7 +619,26 @@ function ScoreCell({ score }: { score: number | null }) {
       : score >= 0
         ? "text-foreground font-medium"
         : "text-muted-foreground";
-  return <span className={cn("tabular-nums", color)}>{score.toFixed(2)}</span>;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          tabIndex={0}
+          className={cn("cursor-help tabular-nums underline decoration-dotted decoration-muted-foreground/40", color)}
+        >
+          {score.toFixed(2)}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>
+        <div className="space-y-0.5 text-xs">
+          <p className="font-medium text-foreground">서브스코어 분해(z-score)</p>
+          <p>모멘텀 40%: {fmtSubscore(score_momentum)}</p>
+          <p>밸류 30%: {fmtSubscore(score_value)}</p>
+          <p>저변동성 30%: {fmtSubscore(score_lowvol)}</p>
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  );
 }
 
 // ─────────────────────────── 패닉셀 탭 ───────────────────────────
@@ -706,6 +734,18 @@ function PanicTab() {
           있습니다. 일봉 종가 기반이라 장중 급락 후 회복(V자)은 감지하지 못합니다.
         </span>
       </div>
+
+      {/* 방법론상 알려진 한계 고지(백엔드 caveats 배선 전에는 미노출) */}
+      {data?.caveats && data.caveats.length > 0 && (
+        <div className="mb-4 flex items-start gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <ul className="list-disc space-y-0.5 pl-4">
+            {data.caveats.map((c, i) => (
+              <li key={i}>{c}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* 로딩/에러/데이터 */}
       {isLoading && <TableSkeleton rows={2} />}
