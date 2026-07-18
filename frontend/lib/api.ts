@@ -807,6 +807,11 @@ export interface PanicOut {
   items: PanicMarket[];
   /** 조회/데이터 부족으로 계산하지 못한 시장 목록(예: ["KOSDAQ"]). */
   unavailable: string[];
+  /**
+   * 지표 방법론상 알려진 한계 고지 문구(예: "종가 확정 후 판정(장중 회복 미탐지)").
+   * 백엔드 배선 시점에 따라 아직 응답에 없을 수 있어 옵셔널 — 없으면 UI에 배너를 노출하지 않는다.
+   */
+  caveats?: string[];
 }
 
 /** 소형주 턴어라운드 스크리너 후보 1건(백엔드 /api/screener/turnaround). */
