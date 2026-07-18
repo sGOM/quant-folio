@@ -15,7 +15,8 @@ ACTIVE_STRATEGIES_KEY = "engine:active_strategies"
 # 메시지(JSON): {"type": "order"|"execution"|"position"|"signal"|"alert", "user_id": int, ...}
 #   - "alert": 무인 자동매매의 조용한 실패를 사용자에게 즉시 알리는 앱 내 경보.
 #     추가 필드: strategy_id:int, severity:"warning"|"critical", message:str(한국어), ts:iso,
-#     code:str(알림 종류 식별자, 예 "runner_failures"|"pit_fallback"|"mdd_kill"|"factor_outage").
+#     code:str(알림 종류 식별자, 예 "runner_failures"|"pit_fallback"|"mdd_kill"|"factor_outage"
+#     |"db_backup_failed"|"db_backup_stale"|"db_backup_s3_upload_failed"|"ohlcv_ingest_failure_rate").
 ENGINE_EVENTS_CHANNEL = "engine:events"
 
 

@@ -115,6 +115,10 @@ class PanicMarket(BaseModel):
     dd60: Optional[float] = None       # 60일 고점대비 낙폭(음수 소수, 국면 참고)
     universe: int                      # 브레드스 유효 종목 수(거래정지 제외)
     signals: list[PanicSignal]
+    # 이 지표의 문서화된 한계(app.services.metrics.panic 모듈 docstring "## 한계" 절
+    # 그대로 반영, UI/문서 고지 대상). 시장마다 동일한 목록이지만 프론트가 개별
+    # 시장 카드에서 바로 렌더링할 수 있도록 항목별로도 싣는다.
+    caveats: list[str] = []
 
 
 class PanicOut(BaseModel):
@@ -125,3 +129,6 @@ class PanicOut(BaseModel):
     # 조회/데이터 부족으로 계산하지 못한 시장 목록(예: ["KOSDAQ"]).
     # items에서 조용히 누락되는 대신 여기에 명시해 "정상"과 "계산 불가"를 구분한다.
     unavailable: list[str] = []
+    # 응답 전체에 적용되는 공통 고지(개별 items[].caveats 와 동일 내용). 응답 최상위에서
+    # 한 번만 배너로 노출하고 싶은 프론트 사용처를 위해 중복 제공한다.
+    caveats: list[str] = []

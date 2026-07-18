@@ -20,8 +20,17 @@ logger = logging.getLogger(__name__)
 # 팩터 워밍업(모멘텀·52주고가·변동성)에 필요한 만큼 과거까지 커버한다.
 _LOOKBACK_DAYS = 500
 
+# 야간 일봉 적재 실패 알림 임계(docs/improvements.md §12) — 유니버스 대비 실패 종목
+# 비율이 이를 넘으면 백테스트·팩터 계산이 조용히 stale 데이터로 굴러갈 위험이 크다고
+# 보고 warning 알림을 발행한다. 소수 종목의 일시적 소스 장애는 흔해 과민 알림을 피하려
+# 10%로 잡는다.
+_INGEST_FAILURE_ALERT_RATIO = 0.10
+
 
 async def _ingest_daily_ohlcv_async() -> dict:
+    from redis.asyncio import Redis
+
+    from app.core.config import settings
     from app.core.database import AsyncSessionLocal
     from app.services.data.ingest import build_universe
     from app.services.data.loader import ensure_ohlcv_coverage
@@ -43,6 +52,24 @@ async def _ingest_daily_ohlcv_async() -> dict:
 
     result = {"universe": len(universe), "ok": len(universe) - len(failed), "failed": failed}
     logger.info("일봉 로컬 적재 완료: %s", result)
+
+    if universe and len(failed) / len(universe) > _INGEST_FAILURE_ALERT_RATIO:
+        from engine.alerts import publish_alert
+
+        redis = Redis.from_url(settings.REDIS_URL)
+        try:
+            await publish_alert(
+                redis, user_id=None, strategy_id=0, severity="warning",
+                message=(
+                    f"야간 일봉 적재 실패율 {len(failed)}/{len(universe)}"
+                    f"({len(failed) / len(universe):.0%})가 임계치를 초과했습니다: "
+                    f"{', '.join(failed[:10])}{' 외' if len(failed) > 10 else ''}"
+                ),
+                code="ohlcv_ingest_failure_rate",
+            )
+        finally:
+            await redis.aclose()
+
     return result
 
 
