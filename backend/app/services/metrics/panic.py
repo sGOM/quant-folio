@@ -90,6 +90,19 @@ _SCORE_CAUTION = 35.0   # 주의 진입
 _SCORE_WARNING = 60.0   # 경계/패닉 승격 하한
 _GATE_SUB = 60.0        # 게이팅용 축 서브스코어 하한
 
+# 모듈 docstring "## 한계 (UI/문서 고지 대상)" 절을 그대로 API 응답에 실어 나르는
+# 문구(docs/improvements.md §13). 여기 텍스트를 바꾸면 docstring 도 함께 갱신할 것.
+CAVEATS: list[str] = [
+    "일봉 종가 기준으로 판정합니다. 장중 급락 후 종가까지 회복(V자 반등)한 경우는 "
+    "감지하지 못하며, 그날 장이 마감되어 종가가 확정된 뒤에야 판정됩니다.",
+    "브레드스(하락·급락종목 비율)는 현재 상장 종목 기준으로 계산해 생존편향이 있습니다"
+    "(과거 상장폐지 종목은 반영되지 않습니다).",
+    "매매 신호가 아닙니다. 자본항복(capitulation)은 통계적으로 바닥 근처에서 발생하는 "
+    "경향이 있어, 패닉 국면에 동반 매도하는 것은 오히려 최악의 타이밍일 수 있습니다.",
+    "종목 단위 신저가 비율(브레드스 S9)은 호출 비용이 커 아직 계산에 포함하지 않습니다 "
+    "(현재는 8개 시그널로만 판정).",
+]
+
 
 def _ramp(x: float | None, warn: float, panic: float) -> float | None:
     """경계(warn)=0점, 패닉(panic)=100점으로 선형 보간 후 [0,100] 클램프.
@@ -142,7 +155,7 @@ def compute_panic(market: str, as_of: date) -> PanicOut:
             # (대시보드 사용자가 "이상 없음"으로 오인하는 것을 방지)
             unavailable.append(mkt)
 
-    return PanicOut(as_of=as_of, items=items, unavailable=unavailable)
+    return PanicOut(as_of=as_of, items=items, unavailable=unavailable, caveats=CAVEATS)
 
 
 def _index_signals(df: pd.DataFrame) -> dict:
@@ -345,6 +358,7 @@ def _compute_one_market(
         dd60=sig.get("dd60"),
         universe=breadth["universe"],
         signals=signals,
+        caveats=CAVEATS,
     )
 
 
