@@ -441,11 +441,16 @@ class RebalanceRunner(BaseRunner):
         # 리스크 레이어(P1-2) 변동성 타겟팅도 종가 히스토리를 요구한다(vol_lookback 봉+1).
         risk_layer = self._cfg.get("risk_layer") or {}
         want_vol_target = bool(risk_layer.get("target_vol"))
+        # 변동성 적격 게이트(옵셔널, method="score")도 종가 히스토리를 요구한다
+        # (base_lookback+1 봉). 미지정이면 기존대로 히스토리 시딩 없이 선정한다.
+        vol_gate = selection.get("vol_gate") or {}
+        want_vol_gate = bool(vol_gate)
         need_hist = (
             bool(rule.get("type"))
             or method in ("momentum", "custom", "all")
             or weighting == "inverse_vol"
             or want_vol_target
+            or want_vol_gate
         )
         if need_hist:
             min_bars = int(rule.get("lookback", 0)) + 1 if rule.get("type") else 0
@@ -453,6 +458,8 @@ class RebalanceRunner(BaseRunner):
                 min_bars = max(min_bars, 253)
             if want_vol_target:
                 min_bars = max(min_bars, int(risk_layer.get("vol_lookback", 20) or 20) + 1)
+            if want_vol_gate:
+                min_bars = max(min_bars, int(vol_gate.get("base_lookback", 252) or 252) + 1)
             history = await self._seed_history(pool, min_bars=min_bars)
             logger.info("전략 %d 히스토리 시딩 완료: %d종목", self.strategy_id, len(history))
 

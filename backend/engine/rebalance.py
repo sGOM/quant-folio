@@ -13,6 +13,7 @@ import calendar
 import math
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 
 from app.services.market import is_market_open
@@ -39,6 +40,59 @@ def _vol_ann_from_series(series: pd.Series | None) -> float | None:
     if series is None:
         return None
     return _compute_vol_ann(series.dropna().tail(253))
+
+
+def _realized_vol_ann(close: pd.Series, window: int) -> float | None:
+    """최근 window 개 로그수익률의 연율 실현변동성(std × √252). 표본 부족 시 None.
+
+    _compute_vol_ann 과 동일 정의(로그수익률 표본표준편차 × √252)이되, 임의 window 를
+    허용한다(_compute_vol_ann 은 20봉 미만이면 None 을 반환해 단기 룩백에 부적합).
+    """
+    if close is None:
+        return None
+    log_ret = np.log(close / close.shift(1)).dropna()
+    if len(log_ret) < window or window < 2:
+        return None
+    w = log_ret.tail(window)
+    return float(w.std() * math.sqrt(252))
+
+
+def passes_vol_gate(series: pd.Series | None, gate: dict) -> bool:
+    """종가 Series 가 변동성 적격 게이트를 통과하는지 판정한다(미래참조 없음: series 는
+    이미 as_of 시점까지로 잘려 주입된다). 데이터 부족(base_lookback+1 미달)은 불통과.
+
+    :param series: 종목 종가(시간 오름차순). 호출자가 as_of 까지로 슬라이스해 넘긴다.
+    :param gate: VolGate 스키마 dict(spike_lookback/base_lookback/spike_min/cap/require_uptrend).
+    """
+    spike_lookback = int(gate.get("spike_lookback", 20))
+    base_lookback = int(gate.get("base_lookback", 252))
+    spike_min = float(gate.get("spike_min", 1.4))
+    spike_max_raw = gate.get("spike_max")
+    spike_max = float(spike_max_raw) if spike_max_raw is not None else None
+    cap = float(gate.get("cap", 0.90))
+    require_uptrend = bool(gate.get("require_uptrend", True))
+
+    if series is None:
+        return False
+    c = series.dropna()
+    if len(c) < base_lookback + 1:
+        return False  # 데이터 부족 → 보수적으로 불통과
+
+    rv_short = _realized_vol_ann(c, spike_lookback)
+    rv_long = _realized_vol_ann(c, base_lookback)
+    if rv_short is None or rv_long is None or rv_long <= 0:
+        return False
+    if rv_short / rv_long < spike_min:
+        return False
+    if spike_max is not None and rv_short / rv_long > spike_max:
+        return False
+    if rv_short > cap:
+        return False
+    if require_uptrend:
+        sma = float(c.tail(spike_lookback).mean())
+        if float(c.iloc[-1]) <= sma:
+            return False
+    return True
 
 
 def cap_normalize_weights(
@@ -182,6 +236,21 @@ def compute_target_weights(
             for sym in universe
             if sym in scores and scores[sym] is not None and not math.isnan(scores[sym])
         ]
+        # 변동성 적격 게이트(옵셔널): 통과 종목만 후보로 남긴다. price_history 는 as_of
+        # 시점까지로 잘려 주입되므로 미래참조가 없다(호출자 책임: 백테스트=panel.loc[:d],
+        # 실거래=직전 확정 종가까지 시딩). None(미지정) 이면 게이트 없음(기존 동작).
+        gate = selection.get("vol_gate")
+        if gate:
+            candidates = [
+                (sym, sc)
+                for sym, sc in candidates
+                if passes_vol_gate(price_history.get(sym), gate)
+            ]
+        # 점수 하한(옵셔널): 상위 top_n 절단 '전에' 미달 종목을 제외한다. None 이면 필터
+        # 없음(기존 동작). 통과 0개면 selected 가 비어 아래에서 빈 dict(전량 현금) 반환.
+        min_score = selection.get("min_score")
+        if min_score is not None:
+            candidates = [(sym, sc) for sym, sc in candidates if sc >= min_score]
         candidates.sort(key=lambda x: x[1], reverse=True)
         ranked = candidates[:top_n]
         selected = [sym for sym, _ in ranked]

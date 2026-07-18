@@ -346,6 +346,39 @@ class UniverseRule(BaseModel):
     )
 
 
+class VolGate(BaseModel):
+    """절대 변동성 적격 게이트(method="score" 전용, 옵셔널).
+
+    후보 각 종목의 as_of 시점까지 확정 종가만으로 실현변동성을 계산해, 단기 변동성이
+    장기 대비 충분히 '살아있고'(spike_min) 절대 수준이 과하지 않으며(cap) 추세가
+    상방(require_uptrend)인 종목만 통과시킨다. 변동성은 게이트로만 쓰고 정렬 키는
+    기존 종합점수를 그대로 유지한다(변동성으로 정렬하지 않음).
+
+    - RV_short = std(logret, spike_lookback) × √252
+    - RV_long  = std(logret, base_lookback) × √252
+    - 적격: RV_short/RV_long >= spike_min AND (spike_max 설정 시 RV_short/RV_long <= spike_max)
+      AND RV_short <= cap AND (require_uptrend 면 close > SMA(spike_lookback))
+    데이터가 base_lookback+1 봉에 못 미치는 종목은 보수적으로 불통과 처리한다.
+
+    spike_max 를 설정하고 spike_min 을 낮게 잡으면 역방향(변동성 안정 구간만 진입,
+    calm gate)으로도 쓸 수 있다.
+    """
+    spike_lookback: int = Field(default=20, ge=5, le=252, description="단기 실현변동성 룩백(거래일)")
+    base_lookback: int = Field(default=252, ge=5, le=1000, description="장기 기준 실현변동성 룩백(거래일)")
+    spike_min: float = Field(default=1.4, gt=0, le=100, description="RV_short/RV_long 하한")
+    spike_max: float | None = Field(default=None, gt=0, le=100, description="RV_short/RV_long 상한(미설정 시 무제한)")
+    cap: float = Field(default=0.90, gt=0, le=5, description="RV_short(연환산) 절대 상한")
+    require_uptrend: bool = Field(default=True, description="close > SMA(spike_lookback) 요구")
+
+    @model_validator(mode="after")
+    def _check_lookbacks(self):
+        if self.base_lookback < self.spike_lookback:
+            raise ValueError("base_lookback 은 spike_lookback 이상이어야 합니다")
+        if self.spike_max is not None and self.spike_max < self.spike_min:
+            raise ValueError("spike_max 는 spike_min 이상이어야 합니다")
+        return self
+
+
 class RebalanceSelection(BaseModel):
     """리밸런싱 종목 선정 규칙.
 
@@ -380,6 +413,17 @@ class RebalanceSelection(BaseModel):
             "팩터 중립화 축(method=score). size=시가총액 중립화, sector=업종 중립화, "
             "size_sector=둘 다(순수 팩터 노출)."
         ),
+    )
+    # 점수 하한(method="score" 전용, 옵셔널). 지정 시 종합점수가 이 값 미만인 종목은
+    # top_n 절단 전에 후보에서 제외된다(부족분은 현금 대기). None 이면 필터 없음(기존 동작).
+    min_score: float | None = Field(
+        default=None,
+        description="종합점수 하한(method=score). 미달 종목은 선정 제외(현금 대기). None=비활성.",
+    )
+    # 변동성 적격 게이트(method="score" 전용, 옵셔널). None 이면 비활성(기존 동작).
+    vol_gate: VolGate | None = Field(
+        default=None,
+        description="절대 변동성 적격 게이트(method=score). None=비활성.",
     )
     universe_rule: UniverseRule | None = Field(
         default=None,

@@ -356,7 +356,16 @@ def _targets_at(
                 for code, v in fac["vol_ann"].items()
                 if not is_nan(v)
             }
-        weights = compute_target_weights({}, config, scores=scores, vols=vols)
+        # 변동성 적격 게이트(옵셔널)는 종가 시계열을 요구한다. 지정 시에만 as_of(d)
+        # 까지의 종가 패널을 주입해 게이트가 실거래와 동일 판정을 하게 한다(미래참조
+        # 없음: hist=panel.loc[:d]). 미지정이면 기존대로 빈 dict 를 넘겨 불필요한 구성
+        # 비용을 피한다(선정 결과 불변).
+        gate_history = {}
+        if selection.get("vol_gate"):
+            gate_history = {
+                sym: hist[sym].dropna() for sym in universe if sym in hist.columns
+            }
+        weights = compute_target_weights(gate_history, config, scores=scores, vols=vols)
         weights = _apply_risk_caps(
             weights, hist, config.get("risk_layer") or {}, config.get("_sector_map")
         )
