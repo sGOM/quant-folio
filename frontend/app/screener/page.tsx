@@ -32,12 +32,19 @@ export default function ScreenerPage() {
   const [market, setMarket] = useState<MetricMarket>("KOSDAQ");
   const [surge, setSurge] = useState(1.5);
   const [maxDebt, setMaxDebt] = useState(1.5);
+  const [smallcapPct, setSmallcapPct] = useState(0.2);
   const [run, setRun] = useState(0); // 증가 시 재조회 트리거
 
   const q = useQuery({
-    queryKey: ["screener-turnaround", market, surge, maxDebt, run],
+    queryKey: ["screener-turnaround", market, surge, maxDebt, smallcapPct, run],
     queryFn: () =>
-      api.screenTurnaround({ market, surge, max_debt: maxDebt, top_n: 30 }),
+      api.screenTurnaround({
+        market,
+        surge,
+        max_debt: maxDebt,
+        smallcap_pct: smallcapPct,
+        top_n: 30,
+      }),
     enabled: run > 0,
     staleTime: 60_000,
     retry: false,
@@ -53,9 +60,10 @@ export default function ScreenerPage() {
               <TrendingUp className="h-5 w-5" /> 소형주 턴어라운드 스크리너
             </h1>
             <p className="text-sm text-muted-foreground">
-              전 시장을 스캔해 <b>시총 하위 20% · 거래대금 급증 · 부채비율 한도 이하 ·
-              최근 3년 만성적자 제외</b> 필터를 통과한 후보를 발굴합니다. 흑자전환 · 순이익
-              YoY · Piotroski F-Score(OpenDART 재무데이터)로 종합점수를 매깁니다.
+              전 시장을 스캔해 <b>시총 하위 {Math.round(smallcapPct * 100)}% · 거래대금 급증 ·
+              부채비율 한도 이하 · 최근 3년 만성적자 제외</b> 필터를 통과한 후보를 발굴합니다.
+              흑자전환 · 순이익 YoY · Piotroski F-Score(OpenDART 재무데이터)로 종합점수를
+              매깁니다.
             </p>
           </header>
 
@@ -72,6 +80,14 @@ export default function ScreenerPage() {
                   <option key={m} value={m}>{m}</option>
                 ))}
               </select>
+            </label>
+            <label className="flex flex-col gap-1 text-xs">
+              <span className="text-muted-foreground">소형주 판정(시총 하위) %</span>
+              <input
+                type="number" min={5} max={50} step={5} value={Math.round(smallcapPct * 100)}
+                onChange={(e) => setSmallcapPct(Number(e.target.value) / 100)}
+                className="h-9 w-28 rounded-md border bg-background px-2 text-sm"
+              />
             </label>
             <label className="flex flex-col gap-1 text-xs">
               <span className="text-muted-foreground">거래대금 급증 배수 ≥</span>
@@ -113,8 +129,14 @@ export default function ScreenerPage() {
           )}
 
           {q.isError && (
-            <div className="flex items-center gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
-              <AlertCircle className="h-4 w-4" /> 스크리너 조회에 실패했습니다.
+            <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <div>
+                <p className="font-medium">스크리너 조회에 실패했습니다.</p>
+                <p className="mt-0.5 text-xs text-destructive/80">
+                  {q.error instanceof Error ? q.error.message : "알 수 없는 오류입니다."}
+                </p>
+              </div>
             </div>
           )}
 

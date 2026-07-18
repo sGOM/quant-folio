@@ -100,10 +100,15 @@ function engineStatusDesc(loading: boolean, alive?: boolean): string {
   );
 }
 
-/** 실시간 이벤트 로그 한 줄. id 는 안정적인 React key 용 단조 증가 값. */
+/**
+ * 실시간 이벤트 로그 한 줄. id 는 안정적인 React key 용 단조 증가 값.
+ * raw 는 WS 로 수신한 이벤트 페이로드 원문 — 요약(text)에는 side/symbol/qty/price/status
+ * 등 핵심 필드만 담기므로, 상세 진단이 필요하면 접기 UI로 원본 전체를 펼쳐 본다(§16).
+ */
 interface LogEntry {
   id: number;
   text: string;
+  raw: Record<string, unknown>;
 }
 
 /** 실시간 모니터링 라우트. 인증 게이트로 감싼 콘텐츠를 렌더한다. */
@@ -186,7 +191,7 @@ function MonitorContent() {
             ? `주문 ${f(data.status)} ${nameOf(data.symbol as string)}`
             : `${type} ${nameOf(data.symbol as string)}`;
       const id = logSeq.current++;
-      setLog((l) => [{ id, text: `${t}  ${desc}` }, ...l].slice(0, 30));
+      setLog((l) => [{ id, text: `${t}  ${desc}`, raw: data }, ...l].slice(0, 30));
     }
   });
 
@@ -345,12 +350,15 @@ function MonitorContent() {
                 <p className="text-muted-foreground/60">이벤트 대기 중…</p>
               ) : (
                 log.map((l) => (
-                  <div
+                  <details
                     key={l.id}
                     className="animate-fade-in border-b border-border/40 py-1 last:border-0"
                   >
-                    {l.text}
-                  </div>
+                    <summary className="cursor-pointer list-none">{l.text}</summary>
+                    <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1.5 text-[10px] leading-relaxed text-muted-foreground/80">
+                      {JSON.stringify(l.raw, null, 2)}
+                    </pre>
+                  </details>
                 ))
               )}
             </div>
