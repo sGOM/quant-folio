@@ -109,7 +109,9 @@ engine 은 5초마다 `engine:heartbeat` 키를 TTL 15초로 갱신한다
 
 전략(러너) 단위 생존은 별도로 `engine:health:{strategy_id}` 키에 기록된다 —
 마지막 성공 시각·연속 실패 횟수가 담기고, 연속 실패가 임계(3회)에 달하면
-`alert` 이벤트로 사용자에게 경보가 발행된다(`engine/alerts.py`).
+`alert` 이벤트로 사용자에게 경보가 발행된다(`engine/alerts.py`). 발행된 알림은
+`alerts` 테이블에도 영속화돼 미접속 중 유실되지 않으며(`GET /api/alerts` 로 조회),
+읽음 90일·미확인 180일 보존정책으로 worker 가 매일 정리한다.
 
 ---
 

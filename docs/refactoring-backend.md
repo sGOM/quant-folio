@@ -46,7 +46,7 @@ services/metrics/
   __init__.py   # 전 심볼 재노출(기존 import 경로 보존)
   common.py     # 영업일/날짜 변환, JSON-safe 숫자, MDD·변동성, _mkts, _pct_dec
   fetch.py      # _fetch_fundamentals/_market_cap/_price_change/_index_* + 펀더멘털 캐시
-  factors.py    # _winsorize_zscore, _neutralize_size, _compute_stock_scores, compute_universe_scores
+  factors.py    # _winsorize_zscore, _neutralize_size/_neutralize_sector, _compute_stock_scores, compute_universe_scores
   sectors.py    # compute_sectors, _compute_one_sector
   stocks.py     # compute_stocks, _compute_tech_indicators
   names.py      # _build_krx_name_map, _build_name_map

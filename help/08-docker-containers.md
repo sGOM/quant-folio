@@ -88,7 +88,7 @@
 
 ### worker — Celery 배치
 
-- **하는 일**: 무거운/주기적 배치 작업. 헬스체크(`ping`) 외에 **beat 스케줄 3개**가
+- **하는 일**: 무거운/주기적 배치 작업. 헬스체크(`ping`) 외에 **beat 스케줄 6개**가
   등록돼 있다 (`worker/celery_app.py` 의 `beat_schedule`, 구현은 `worker/tasks.py`):
 
   | 태스크 | 주기 | 하는 일 |
@@ -96,6 +96,9 @@
   | `ingest_daily_ohlcv` | 매일 18:30 | 장 마감·시세 확정 후 당일 일봉을 `price_ticks` 에 적재 |
   | `check_fill_quality_drift` | 매주 월 09:00 | 체결 품질(슬리피지 실측) 드리프트 정기 점검 |
   | `snapshot_sector_map` | 분기 1회(1/4/7/10월 1일 19:00) | 업종분류를 `sector_map_snapshots` 에 적재(섹터 캡 PIT화) |
+  | `backup_database` | 매일 03:00 | `pg_dump` 압축 백업 + 보존기간 관리(`docs/db-backup.md`) |
+  | `check_backup_freshness` | 매일 09:00 | 백업 성공 기록 신선도 점검 — worker/beat 침묵 사망 감지 |
+  | `cleanup_old_alerts` | 매일 04:00 | `alerts` 보존정책 정리(읽음 90일·미확인 180일 초과 삭제) |
 
 - **커맨드**: `celery -A worker.celery_app.celery_app worker --loglevel=info -B`
   — `-B` 가 beat 스케줄러를 워커 프로세스에 **내장**한다(별도 beat 컨테이너 없음).
