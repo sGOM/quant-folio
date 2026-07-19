@@ -318,6 +318,51 @@ class SectorMapSnapshot(Base):
     )
 
 
+# ─────────────────────────── news_articles ───────────────────────────
+class NewsArticle(Base):
+    """경제 뉴스 기사(docs/ROADMAP.md M3 — 수집·요약·종목 연계).
+
+    언론사 RSS(worker.ingest_news, 주기 배치)에서 수집한 기사 메타데이터를 적재한다.
+    본문 전재가 아닌 **요약+원문 링크** 방식으로만 표시한다(출처 약관 준수). url 을
+    유니크 키로 삼아 재수집 시 중복 삽입을 막는다. 요약은 현재 RSS description 기반
+    추출 요약이며, 생성 수단은 교체 가능하도록 서비스(app/services/news.py)에 격리한다.
+    """
+    __tablename__ = "news_articles"
+    __table_args__ = (
+        UniqueConstraint("url", name="uq_news_articles_url"),
+        Index("ix_news_articles_published", "published_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(50), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    url: Mapped[str] = mapped_column(String(1000), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class NewsArticleSymbol(Base):
+    """기사 ↔ 종목 매핑(제목·요약의 종목명 언급 기반, app/services/news.py::match_symbols).
+
+    종목 상세/스크리너에서 "이 종목의 관련 기사"를 조회하는 역인덱스. (symbol,
+    article_id) 복합 인덱스가 그 조회 경로를 담당한다.
+    """
+    __tablename__ = "news_article_symbols"
+    __table_args__ = (
+        UniqueConstraint("article_id", "symbol", name="uq_news_article_symbols"),
+        Index("ix_news_article_symbols_symbol_article", "symbol", "article_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    article_id: Mapped[int] = mapped_column(
+        ForeignKey("news_articles.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+
+
 # ─────────────────────────── risk_limits ───────────────────────────
 class RiskLimit(Base):
     __tablename__ = "risk_limits"
