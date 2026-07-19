@@ -4,6 +4,8 @@ from app.models.models import (
     Alert,
     Backtest,
     Execution,
+    NewsArticle,
+    NewsArticleSymbol,
     Order,
     OrderSide,
     OrderStatus,
@@ -33,4 +35,6 @@ __all__ = [
     "RiskLimit",
     "SectorMapSnapshot",
     "Alert",
+    "NewsArticle",
+    "NewsArticleSymbol",
 ]

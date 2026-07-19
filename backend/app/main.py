@@ -15,6 +15,7 @@ from app.api.routes import (
     fill_quality,
     kis,
     metrics,
+    news,
     recommend,
     screener,
     strategies,
@@ -101,6 +102,7 @@ app.include_router(metrics.router)
 app.include_router(recommend.router)
 app.include_router(screener.router)
 app.include_router(alerts.router)
+app.include_router(news.router)
 app.include_router(ws.router)
 
 

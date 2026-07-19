@@ -14,6 +14,7 @@ import {
   BarChart3,
   TrendingUp,
   Sparkles,
+  Newspaper,
 } from "lucide-react";
 import { useLogout } from "@/lib/useAuth";
 import { GlossaryDrawer } from "@/components/GlossaryDrawer";
@@ -29,6 +30,7 @@ const LINKS = [
   { href: "/metrics", label: "지표", icon: BarChart3 },
   { href: "/recommend", label: "추천", icon: Sparkles },
   { href: "/screener", label: "스크리너", icon: TrendingUp },
+  { href: "/news", label: "뉴스", icon: Newspaper },
   { href: "/settings", label: "설정", icon: Settings },
 ];
 

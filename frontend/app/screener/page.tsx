@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 import { AlertCircle, Search, TrendingUp } from "lucide-react";
 import { api, type MetricMarket, type TurnaroundCandidate } from "@/lib/api";
@@ -174,7 +175,14 @@ export default function ScreenerPage() {
                         <td>
                           <div className="font-medium">{c.name}</div>
                           <div className="text-[11px] text-muted-foreground">
-                            {c.code} · {c.market}
+                            {c.code} · {c.market} ·{" "}
+                            <Link
+                              href={`/news?symbol=${c.code}`}
+                              className="hover:text-primary hover:underline"
+                              title="이 종목의 관련 기사 보기"
+                            >
+                              뉴스
+                            </Link>
                           </div>
                         </td>
                         <td className="text-right tabular-nums">{fmtAmt(c.market_cap)}</td>
