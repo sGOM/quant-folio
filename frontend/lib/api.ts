@@ -948,6 +948,26 @@ export function markAllAlertsRead(): Promise<{ updated: number }> {
   return request<{ updated: number }>(`/api/alerts/read-all`, { method: "POST" });
 }
 
+/** GET /api/news 응답 항목 — 수집된 경제 기사(요약+원문 링크, ROADMAP M3). */
+export interface NewsItem {
+  id: number;
+  /** 출처 매체명(예: "연합뉴스 경제"). */
+  source: string;
+  title: string;
+  /** 원문 링크(새 탭으로 연다 — 본문은 전재하지 않는다). */
+  url: string;
+  /** 추출 요약. 제목과 중복이면 null. */
+  summary: string | null;
+  published_at: string;
+  /** 기사에 언급된 종목코드 목록(종목명 매칭 기반). */
+  symbols: string[];
+}
+
+export interface NewsListOut {
+  items: NewsItem[];
+  has_more: boolean;
+}
+
 /** 전략 러너 1개의 헬스 상태(백엔드 /api/engine/strategies/health 응답 항목). */
 export interface StrategyHealth {
   strategy_id: number;
@@ -1460,6 +1480,29 @@ export const api = {
 
   /** 종목코드 → 한글명 전체 매핑(체결/주문 로그에 종목명 표시용). */
   symbolNames: () => request<Record<string, string>>("/api/symbols/names"),
+
+  // --- 경제 뉴스(ROADMAP M3) ---
+  /**
+   * 수집된 경제 기사 목록(발행시각 내림차순).
+   * @param filters.symbol    지정하면 그 종목의 관련 기사만 반환
+   * @param filters.q         제목 검색어(부분일치)
+   * @param filters.dateFrom  발행일 시작(YYYY-MM-DD, KST 기준 포함)
+   * @param filters.dateTo    발행일 끝(YYYY-MM-DD, KST 기준 포함)
+   * @param limit  페이지 크기(기본 30)
+   * @param offset 페이지 오프셋
+   */
+  listNews: (
+    filters: { symbol?: string; q?: string; dateFrom?: string; dateTo?: string },
+    limit = 30,
+    offset = 0,
+  ) => {
+    const sp = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (filters.symbol) sp.set("symbol", filters.symbol);
+    if (filters.q) sp.set("q", filters.q);
+    if (filters.dateFrom) sp.set("date_from", filters.dateFrom);
+    if (filters.dateTo) sp.set("date_to", filters.dateTo);
+    return request<NewsListOut>(`/api/news?${sp.toString()}`);
+  },
 
   // --- 지표(섹터/종목 스냅샷) ---
   /**
