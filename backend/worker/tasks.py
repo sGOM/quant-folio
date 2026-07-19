@@ -17,6 +17,27 @@ from worker.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
+
+def _run_async(coro):
+    """비동기 태스크 본체를 실행하고 종료 직전 DB 커넥션 풀을 비운다.
+
+    asyncio.run 은 태스크마다 새 이벤트루프를 만들고 닫는데, 전역 SQLAlchemy 엔진의
+    풀에는 직전 루프에 묶인 커넥션이 남는다. 다음 태스크(새 루프)가 그 커넥션을
+    재사용하면 "Future attached to a different loop" 로 죽는다 — 워커 프로세스에서
+    두 번째 이후 실행부터 터지는 잠복 버그. 루프가 닫히기 전에 dispose 로 풀을
+    비워 매 실행이 제 루프의 새 커넥션을 열게 한다.
+    """
+
+    async def _wrapped():
+        try:
+            return await coro
+        finally:
+            from app.core.database import engine
+
+            await engine.dispose()
+
+    return asyncio.run(_wrapped())
+
 # 팩터 워밍업(모멘텀·52주고가·변동성)에 필요한 만큼 과거까지 커버한다.
 _LOOKBACK_DAYS = 500
 
@@ -81,7 +102,7 @@ def ingest_daily_ohlcv() -> dict:
     각 종목은 로컬에 이미 있는 만큼은 건너뛰고 부족분(신규 종목 전체 또는 최근 며칠)만
     외부 소스(FDR/pykrx)로 보충한다 — 매일 실행해도 가벼운 이유.
     """
-    return asyncio.run(_ingest_daily_ohlcv_async())
+    return _run_async(_ingest_daily_ohlcv_async())
 
 
 # 체결 정합(fill quality) 정기 점검(B-2) — 최근 며칠간 창.
@@ -193,7 +214,7 @@ def check_fill_quality_drift() -> dict:
     발행한다(critical 이 아니므로 텔레그램 발송은 안 되고 앱 내 WS 알림만 — B-1 참고).
     표본 부족(min_sample 미만)이면 등급이 INSUFFICIENT 라 자연히 알림이 발화하지 않는다.
     """
-    return asyncio.run(_check_fill_quality_drift_async())
+    return _run_async(_check_fill_quality_drift_async())
 
 
 async def _snapshot_sector_map_async() -> dict:
@@ -223,7 +244,7 @@ def snapshot_sector_map() -> dict:
     구간의 소급 적용은 데이터 소스 부재로 여전히 불가능(문서화된 잔존 한계).
     같은 분기에 이미 스냅샷이 있으면 멱등하게 스킵한다(snapshot_sector_map 내부 정책).
     """
-    return asyncio.run(_snapshot_sector_map_async())
+    return _run_async(_snapshot_sector_map_async())
 
 
 # DB 백업(E-2) — 저장 위치·보존기간. worker 컨테이너에 마운트된 named volume(db_backups)에
@@ -391,7 +412,7 @@ def backup_database() -> dict:
     스토리지에도 업로드한다(서버 디스크 손상 대비). 업로드 실패는 warning 알림만 발행하고
     태스크는 ok=True 로 정상 종료한다(로컬 백업 자체는 이미 성공했으므로).
     """
-    return asyncio.run(_backup_database_async())
+    return _run_async(_backup_database_async())
 
 
 # 백업 신선도 감시(docs/improvements.md §9) — backup:last_success_at 를 아무도 읽지
@@ -443,7 +464,7 @@ def check_backup_freshness() -> dict:
     알림을 발행하므로, 이 태스크가 잡는 것은 그보다 상위의 침묵 실패(worker 프로세스 사망,
     beat 스케줄러 중단 등 backup_database 가 아예 실행되지 못하는 경우)다.
     """
-    return asyncio.run(_check_backup_freshness_async())
+    return _run_async(_check_backup_freshness_async())
 
 
 # alerts 테이블 보존정책(§21) — §17로 모든 publish_alert 가 영속화되기 시작했는데 정리
@@ -486,7 +507,7 @@ def cleanup_old_alerts() -> dict:
     아직 못 봤을 수 있는 미확인 알림을 더 오래 보존한다. §17 도입 이후 정리 경로가
     없어 테이블이 무한 증식하던 것을 해소한다.
     """
-    return asyncio.run(_cleanup_old_alerts_async())
+    return _run_async(_cleanup_old_alerts_async())
 
 
 # ─────────────────────────── 경제 뉴스 수집 (ROADMAP M3) ───────────────────────────
@@ -530,4 +551,4 @@ def ingest_news() -> dict:
     url 유니크 기준 멱등이라 재실행에 안전하다. 적재와 함께 보존기간(60일)이 지난
     기사를 정리하고, 전체 피드 실패 시 전역 warning 알림을 발행한다.
     """
-    return asyncio.run(_ingest_news_async())
+    return _run_async(_ingest_news_async())
