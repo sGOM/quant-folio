@@ -318,8 +318,18 @@ factors.py::_neutralize_sector`를 신설 — `_neutralize_size`(연속축 OLS �
 select 에도 "업종 중립화"/"시가총액 + 업종 중립화" 옵션을 추가.
 
 `_neutralize_sector`(그룹평균 제거·NaN 보존·단독섹터 보존 3건)의 유닛테스트를
-`tests/test_quality_factor.py`에 추가, 전체 pytest(422건) 통과 확인. id=23 PIT
-A/B(업종 쏠림 분리 효과 판정)는 코드는 완료됐고 리서치는 후속(남은 과제 참고).
+`tests/test_quality_factor.py`에 추가, 전체 pytest(422건) 통과 확인.
+
+**id=23 PIT A/B 판정(2026-07-19, `scripts/validate_sector_neutralize_ab.py`) —
+"현행(neutralize 미적용) 유지"로 종결**: base vs `"sector"` vs `"size_sector"`,
+반기 2-fold + FULL, 방어형 규약(alpha/Sharpe). `"sector"`는 H2·FULL에서 근소
+우위(FULL Sharpe 1.07 vs 1.04, alpha +19.6% vs +19.3%)였지만 H1(횡보·하락장)에서
+알파가 소멸(−0.2% vs +1.4%, Sharpe −0.11 vs 0.02)해 양 반기 우위 실패 — 혼재.
+`"size_sector"`는 FULL 포함 전면 열위. 해석: id=23의 업종 쏠림은 제거해야 할
+왜곡이 아니라 방어 구간 알파의 원천 일부(저변동 팩터가 특정 업종에 자연 편중)로,
+demean 이 이를 깎아냈다. 등록 config 변경 없음. 한계: `sector_map_snapshots`가
+아직 비어 있어 전 구간이 현재 KRX 분류 폴백(C-2)으로 돌았다 — 스냅샷이 수년치
+쌓인 뒤에도 결론이 뒤집힐 가능성은 낮지만(분류 변경은 드묾) 참고.
 
 ## 21. alerts 테이블 보존정책·반복 알림 억제 부재 (§17 운영 후속) ✅
 
