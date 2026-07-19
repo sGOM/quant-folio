@@ -55,6 +55,13 @@ celery_app.conf.beat_schedule = {
         "task": "worker.check_backup_freshness",
         "schedule": crontab(hour=9, minute=0),
     },
+    # 경제 뉴스 수집(ROADMAP M3) — 시간별. RSS 는 최근 기사만 내려주므로 이보다 성기면
+    # 기사가 유실되고, url 멱등이라 촘촘해도 무해하다. 다른 배치와 겹치지 않게 분(分)만
+    # 비켜 둔다.
+    "ingest-news-hourly": {
+        "task": "worker.ingest_news",
+        "schedule": crontab(minute=10),
+    },
     # alerts 테이블 보존정책 정리(§21) — §17 도입 이후 정리 경로가 없어 무한 증식하던
     # 것을 해소. 야간 백업(03:00)과 겹치지 않는 시간대에 실행.
     "cleanup-old-alerts": {

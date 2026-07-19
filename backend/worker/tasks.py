@@ -487,3 +487,47 @@ def cleanup_old_alerts() -> dict:
     없어 테이블이 무한 증식하던 것을 해소한다.
     """
     return asyncio.run(_cleanup_old_alerts_async())
+
+
+# ─────────────────────────── 경제 뉴스 수집 (ROADMAP M3) ───────────────────────────
+async def _ingest_news_async() -> dict:
+    from redis.asyncio import Redis
+
+    from app.core.config import settings
+    from app.core.database import AsyncSessionLocal
+    from app.services.news import FEEDS, ingest_news, purge_old_news
+
+    async with AsyncSessionLocal() as db:
+        result = await ingest_news(db)
+        result["purged"] = await purge_old_news(db)
+
+    # 전체 피드가 실패하면 수집 파이프라인 자체가 죽은 것 — 완료 기준(ROADMAP M3)에
+    # 따라 알림으로 감지한다. 개별 피드의 일시 장애는 흔해 알리지 않는다.
+    if FEEDS and result["feeds_ok"] == 0:
+        from engine.alerts import publish_alert
+
+        redis = Redis.from_url(settings.REDIS_URL)
+        try:
+            await publish_alert(
+                redis, user_id=None, strategy_id=0, severity="warning",
+                message=(
+                    "경제 뉴스 수집이 전체 실패했습니다(모든 피드 응답 없음). "
+                    "네트워크 또는 피드 URL(app/services/news.py::FEEDS)을 확인하세요."
+                ),
+                code="news_ingest_failure",
+                dedup_window_hours=6.0,  # 시간별 배치라 원인 해소 전 반복 발행 억제
+            )
+        finally:
+            await redis.aclose()
+
+    return result
+
+
+@celery_app.task(name="worker.ingest_news")
+def ingest_news() -> dict:
+    """언론사 RSS 에서 경제 기사를 수집해 news_articles 에 적재한다(M3, 시간별 배치).
+
+    url 유니크 기준 멱등이라 재실행에 안전하다. 적재와 함께 보존기간(60일)이 지난
+    기사를 정리하고, 전체 피드 실패 시 전역 warning 알림을 발행한다.
+    """
+    return asyncio.run(_ingest_news_async())
