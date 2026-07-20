@@ -533,6 +533,20 @@ Exception: qmetrics = {}`) 등 순수 로직 경로가 실제로 정확히 동�
 KRX/OpenDART 헬퍼는 `app.services.recommend` 네임스페이스에 바인딩된 이름을
 대역화해 네트워크 없이 검증했다.
 
+## 30. `app/api/routes/ws.py` 실시간 이벤트 중계 테스트 커버리지 0 해소 ✅
+
+`_relay`/`_drain` 태스크 경합 종료·`pubsub.unsubscribe`/`aclose` 정리 로직에
+테스트가 없었다(§신규발굴 4차 3위, 낮은 확신도). 코드 자체가 짧고 이미
+방어적으로 작성돼 있어(`FIRST_COMPLETED`로 양쪽 정리, `WebSocketDisconnect`
+무시) 실제 버그 발견 가능성은 낮았으나, 인증 실패 시 close(4401)·정상 중계·
+연결 종료 시 pubsub 자원 정리라는 핵심 계약은 검증해 둘 가치가 있었다.
+`test_ws_events.py` 신설(3건 — 미인증 연결이 4401로 닫힘, 정상 인증 시
+connected 메시지 후 pubsub 이벤트 중계와 종료 시 unsubscribe/aclose 확인,
+JSON 파싱 실패 메시지는 건너뛰고 다음 정상 메시지만 전달). 실 Redis 없이
+`redis_client.pubsub()`·`_authenticate`를 대역화하고 `TestClient.
+websocket_connect`로 검증했다. 사전 우려와 달리 실제 버그는 발견되지
+않았다 — 순수 커버리지 확충 성격.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |
