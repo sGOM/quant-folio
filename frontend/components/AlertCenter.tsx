@@ -42,6 +42,7 @@ const CODE_LABEL: Record<string, string> = {
   live_gate_blocked: "실전 전환 게이트 차단",
   sector_map_outage: "업종분류 스냅샷 적재 실패",
   alert_cleanup_failed: "알림 보존정책 정리 실패",
+  price_feed_outage: "실시간 시세 WS 재연결 실패",
 };
 
 /**

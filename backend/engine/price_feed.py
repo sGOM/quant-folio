@@ -12,6 +12,8 @@ from decimal import Decimal
 
 from redis.asyncio import Redis
 
+from app.core.channels import FAILURE_ALERT_THRESHOLD
+from engine.alerts import publish_alert
 from engine.kis_ws import KisWebSocketClient
 
 logger = logging.getLogger("engine.price_feed")
@@ -25,6 +27,7 @@ class PriceFeedManager:
     def __init__(self, redis: Redis):
         self.redis = redis
         self._feeds: dict[int, dict] = {}  # user_id -> {task, stop, symbols}
+        self._fail_counts: dict[int, int] = {}  # user_id -> 연속 재연결 실패 횟수
 
     async def ensure(
         self, user_id: int, app_key: str, app_secret: str, symbols: set[str]
@@ -47,14 +50,19 @@ class PriceFeedManager:
             await self.redis.set(f"price:{sym}", str(price), ex=_PRICE_TTL)
 
         client = KisWebSocketClient(app_key, app_secret, on_price)
-        task = asyncio.create_task(self._supervise(client, list(symbols), stop))
+        task = asyncio.create_task(self._supervise(user_id, client, list(symbols), stop))
         self._feeds[user_id] = {"task": task, "stop": stop, "symbols": set(symbols)}
         logger.info("PriceFeed 시작 user=%d symbols=%s", user_id, sorted(symbols))
 
     async def _supervise(
-        self, client: KisWebSocketClient, symbols: list[str], stop: asyncio.Event
+        self, user_id: int, client: KisWebSocketClient, symbols: list[str], stop: asyncio.Event
     ) -> None:
-        """WS 연결을 감독하며 끊기면 재연결한다(오류 시 지수 백오프, 취소는 전파)."""
+        """WS 연결을 감독하며 끊기면 재연결한다(오류 시 지수 백오프, 취소는 전파).
+
+        REST 폴백이 있어 매매 자체는 죽지 않지만, 연속 재연결 실패가 임계치를 넘으면
+        실시간성이 조용히 저하된 채(최대 120초 백오프) 방치될 수 있어 1회 경보한다
+        (_reconcile_loop/_fill_notice_loop 와 같은 임계-교차 1회 발행 패턴, §23).
+        """
         backoff = 5        # 현재 대기 시간(초)
         max_backoff = 120  # 백오프 상한(초)
         while not stop.is_set():
@@ -62,12 +70,26 @@ class PriceFeedManager:
                 await client.run(symbols, stop)
                 # 정상 반환(연결 종료) — busy-retry 방지를 위해 짧게 대기 후 재연결.
                 wait = backoff if stop.is_set() else 3
+                self._fail_counts[user_id] = 0
             except asyncio.CancelledError:
                 raise  # 취소는 그대로 전파(정리 경로 보존)
             except Exception as e:  # noqa: BLE001
                 logger.warning("PriceFeed WS 오류, %ds 후 재연결: %s", backoff, e)
                 wait = backoff
                 backoff = min(backoff * 2, max_backoff)  # 지수 백오프
+                fail_count = self._fail_counts.get(user_id, 0) + 1
+                self._fail_counts[user_id] = fail_count
+                if fail_count == FAILURE_ALERT_THRESHOLD:
+                    await publish_alert(
+                        self.redis, user_id=user_id, strategy_id=0, severity="warning",
+                        code="price_feed_outage",
+                        message=(
+                            f"실시간 시세 WS 연속 {fail_count}회 재연결 실패 — "
+                            f"REST 폴백으로 매매는 지속되나 시세 반영이 지연될 수 있음. "
+                            f"마지막 원인: {e}"
+                        ),
+                        dedup_window_hours=6.0,
+                    )
             else:
                 backoff = 5  # 정상 종료면 백오프 리셋
             try:
@@ -77,6 +99,7 @@ class PriceFeedManager:
 
     async def remove(self, user_id: int) -> None:
         """사용자의 시세 피드를 중지·정리한다(없으면 무시)."""
+        self._fail_counts.pop(user_id, None)
         feed = self._feeds.pop(user_id, None)
         if not feed:
             return
