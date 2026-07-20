@@ -158,4 +158,12 @@ describe("formatRelativeTime", () => {
     const iso = new Date(NOW - 2 * 86_400_000).toISOString();
     expect(formatRelativeTime(iso)).toBe("2일 전");
   });
+
+  it("미래 시각(서버-클라이언트 시계 오차 등)은 '곧'을 반환한다", () => {
+    // diffSec<5 분기가 먼저면 음수도 걸려 이 분기가 죽은 코드가 되던 버그(전체
+    // 코드 버그 검사에서 발견) — 순서 수정 후 실제로 "곧"이 반환되는지 확인.
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const iso = new Date(NOW + 10_000).toISOString();
+    expect(formatRelativeTime(iso)).toBe("곧");
+  });
 });

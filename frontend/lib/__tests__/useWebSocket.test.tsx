@@ -127,4 +127,23 @@ describe("useEventSocket", () => {
     // 언마운트 후에는 새 소켓이 생기지 않아야 한다.
     expect(MockWebSocket.instances).toHaveLength(1);
   });
+
+  it("여러 컴포넌트가 동시에 구독해도 소켓은 1개만 유지한다(전체 코드 버그 검사에서 발견 — AlertCenter·모니터링 페이지가 각자 소켓을 열던 문제)", () => {
+    const onA = vi.fn();
+    const onB = vi.fn();
+    const a = renderHook(() => useEventSocket(onA));
+    const b = renderHook(() => useEventSocket(onB));
+
+    expect(MockWebSocket.instances).toHaveLength(1); // 소켓은 하나만 생성됨
+
+    MockWebSocket.instances[0].simulateMessage({ type: "fill" });
+    expect(onA).toHaveBeenCalledWith({ type: "fill" });
+    expect(onB).toHaveBeenCalledWith({ type: "fill" }); // 두 구독자 모두 같은 이벤트를 받는다
+
+    a.unmount();
+    expect(MockWebSocket.instances[0].closeCalls).toBe(0); // 구독자가 남아 있으면 소켓을 닫지 않는다
+
+    b.unmount();
+    expect(MockWebSocket.instances[0].closeCalls).toBe(1); // 마지막 구독자가 사라지면 닫는다
+  });
 });
