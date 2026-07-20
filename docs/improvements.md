@@ -372,6 +372,40 @@ docstring·"한계" 절도 갱신해 잔존 한계(지문 없는 이력이 섞�
 
 ---
 
+## 신규 발굴 (2026-07-20 재점검, §23)
+
+발굴 근거: §21 alerts 프론트 연동 완료 직후 재점검 — 남은 과제 4개가 전부 외부
+자원(실계정·운영DB·자격증명·장기 운영이력) 필요로 코드 작업이 막혀, 코드베이스
+전반(엔진 상시 루프·alerts 신규 로직·§21 방금 만든 API 응답)을 다시 훑어 코드만으로
+완결 가능한 후보를 찾았다.
+
+## 23. 엔진 상시 루프 무알림·alerts 회귀 방어 공백·has_more 추정 제거 ✅
+
+**상시 루프 무알림**: `engine/main.py::_reconcile_loop`(미체결 주문 재조회, 60초
+주기)·`_fill_notice_loop`(체결통보 구독 재동기화, 60초 주기)가 예외를 로그만 남기고
+삼킨 채 다음 주기에 재시도해, 연속 실패가 며칠 지속돼도 알림이 없었다(`_reconcile_loop`가
+죽으면 미체결 주문이 영원히 SUBMITTED로 남는 금전 리스크). `base_runner.py`의 러너별
+연속 실패 알림 패턴(임계 도달 '순간'에만 1회 발행, 성공 시 리셋, `FAILURE_ALERT_THRESHOLD`
+공유)을 이 두 전역 루프에도 이식했다. 전역 루프라 특정 사용자를 특정할 수 없어
+`user_id=None, strategy_id=0`(`worker/tasks.py`의 `db_backup_failed` 등과 동일한
+sentinel 관례)로 `critical` 알림을 발행한다.
+
+**alerts 신규 로직(§17/§21) 테스트 공백**: `publish_alert`의 `dedup_window_hours`
+DB dedup, `worker/tasks.py::cleanup_old_alerts`(읽음 90일/미읽음 180일 분리 삭제
+보존정책), `app/api/routes/alerts.py`(목록·읽음처리·offset 페이지네이션) 모두 유닛테스트가
+0건이었다. `tests/test_alerts_dedup.py`(dedup 스킵/삽입/window 미지정 3건)·
+`tests/test_alerts_cleanup.py`(보존정책 분리 삭제 2건 — 실제 delete() 문의 WHERE 절을
+SQLAlchemy 내부 평가기 `sqlalchemy.orm.evaluator._EvaluatorCompiler`로 정확히 평가해
+재구현 오차 없이 검증)·`tests/test_alerts_route.py`(has_more 계산 3건·확인처리 소유권
+4건·전체확인 1건) 신설, 총 13건 추가. 전체 pytest 460건 통과(로컬 환경엔 FinanceDataReader
+미설치로 무관한 기존 2건만 격리 실패).
+
+**`GET /api/alerts` has_more 추정 제거**: 방금 만든 §21 프론트 "더보기"가 "마지막
+페이지 길이==limit"이라는 추정 휴리스틱을 썼는데, 라우트가 `limit+1`건을 조회해
+초과분 존재로 `has_more`를 정확히 계산하도록 바꿨다(`AlertListOut.has_more` 필드
+추가). `frontend/lib/api.ts::AlertListOut`·`AlertCenter.tsx`의 `getNextPageParam`도
+추정 로직 대신 이 필드를 그대로 쓰도록 갱신.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |
