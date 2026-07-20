@@ -928,6 +928,7 @@ export interface AlertRecord {
 export interface AlertListOut {
   items: AlertRecord[];
   unread_count: number;
+  has_more: boolean;
 }
 
 /** 본인 + 전역(user_id=NULL) 알림 목록(최신순). offset으로 이전 이력을 더 조회한다(§21). */
