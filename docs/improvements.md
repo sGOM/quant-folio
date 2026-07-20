@@ -446,6 +446,30 @@ variant, 발동일·쿨다운 재가동 안내 툴팁)를 붙였다. `tests/test
 sentinel 관례를 두 곳에 이식했다 — 코드(`sector_map_outage`)는 warning,
 alerts 정리 실패(`alert_cleanup_failed`)도 warning.
 
+## 신규 발굴 (2026-07-20 재점검, §25)
+
+발굴 근거: §24 완료 직후 4번째 재점검 — alerts/engine 루프/MDD/reconcile/has_more(§1~24)는
+제외하고 새 각도(alerts 이외 화면의 백엔드 노출 공백, Celery beat 태스크, WS 이벤트 처리,
+risk_layer 배선, 팩터 IC/IR 노출, KIS 연동 에러 처리, 테스트 커버리지)를 훑었다. Celery
+beat 전체 태스크·WS 이벤트 타입·팩터 IC 노출·risk_layer 배선은 이미 해소되어 있었고,
+실시간 시세 WS(`engine/price_feed.py`/`engine/kis_ws.py`)와 KIS REST 클라이언트에서
+새 공백 3건(§25~27, 별도 PR로 순차 진행)을 찾았다.
+
+## 25. 실시간 시세 WS 재연결 실패 무알림 해소 ✅
+
+`PriceFeedManager._supervise`는 KIS 실시간 시세 WS 연결이 끊기면 지수 백오프
+(최대 120초)로 재연결을 시도하지만, 반복 실패해도(앱키 만료, KIS 측 장애 등)
+로그 경고만 남기고 알림이 없었다. 러너는 `price:{symbol}` 캐시가 없으면 REST 로
+폴백해 매매 자체는 죽지 않지만, 실시간성이 조용히 저하된 채 장시간 방치될 수
+있었다. `_reconcile_loop`/`_fill_notice_loop`(§23)와 동일한 임계-교차 1회 알림
+패턴(`FAILURE_ALERT_THRESHOLD`)을 사용자별로 적용 — `PriceFeedManager`에
+`_fail_counts: dict[user_id, int]`를 추가해 성공 시 리셋, 연속 실패가 임계치에
+닿는 순간에만 `publish_alert(user_id=<해당 사용자>, code="price_feed_outage",
+severity="warning", dedup_window_hours=6.0)`을 발행한다(사용자별 피드라 시스템
+sentinel(`user_id=None`)이 아닌 실제 user_id 사용 — WS 토스트도 정상 전달됨).
+`test_price_feed.py` 신설(4건 — 임계 교차 시 정확히 1회 알림, 임계 미달 무알림,
+성공 시 카운터 리셋). 이전까지 이 모듈은 테스트 0건이었다.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |

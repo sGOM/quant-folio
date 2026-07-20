@@ -910,7 +910,8 @@ export type AlertCode =
   | "db_backup_s3_upload_failed"
   | "live_gate_blocked"
   | "sector_map_outage"
-  | "alert_cleanup_failed";
+  | "alert_cleanup_failed"
+  | "price_feed_outage";
 
 /** 알림 심각도. critical=파국/치명, warning=주의(자동 폴백 등). */
 export type AlertSeverity = "warning" | "critical";
