@@ -479,6 +479,21 @@ tr_id·0가·파싱 불가 가격). 실제 WS 연결(`run`/`issue_approval_key`)
 네트워크가 필요해 이 스위트 범위 밖 — `_handle`처럼 네트워크 없이 검증
 가능한 순수 로직만 다룬다.
 
+## 27. KIS REST 유량제한 재시도가 시세 조회에만 있던 비대칭 해소 ✅
+
+`app/services/kis/client.py::KisClient`는 EGW00201(유량제한) 재시도를
+`get_current_price`에만 갖고 있었고, `place_order`/`get_order_execution`/
+`get_balance`는 `rt_cd != "0"`이면 즉시 실패했다(§신규발굴 3차 3위 — 애초
+"낮은 확신도"로 올렸으나 실제 코드를 보니 진짜 비대칭이었다). 전역
+throttle(`_RateLimiter`)로도 못 막는 교차 프로세스(web·engine·worker 동시
+접근) 경합에서 이 세 호출도 EGW00201 을 맞을 수 있는데, 주문·체결조회·
+잔고조회 실패는 시세 조회 실패보다 파급(미체결 오판, reconcile 오탐 등)이
+크다. HTTP/`rt_cd` 검증과 재시도 로직을 `_request_json` 공통 헬퍼로 추출해
+네 메서드 모두 동일한 보호를 받도록 통일했다. `test_kis_client.py` 신설
+(5건 — 재시도 없이 성공, 재시도 후 성공, 재시도 소진 후 실패, 비유량제한
+오류는 즉시 실패, get_balance 배선 확인). 이전까지 `KisClient`의 HTTP
+경로는 테스트 0건이었다.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |

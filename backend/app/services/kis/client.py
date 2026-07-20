@@ -169,22 +169,25 @@ class KisClient:
             "custtype": "P",
         }
 
-    async def get_current_price(self, symbol: str) -> dict:
-        """국내주식 현재가 시세 조회 (FHKST01010100).
+    async def _request_json(
+        self, method: str, url: str, *, headers: dict, err_label: str,
+        params: dict | None = None, json: dict | None = None,
+    ) -> dict:
+        """공통 KIS REST 호출 — HTTP/`rt_cd` 오류를 KisError 로 정규화하고,
+        유량제한(EGW00201)이면 짧은 백오프로 몇 회 재시도한다.
 
-        연속 조회(리밸런싱 등)는 전역 throttle 로 초당 한도를 지키지만, 교차 프로세스
-        경합으로 여전히 EGW00201 이 뜰 수 있어 짧은 백오프로 몇 회 재시도한다.
+        원래 시세 조회(get_current_price)에만 있던 재시도를 주문·체결조회·잔고조회에도
+        적용한 공통 경로 — 전역 throttle 로도 못 막는 교차 프로세스(web·engine·worker
+        동시 접근) 경합에서 이 엔드포인트들도 EGW00201 을 맞을 수 있는데, 재시도가
+        없으면 주문·체결·잔고 확인이 실패해 시세 조회보다 파급이 크다.
         """
-        url = f"{self._base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
-        params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol}
         last_exc: Exception | None = None
         for attempt in range(_RATE_RETRY):
             await self._throttle()
-            headers = await self._auth_headers("FHKST01010100")
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url, headers=headers, params=params)
+                resp = await client.request(method, url, headers=headers, params=params, json=json)
             if resp.status_code != 200:
-                exc = KisError(f"시세 조회 실패: HTTP {resp.status_code} {resp.text[:200]}")
+                exc = KisError(f"{err_label} 실패: HTTP {resp.status_code} {resp.text[:200]}")
                 if _is_rate_limit_error(exc) and attempt < _RATE_RETRY - 1:
                     last_exc = exc
                     await asyncio.sleep(_RATE_BACKOFF * (attempt + 1))
@@ -195,15 +198,25 @@ class KisClient:
                 # EGW00201(유량제한)은 msg_cd 에 담기고 msg1 은 한글 문구뿐이라, 재시도
                 # 판정을 위해 msg_cd 를 메시지에 포함해야 _is_rate_limit_error 가 잡는다.
                 exc = KisError(
-                    f"시세 조회 오류: [{data.get('msg_cd', '')}] {data.get('msg1', data)}"
+                    f"{err_label} 오류: [{data.get('msg_cd', '')}] {data.get('msg1', data)}"
                 )
                 if _is_rate_limit_error(exc) and attempt < _RATE_RETRY - 1:
                     last_exc = exc
                     await asyncio.sleep(_RATE_BACKOFF * (attempt + 1))
                     continue
                 raise exc
-            return data["output"]
-        raise last_exc or KisError("시세 조회 실패")
+            return data
+        raise last_exc or KisError(f"{err_label} 실패")
+
+    async def get_current_price(self, symbol: str) -> dict:
+        """국내주식 현재가 시세 조회 (FHKST01010100)."""
+        url = f"{self._base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+        params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol}
+        headers = await self._auth_headers("FHKST01010100")
+        data = await self._request_json(
+            "GET", url, headers=headers, params=params, err_label="시세 조회",
+        )
+        return data["output"]
 
     @staticmethod
     def _dec(o: dict, key: str) -> Decimal:
@@ -294,14 +307,9 @@ class KisClient:
         headers["hashkey"] = hashkey
 
         url = f"{self._base_url}/uapi/domestic-stock/v1/trading/order-cash"
-        await self._throttle()
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, headers=headers, json=body)
-        if resp.status_code != 200:
-            raise KisError(f"주문 실패: HTTP {resp.status_code} {resp.text[:200]}")
-        data = resp.json()
-        if data.get("rt_cd") != "0":
-            raise KisError(f"주문 거부: {data.get('msg1', data)}")
+        data = await self._request_json(
+            "POST", url, headers=headers, json=body, err_label="주문",
+        )
         out = data.get("output", {})
         return OrderResult(
             order_id=out.get("ODNO"),
@@ -341,14 +349,9 @@ class KisClient:
             "CTX_AREA_NK100": "",
         }
         url = f"{self._base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
-        await self._throttle()
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers, params=params)
-        if resp.status_code != 200:
-            raise KisError(f"체결 조회 실패: HTTP {resp.status_code} {resp.text[:200]}")
-        data = resp.json()
-        if data.get("rt_cd") != "0":
-            raise KisError(f"체결 조회 오류: {data.get('msg1', data)}")
+        data = await self._request_json(
+            "GET", url, headers=headers, params=params, err_label="체결 조회",
+        )
 
         rows = [r for r in data.get("output1", []) if r.get("odno") == kis_order_id]
         if not rows:
@@ -388,12 +391,7 @@ class KisClient:
             "CTX_AREA_NK100": "",
         }
         url = f"{self._base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
-        await self._throttle()
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers, params=params)
-        if resp.status_code != 200:
-            raise KisError(f"잔고 조회 실패: HTTP {resp.status_code} {resp.text[:200]}")
-        data = resp.json()
-        if data.get("rt_cd") != "0":
-            raise KisError(f"잔고 조회 오류: {data.get('msg1', data)}")
+        data = await self._request_json(
+            "GET", url, headers=headers, params=params, err_label="잔고 조회",
+        )
         return Balance(positions=data.get("output1", []), summary=data.get("output2", []))
