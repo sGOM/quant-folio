@@ -104,6 +104,10 @@ async def reconcile_open_orders(
             except BrokerError as e:
                 logger.warning("브로커 생성 실패 user=%s: %s", uid, e)
                 brokers[uid] = None
+                # 이전엔 여기서 조용히 None 을 반환해 해당 사용자의 주문이 매 주기
+                # 아무 통계에도 안 잡히고 넘어갔다(자격증명이 계속 만료 상태여도
+                # _reconcile_loop 의 실패 카운터가 못 봄). errors 에 반영해 눈에 띄게 한다.
+                stats["errors"] += 1
         return brokers[uid]
 
     async def _balance(uid: int, broker: BrokerClient) -> dict:

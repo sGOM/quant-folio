@@ -292,14 +292,25 @@ async def _reconcile_loop() -> None:
     from engine.reconcile import reconcile_open_orders
 
     while not _shutdown.is_set():
+        # reconcile_open_orders 는 개별 주문/사용자 단위 실패(브로커 생성·체결조회 실패)를
+        # 예외로 던지지 않고 stats["errors"] 에만 누적한다 — 루프 자체는 안 죽지만, 특정
+        # 사용자의 자격증명이 계속 만료 상태여도 예외 기반 카운터만으로는 못 잡는다.
+        # 그래서 하드 예외뿐 아니라 errors>0 도 같은 실패 카운터에 반영한다.
+        failure_reason: str | None = None
         try:
             async with AsyncSessionLocal() as db:
                 stats = await reconcile_open_orders(db, redis_client)
             if stats["filled"] or stats["partial"]:
                 logger.info("체결 재조회 정합: %s", stats)
-            _reconcile_fail_count = 0
+            if stats["errors"]:
+                failure_reason = f"{stats['errors']}건 브로커 조회 실패(개별 주문/사용자 단위)"
         except Exception as e:  # noqa: BLE001
             logger.exception("체결 재조회 루프 오류")
+            failure_reason = str(e)
+
+        if failure_reason is None:
+            _reconcile_fail_count = 0
+        else:
             _reconcile_fail_count += 1
             if _reconcile_fail_count == FAILURE_ALERT_THRESHOLD:
                 await publish_alert(
@@ -307,7 +318,7 @@ async def _reconcile_loop() -> None:
                     code="runner_failures",
                     message=(
                         f"체결 재조회 루프 연속 {_reconcile_fail_count}회 실패 — "
-                        f"미체결 주문이 정합되지 않고 있을 수 있음. 마지막 원인: {e}"
+                        f"미체결 주문이 정합되지 않고 있을 수 있음. 마지막 원인: {failure_reason}"
                     ),
                 )
         try:
