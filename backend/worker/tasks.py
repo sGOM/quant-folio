@@ -209,9 +209,10 @@ async def _check_fill_quality_drift_async() -> dict:
 def check_fill_quality_drift() -> dict:
     """실거래-백테스트 체결 정합(P2-3)을 주간 점검해 슬리피지 가정 이탈 시 경보한다(B-2).
 
-    최근 90일 체결이 있는 (사용자, 전략) 쌍마다 fill-quality 리포트를 재계산해, M1/M3
-    등급이 RED 이거나 실측 실행 슬리피지가 백테스트 가정의 2배를 넘으면 warning 알림을
-    발행한다(critical 이 아니므로 텔레그램 발송은 안 되고 앱 내 WS 알림만 — B-1 참고).
+    최근 90일 체결이 있는 (사용자, 전략) 쌍마다 fill-quality 리포트를 재계산해, M1(실행
+    슬리피지)·M3(전체 이탈) 등급이 RED 면 warning 알림을 발행한다(critical 이 아니므로
+    텔레그램 발송은 안 되고 앱 내 WS 알림만 — B-1 참고). RED 임계 자체는 이 함수가 아니라
+    `compute_fill_quality_report`(app/api/routes/fill_quality.py)의 등급 산정 로직이 정한다.
     표본 부족(min_sample 미만)이면 등급이 INSUFFICIENT 라 자연히 알림이 발화하지 않는다.
     """
     return _run_async(_check_fill_quality_drift_async())
