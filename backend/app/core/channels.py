@@ -62,3 +62,13 @@ def position_lock_key(user_id: int, symbol: str) -> str:
 # 마지막 DB 백업 성공 시각(ISO) — worker.backup_database 가 기록, worker.check_backup_freshness
 # (§9)·엔진 헬스 API 가 조회. TTL 없이 최신값만 유지.
 BACKUP_LAST_SUCCESS_KEY = "backup:last_success_at"
+
+# 전략별 MDD 킬스위치 상태(고점 HWM·발동 여부·발동일) 프리픽스 — engine.rebalance_runner
+# 가 갱신, /api/engine/strategies/health(§23 후속)가 조회.
+# 값(JSON): {"hwm": float, "killed": bool, "kill_date": "YYYY-MM-DD"|None}
+MDD_STATE_PREFIX = "rebalance:mdd:"
+
+
+def mdd_state_key(strategy_id: int) -> str:
+    """전략별 MDD 킬스위치 상태 키."""
+    return f"{MDD_STATE_PREFIX}{strategy_id}"

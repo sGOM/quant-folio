@@ -415,6 +415,37 @@ SQLAlchemy 내부 평가기 `sqlalchemy.orm.evaluator._EvaluatorCompiler`로 정
 `tests/test_reconcile.py` 신설(브로커 생성 실패 시 errors 계측 확인 1건 + 정상
 경로 대조군 1건).
 
+---
+
+## 신규 발굴 (2026-07-20 재점검, §24)
+
+발굴 근거: §23(엔진 상시 루프·alerts 테스트·has_more·reconcile 계측) 완료 직후
+3번째 재점검 — 이전 두 배치가 안 훑은 각도(리스크 안전장치의 프론트 노출,
+Celery beat 배치 태스크의 알림 배선 공백)에서 찾았다.
+
+## 24. MDD 킬스위치 상태 노출 + 배치 태스크 무알림 2건 해소 ✅
+
+**MDD 킬스위치 상태 노출**: `engine.rebalance_runner`가 `rebalance:mdd:{id}`에
+고점(HWM)·발동 여부·발동일을 갱신해 왔지만 어떤 API 도 읽지 않아, 발동(전량 청산)
+순간의 alert 토스트/알림함 메시지 외엔 나중에 "지금 청산 상태로 재가동 대기 중"임을
+확인할 방법이 없었다. Redis 키 빌더를 `app/core/channels.py::mdd_state_key`로
+옮겨(기존 `engine_health_key`와 동일한 web/engine 공유 규약 위치) `rebalance_runner.py`가
+이를 쓰도록 정리하고, `GET /api/engine/strategies/health` 응답에
+`mdd_killed`/`mdd_kill_date`/`mdd_hwm` 필드를 추가했다. 모니터 페이지
+(`StrategyHealthPanel`)에 발동 중일 때만 뜨는 "MDD 킬 발동중" 배지(warning
+variant, 발동일·쿨다운 재가동 안내 툴팁)를 붙였다. `tests/test_engine_health_route.py`
+신설(4건 — 발동/기본값/HWM만 추적/헬스와 독립).
+
+**Celery beat 배치 태스크 무알림 2건**: `worker/tasks.py::snapshot_sector_map`
+(분기 1회 PIT 업종 스냅샷 적재)이 실패를 예외 재전파만 하고 알림이 없어, 조용히
+실패하면 최소 3개월간 §20 판정 근거였던 PIT 섹터 데이터가 스테일 상태로 남을 수
+있었다. `cleanup_old_alerts`(§21 보존정책 삭제)도 동일하게 무알림이었다(영향도는
+낮음 — 실패해도 alerts 테이블이 조금 더 커지는 정도). 같은 파일의 다른 배치
+태스크(`ingest_daily_ohlcv`·`backup_database`·`check_backup_freshness`·
+`ingest_news`)가 따르는 `publish_alert(user_id=None, strategy_id=0, ...)`
+sentinel 관례를 두 곳에 이식했다 — 코드(`sector_map_outage`)는 warning,
+alerts 정리 실패(`alert_cleanup_failed`)도 warning.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |

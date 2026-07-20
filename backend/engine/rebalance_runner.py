@@ -19,6 +19,7 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from app.core.channels import mdd_state_key
 from app.core.database import AsyncSessionLocal
 from app.models import Order, OrderStatus, Position
 from app.services.backtest.tracking import replay_cash_balance
@@ -52,7 +53,6 @@ logger = logging.getLogger("engine.rebalance_runner")
 
 _LAST_PREFIX = "rebalance:last:"
 _REGIME_PREFIX = "rebalance:regime:"  # 직전 레짐 상태(risk-off 여부) 보관
-_MDD_PREFIX = "rebalance:mdd:"  # MDD 킬스위치 상태(고점 HWM·발동 여부·발동일)
 _LAST_TTL = 60 * 60 * 24 * 90  # 90일(휴장 등 대비 여유)
 
 # pykrx 종합지수 티커(레짐 필터 기준지수). 백테스트 라우트와 동일 규약.
@@ -235,7 +235,7 @@ class RebalanceRunner(BaseRunner):
     # 재설정되므로 데이터 오류로 인한 오발동(전량 청산)은 발생하지 않는다(안전측: 새 낙폭이
     # 임계에 도달해야만 발동). 이는 레짐/마지막 실행일 상태와 동일한 내구성 특성이다.
     def _mdd_key(self) -> str:
-        return f"{_MDD_PREFIX}{self.strategy_id}"
+        return mdd_state_key(self.strategy_id)
 
     async def _get_mdd_state(self) -> dict | None:
         """저장된 MDD 상태(hwm·killed·kill_date). 미기록/손상 시 None."""

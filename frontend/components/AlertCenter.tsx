@@ -40,6 +40,8 @@ const CODE_LABEL: Record<string, string> = {
   db_backup_stale: "DB 백업 신선도 초과",
   db_backup_s3_upload_failed: "DB 백업 오프사이트 업로드 실패",
   live_gate_blocked: "실전 전환 게이트 차단",
+  sector_map_outage: "업종분류 스냅샷 적재 실패",
+  alert_cleanup_failed: "알림 보존정책 정리 실패",
 };
 
 /**
