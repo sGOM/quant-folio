@@ -58,6 +58,13 @@ class FakeRedis:
     async def delete(self, k):
         self.store.pop(k, None)
 
+    async def incr(self, k):
+        self.store[k] = str(int(self.store.get(k, "0")) + 1)
+        return int(self.store[k])
+
+    async def expire(self, k, seconds):
+        return True  # TTL 자체는 이 대역의 관심사가 아님(고정 윈도우 카운트 로직만 검증)
+
     async def publish(self, channel, data):
         self.published.append((channel, data))
         return 1
