@@ -61,10 +61,8 @@ export function AlertCenter() {
     queryKey: ["alerts"],
     queryFn: ({ pageParam }) => api.listAlerts(false, PAGE_SIZE, pageParam),
     initialPageParam: 0,
-    // 응답에 has_more 가 없으므로 마지막 페이지가 꽉 찼으면 다음 페이지가 있다고 본다
-    // (경계에서 마지막 "더보기"가 빈 페이지 한 번을 받을 수 있으나 무해).
     getNextPageParam: (last, all) =>
-      last.items.length === PAGE_SIZE ? all.length * PAGE_SIZE : undefined,
+      last.has_more ? all.length * PAGE_SIZE : undefined,
     refetchInterval: REFETCH_INTERVAL_MS,
   });
 
