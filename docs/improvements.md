@@ -593,6 +593,28 @@ FakeBroker·FakeRedis로 실제 `risk.py`/`executor.py`를 그대로 태워 종�
 확인했으며(신호 자체는 `latest_signal`만 고정값으로 대역화), 실제 버그는
 발견되지 않았으나(로직은 정확했음) 향후 회귀를 막는 안전망을 확보했다.
 
+## 신규 발굴 (2026-07-21 재점검, §33)
+
+§1~32 및 남은 과제(외부 자원 필요 4건)와 겹치지 않는 후보를 재탐색(7차).
+`engine/risk.py` 순수 유닛 테스트(경계값), `worker/tasks.py`의 백업·뉴스
+수집 태스크 테스트 공백은 확신도 중간~낮음으로 이번엔 보류.
+
+## 33. `engine/executor.py::execute_signal` 3중 멱등 방어·거부 경로 테스트 커버리지 0 해소 ✅
+
+모든 러너(StrategyRunner·RebalanceRunner)가 공유하는 단일 주문 진입점인데,
+기존 `test_executor.py`는 `make_idempotency_key`의 결정성만 검증했고, 이중
+매수/매도를 막는 핵심 방어선 — 3중 멱등 방어(Redis 락 경합 시 즉시 반환,
+DB `idempotency_key` 기존 주문 스킵, `IntegrityError` UNIQUE 충돌 흡수) —
+와 `broker.place_order`가 `BrokerError`를 던질 때 `REJECTED` 기록·이벤트
+발행 경로는 정상 체결 경로만 e2e/StrategyRunner 테스트로 간접 검증됐을 뿐
+직접 검증된 적이 없었다(§신규발굴 7차 1위). `test_executor.py`에 7건
+추가(전량체결 정상 경로, Redis 락 경합, DB 기존 주문 발견, IntegrityError
+흡수, 증권사 주문거부 REJECTED 기록, 미체결 접수 시 SUBMITTED 유지, 체결
+조회 자체 실패 시 SUBMITTED 로 남아 reconcile 에 위임). `execute_signal`은
+세션을 인자로 직접 받으므로 `test_engine_e2e.py`와 동일한 FakeDB(`_Store`)·
+FakeBroker·FakeRedis 를 팩토리 패치 없이 바로 사용했다. 실제 버그는
+발견되지 않았으나(로직은 정확했음) 향후 회귀를 막는 안전망을 확보했다.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |
