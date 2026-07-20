@@ -788,6 +788,8 @@ function StrategyToggle({ strategy }: { strategy: Strategy }) {
  * `GET /api/engine/strategies/health` 를 30초 주기로 폴링해(+ WS "alert" 수신 시 즉시 무효화),
  * 각 러너의 마지막 성공 틱 상대시각·연속 실패 횟수·healthy 배지를 보여준다.
  * 엔진 프로세스 전역 생존(상단 배지)과 달리, 전략 단위로 "조용한 실패"(외부 조회 지연 등)를 드러낸다.
+ * MDD 킬스위치가 발동 중이면(전량 청산 후 쿨다운 재가동 대기) 별도 배지로 표시한다 —
+ * 이전엔 발동 순간의 토스트/알림함 메시지 외엔 이 상태를 나중에 확인할 방법이 없었다.
  */
 function StrategyHealthPanel({
   data,
@@ -845,22 +847,39 @@ function StrategyHealthPanel({
               </Tooltip>
             )}
           </div>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span tabIndex={0} className="cursor-help">
-                <Badge variant={!s.reported ? "muted" : s.healthy ? "success" : "destructive"}>
-                  {!s.reported ? "대기" : s.healthy ? "정상" : "이상"}
-                </Badge>
-              </span>
-            </TooltipTrigger>
-            <TooltipContent>
-              {!s.reported
-                ? "엔진이 이 전략을 시작했지만 아직 첫 틱을 처리하지 못했습니다."
-                : s.healthy
-                  ? `연속 실패 ${s.consecutive_failures}회 (임계 ${data?.threshold} 미만) — 정상 처리 중입니다.`
-                  : `연속 실패 ${s.consecutive_failures}회로 임계(${data?.threshold})를 넘었습니다. 외부 조회 지연·오류가 지속되고 있을 수 있습니다.`}
-            </TooltipContent>
-          </Tooltip>
+          <div className="flex shrink-0 items-center gap-1.5">
+            {s.mdd_killed && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span tabIndex={0} className="cursor-help">
+                    <Badge variant="warning">MDD 킬 발동중</Badge>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {s.mdd_kill_date
+                    ? `${s.mdd_kill_date}에 고점 대비 낙폭이 임계를 넘어 전량 청산됐습니다. `
+                    : "고점 대비 낙폭이 임계를 넘어 전량 청산됐습니다. "}
+                  쿨다운(거래일 경과) 후 자동 재가동됩니다.
+                </TooltipContent>
+              </Tooltip>
+            )}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span tabIndex={0} className="cursor-help">
+                  <Badge variant={!s.reported ? "muted" : s.healthy ? "success" : "destructive"}>
+                    {!s.reported ? "대기" : s.healthy ? "정상" : "이상"}
+                  </Badge>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>
+                {!s.reported
+                  ? "엔진이 이 전략을 시작했지만 아직 첫 틱을 처리하지 못했습니다."
+                  : s.healthy
+                    ? `연속 실패 ${s.consecutive_failures}회 (임계 ${data?.threshold} 미만) — 정상 처리 중입니다.`
+                    : `연속 실패 ${s.consecutive_failures}회로 임계(${data?.threshold})를 넘었습니다. 외부 조회 지연·오류가 지속되고 있을 수 있습니다.`}
+              </TooltipContent>
+            </Tooltip>
+          </div>
         </Card>
       ))}
     </div>

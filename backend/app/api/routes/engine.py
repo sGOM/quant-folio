@@ -17,6 +17,7 @@ from app.core.channels import (
     ENGINE_HEARTBEAT_KEY,
     FAILURE_ALERT_THRESHOLD,
     engine_health_key,
+    mdd_state_key,
 )
 from app.core.database import get_db
 from app.core.redis import redis_client
@@ -89,8 +90,14 @@ async def strategies_health(
     연속 실패 횟수를 노출한다(엔진이 engine:health:{id} 에 갱신). 러너가 조용히 실패해도
     heartbeat 는 alive 이므로, 이 엔드포인트로 러너별 이상을 드러낸다.
 
+    MDD 킬스위치 상태(고점 HWM·발동 여부·발동일, engine.rebalance_runner 가
+    rebalance:mdd:{id} 에 갱신)도 함께 노출한다 — 이전엔 발동 순간의 alert
+    토스트/알림함 메시지 외엔 "지금 청산 상태로 재가동 대기 중"임을 나중에
+    확인할 방법이 없었다.
+
     :return: {"threshold": int, "strategies": [{strategy_id, name, status,
-        last_success_ts, consecutive_failures, last_error, updated_at, healthy}]}.
+        last_success_ts, consecutive_failures, last_error, updated_at, healthy,
+        mdd_killed, mdd_kill_date, mdd_hwm}]}.
         healthy 는 연속 실패가 임계 미만인지 여부(임계 이상이면 알림도 발행된 상태).
     """
     rows = await db.scalars(
@@ -113,6 +120,15 @@ async def strategies_health(
             except (json.JSONDecodeError, TypeError):
                 health = {}
         failures = int(health.get("consecutive_failures", 0) or 0)
+
+        mdd_raw = await redis_client.get(mdd_state_key(s.id))
+        mdd: dict = {}
+        if mdd_raw:
+            try:
+                mdd = json.loads(mdd_raw)
+            except (json.JSONDecodeError, TypeError):
+                mdd = {}
+
         out.append({
             "strategy_id": s.id,
             "name": s.name,
@@ -124,5 +140,8 @@ async def strategies_health(
             # 헬스 레코드가 아직 없으면(막 start) reported=False 로 구분 가능.
             "reported": bool(health),
             "healthy": failures < FAILURE_ALERT_THRESHOLD,
+            "mdd_killed": bool(mdd.get("killed", False)),
+            "mdd_kill_date": mdd.get("kill_date"),
+            "mdd_hwm": mdd.get("hwm"),
         })
     return {"threshold": FAILURE_ALERT_THRESHOLD, "strategies": out}

@@ -218,6 +218,7 @@ def check_fill_quality_drift() -> dict:
 
 
 async def _snapshot_sector_map_async() -> dict:
+    from app.core.config import settings
     from app.core.database import AsyncSessionLocal
     from app.services.data.krx_index import snapshot_sector_map
 
@@ -225,8 +226,25 @@ async def _snapshot_sector_map_async() -> dict:
         try:
             n = await snapshot_sector_map(db)
             await db.commit()
-        except Exception:
+        except Exception as e:  # noqa: BLE001
             await db.rollback()
+            # 분기 1회 배치라 조용히 실패하면 최소 3개월간 아무도 모른 채 PIT 업종
+            # 데이터가 스테일 상태로 남는다(§20 판정 근거로 쓰인 데이터). 다른 배치
+            # 태스크와 동일한 sentinel 관례로 알린다.
+            from redis.asyncio import Redis
+
+            from engine.alerts import publish_alert
+
+            redis = Redis.from_url(settings.REDIS_URL)
+            try:
+                await publish_alert(
+                    redis, user_id=None, strategy_id=0, severity="warning",
+                    message=f"업종분류 분기 스냅샷 적재 실패: {e}",
+                    code="sector_map_outage",
+                    dedup_window_hours=24.0,
+                )
+            finally:
+                await redis.aclose()
             raise
 
     result = {"snapshot_symbols": n}
@@ -478,6 +496,7 @@ _ALERT_RETENTION_UNREAD_DAYS = 180
 async def _cleanup_old_alerts_async() -> dict:
     from sqlalchemy import delete
 
+    from app.core.config import settings
     from app.core.database import AsyncSessionLocal
     from app.models import Alert
 
@@ -485,15 +504,34 @@ async def _cleanup_old_alerts_async() -> dict:
     read_cutoff = now - timedelta(days=_ALERT_RETENTION_READ_DAYS)
     unread_cutoff = now - timedelta(days=_ALERT_RETENTION_UNREAD_DAYS)
 
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            delete(Alert).where(
-                (Alert.is_read.is_(True) & (Alert.created_at < read_cutoff))
-                | (Alert.is_read.is_(False) & (Alert.created_at < unread_cutoff))
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                delete(Alert).where(
+                    (Alert.is_read.is_(True) & (Alert.created_at < read_cutoff))
+                    | (Alert.is_read.is_(False) & (Alert.created_at < unread_cutoff))
+                )
             )
-        )
-        await db.commit()
-        deleted = result.rowcount
+            await db.commit()
+            deleted = result.rowcount
+    except Exception as e:  # noqa: BLE001
+        # 매일 재시도되고 실패해도 "alerts 테이블이 조금 더 커지는" 정도라 severity 는
+        # warning — 다만 원인이 지속되면 알 수 있게 다른 배치 태스크와 같은 관례로 알린다.
+        from redis.asyncio import Redis
+
+        from engine.alerts import publish_alert
+
+        redis = Redis.from_url(settings.REDIS_URL)
+        try:
+            await publish_alert(
+                redis, user_id=None, strategy_id=0, severity="warning",
+                message=f"alerts 보존정책 정리 실패: {e}",
+                code="alert_cleanup_failed",
+                dedup_window_hours=20.0,
+            )
+        finally:
+            await redis.aclose()
+        raise
 
     logger.info("alerts 보존정책 정리 완료: %d건 삭제", deleted)
     return {"deleted": deleted}

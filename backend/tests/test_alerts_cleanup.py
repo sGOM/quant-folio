@@ -8,9 +8,11 @@ delete() 문의 조건을 정확히(재구현 오차 없이) 평가한다.
 """
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy.orm.evaluator import _EvaluatorCompiler
 
 from app.models import Alert
+from tests.conftest import FakeRedis
 
 
 def _mk_alert(*, is_read: bool, age_days: float) -> Alert:
@@ -86,3 +88,58 @@ async def test_cleanup_noop_when_nothing_stale(monkeypatch):
 
     assert result["deleted"] == 0
     assert len(session.rows) == 2
+
+
+class _FakeDeleteSessionBoom:
+    """delete 실행 자체가 실패하는 상황(DB 장애 등)을 재현한다."""
+
+    def __call__(self):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, _stmt):
+        raise RuntimeError("커넥션 끊김")
+
+
+class _FakeAsyncRedisConn(FakeRedis):
+    async def aclose(self) -> None:
+        return None
+
+
+class _FakeRedisCls:
+    """redis.asyncio.Redis 대역 — Redis.from_url(...) 호출을 가로챈다."""
+
+    last: "_FakeAsyncRedisConn | None" = None
+
+    @classmethod
+    def from_url(cls, _url):
+        cls.last = _FakeAsyncRedisConn()
+        return cls.last
+
+
+async def test_cleanup_failure_publishes_alert_and_reraises(monkeypatch, caplog):
+    """delete 실패 시 다른 배치 태스크와 같은 관례로 alert_cleanup_failed 를 발행하고 재전파한다.
+
+    이 알림은 user_id=None + severity="warning"(다른 시스템 배치 알림과 동일 관례) —
+    publish_alert 는 WS 전송 대상 사용자가 없어(user_id=None) DB 영속화만 시도하고
+    WS·텔레그램은 건너뛴다(ohlcv_ingest_failure_rate 등 기존 배치 알림과 동일 동작).
+    그래서 실제 보장되는 관측 가능한 부수효과인 로그로 발행 여부를 확인한다.
+    """
+    import logging
+
+    from app.core import database
+    from worker import tasks
+
+    monkeypatch.setattr(database, "AsyncSessionLocal", _FakeDeleteSessionBoom())
+    monkeypatch.setattr("redis.asyncio.Redis", _FakeRedisCls)
+
+    with caplog.at_level(logging.WARNING, logger="engine.alerts"):
+        with pytest.raises(RuntimeError, match="커넥션 끊김"):
+            await tasks._cleanup_old_alerts_async()
+
+    assert "alert_cleanup_failed" in caplog.text

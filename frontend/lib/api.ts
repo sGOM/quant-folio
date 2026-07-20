@@ -908,7 +908,9 @@ export type AlertCode =
   | "db_backup_failed"
   | "db_backup_stale"
   | "db_backup_s3_upload_failed"
-  | "live_gate_blocked";
+  | "live_gate_blocked"
+  | "sector_map_outage"
+  | "alert_cleanup_failed";
 
 /** 알림 심각도. critical=파국/치명, warning=주의(자동 폴백 등). */
 export type AlertSeverity = "warning" | "critical";
@@ -985,6 +987,12 @@ export interface StrategyHealth {
   reported: boolean;
   /** consecutive_failures < threshold. */
   healthy: boolean;
+  /** MDD 킬스위치 발동 중(전량 청산 후 쿨다운 재가동 대기) 여부. */
+  mdd_killed: boolean;
+  /** 킬스위치 발동일(YYYY-MM-DD). 미발동이면 null. */
+  mdd_kill_date: string | null;
+  /** 고점(HWM) 자산가치(원). 평가 이력이 없으면 null. */
+  mdd_hwm: number | null;
 }
 
 /** 전략별 헬스 조회 응답 래퍼. */
