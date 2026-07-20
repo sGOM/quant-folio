@@ -155,7 +155,7 @@ async def apply_fill_notice(user_id: int, notice: FillNoticeData, redis) -> bool
 
         fully = (already + delta) >= target
         price = notice.price if notice.price and notice.price > 0 else order.price
-        await record_fill(db, order, delta, price, fully_filled=fully)
+        await record_fill(db, order, delta, price, fully_filled=fully, redis=redis)
         await db.commit()
 
         await publish_event(redis, {

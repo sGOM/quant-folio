@@ -124,7 +124,7 @@ async def execute_signal(
             logger.info("주문 접수(미체결): %s %s %d주", side, symbol, qty)
             return order
 
-        await _record_fill(db, order, fill_qty, fill_price, fully_filled=(fill_qty >= qty))
+        await _record_fill(db, order, fill_qty, fill_price, fully_filled=(fill_qty >= qty), redis=redis)
         await db.commit()
 
         await _publish(redis, {

@@ -120,7 +120,7 @@ async def reconcile_open_orders(
         return balances[uid]
 
     async def _apply(order: Order, delta: int, price: Decimal, fully: bool) -> None:
-        await record_fill(db, order, delta, price, fully_filled=fully)
+        await record_fill(db, order, delta, price, fully_filled=fully, redis=redis)
         await db.commit()
         stats["filled" if fully else "partial"] += 1
         await publish_event(redis, {

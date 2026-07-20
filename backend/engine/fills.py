@@ -21,9 +21,15 @@ logger = logging.getLogger("engine.fills")
 
 
 async def record_fill(
-    db: AsyncSession, order: Order, qty: int, price: Decimal, *, fully_filled: bool
+    db: AsyncSession, order: Order, qty: int, price: Decimal, *, fully_filled: bool,
+    redis: Redis | None = None,
 ) -> None:
-    """Execution 기록 + Position 평균단가 갱신 + 주문 상태 갱신."""
+    """Execution 기록 + Position 평균단가 갱신 + 주문 상태 갱신.
+
+    :param redis: 지정 시(§신규발굴 8차 이월), 매도 체결이 보유수량을 초과해 포지션이
+        0으로 클램프될 때 warning 알림을 발행한다(정합 경쟁·이중 체결 의심 신호).
+        None 이면 기존처럼 로그만 남긴다(호출부가 redis 를 못 구하는 경로 대비).
+    """
     db.add(Execution(
         order_id=order.id,
         strategy_id=order.strategy_id,  # 비정규화: 전략별 체결 직접 조회용
@@ -55,6 +61,25 @@ async def record_fill(
             pos.qty = new_qty
     else:  # SELL
         if pos is not None:
+            if fill_qty > pos.qty:
+                logger.warning(
+                    "오버셀 감지: 매도 체결 %s주가 보유수량 %s주를 초과 — 0으로 클램프 "
+                    "user=%s strategy=%s symbol=%s(정합 경쟁·이중 체결 의심)",
+                    fill_qty, pos.qty, order.user_id, order.strategy_id, order.symbol,
+                )
+                if redis is not None and order.strategy_id is not None:
+                    # engine.alerts 는 이 모듈을 import 하므로(publish_event 재사용),
+                    # 순환 import 를 피하려 함수 내부에서 지연 import 한다.
+                    from engine.alerts import publish_alert
+
+                    await publish_alert(
+                        redis, user_id=order.user_id, strategy_id=order.strategy_id,
+                        severity="warning", code="oversell_clamped",
+                        message=(
+                            f"{order.symbol} 매도 체결 {fill_qty}주가 보유수량 {pos.qty}주를 "
+                            f"초과해 포지션을 0으로 클램프했습니다(정합 경쟁 의심 — 확인 필요)."
+                        ),
+                    )
             pos.qty = max(pos.qty - fill_qty, Decimal("0"))
             if pos.qty == 0:
                 pos.avg_price = Decimal("0")

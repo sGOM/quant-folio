@@ -9,10 +9,12 @@
 record_fill 을 직접 호출하는 단위테스트. 실제 DB 없이 where 절을 introspect 하는
 인메모리 세션 대역으로 (user_id, strategy_id, symbol) 필터링을 재현한다.
 """
+import json
 from decimal import Decimal
 
 from app.models import Execution, Order, OrderSide, Position
 from engine.fills import record_fill
+from tests.conftest import FakeRedis
 
 
 def _eq_filters(stmt) -> dict:
@@ -118,3 +120,49 @@ async def test_avg_price_is_independent_per_strategy():
     assert a.avg_price == Decimal("1500")
     assert b.qty == Decimal("5")
     assert b.avg_price == Decimal("2000")  # 다른 전략 평단 불변
+
+
+async def test_oversell_clamps_to_zero_and_warns_via_alert():
+    """매도 체결이 보유수량을 초과하면 0으로 클램프하고(방어) warning 알림을 발행한다
+    (§신규발굴 5~8차 이월 후보 — 이전엔 무경보였다).
+    """
+    db = _FakeSession()
+    redis = FakeRedis()
+    sym = "005930"
+    await record_fill(db, _order(10, sym, OrderSide.BUY), 10, Decimal("1000"), fully_filled=True)
+
+    # 보유 10주인데 15주 매도 체결이 들어온 상황(정합 경쟁·이중 체결 의심).
+    await record_fill(
+        db, _order(10, sym, OrderSide.SELL, order_id=2), 15, Decimal("1100"),
+        fully_filled=True, redis=redis,
+    )
+
+    a = db.position(10, sym)
+    assert a.qty == Decimal("0")  # 음수로 내려가지 않고 0에서 클램프
+    assert a.avg_price == Decimal("0")
+
+    alerts = [
+        json.loads(data) for _, data in redis.published
+        if json.loads(data).get("code") == "oversell_clamped"
+    ]
+    assert len(alerts) >= 1
+    assert alerts[0]["severity"] == "warning"
+    assert alerts[0]["strategy_id"] == 10
+
+
+async def test_normal_sell_within_holding_does_not_alert():
+    db = _FakeSession()
+    redis = FakeRedis()
+    sym = "005930"
+    await record_fill(db, _order(10, sym, OrderSide.BUY), 10, Decimal("1000"), fully_filled=True)
+
+    await record_fill(
+        db, _order(10, sym, OrderSide.SELL, order_id=2), 10, Decimal("1100"),
+        fully_filled=True, redis=redis,
+    )
+
+    alerts = [
+        json.loads(data) for _, data in redis.published
+        if json.loads(data).get("code") == "oversell_clamped"
+    ]
+    assert alerts == []
