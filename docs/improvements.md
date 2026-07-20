@@ -653,6 +653,27 @@ apply_fill_notice`) 모두 이미 갖고 있던 `redis`를 그대로 전달하�
 positions.py`에 오버셀 클램프+알림 발행 검증과 정상 매도는 알림이 없음을
 확인하는 대조군 테스트 2건을 추가했다.
 
+## 신규 발굴 (2026-07-21 재점검, §36)
+
+§1~35 및 남은 과제(외부 자원 필요 4건)와 겹치지 않는 후보를 재탐색(9차,
+worker/api routes/backtest core/frontend 로 범위 확대). 실거래 핵심 경로가
+거의 소진돼 이번 라운드는 후보 강도가 이전 차수보다 낮았다. `app/api/routes/
+trading.py::list_positions`의 브로커 폴백 로직(조회 전용, 자금 리스크 낮음)
+은 확신도 낮음~중간으로 보류.
+
+## 36. `worker/tasks.py` DB 백업 순수 로직(URL 파싱·보존정책) 테스트 커버리지 0 해소 ✅
+
+`_backup_database_async`(pg_dump·S3·celery beat 배선)를 참조하는 테스트가
+전무했다(§신규발굴 9차 1위). 그중 외부 I/O(subprocess/boto3) 없이 검증
+가능한 순수 함수 두 개 — `_parse_database_url`(DATABASE_URL → pg_dump 접속
+정보 파싱, 필드 누락 시 기본값 폴백)·`_prune_old_backups`(보존기간 계산·
+파일명 패턴 매칭·삭제 대상 판정) — 를 `test_backup_tasks.py` 신설(7건)로
+검증했다. 여기 버그는 "야간 백업이 조용히 잘못된 host/port 로 실패"하거나
+"보존기간 계산이 틀려 백업이 너무 일찍 삭제/과다 보존"되는 방식으로 나타나
+데이터 손실 리스크와 직결된다. `_run_pg_dump_gzip`/`_upload_backup_to_s3`는
+실제 프로세스·네트워크 의존이라 이번 범위에서 제외했다. 실제 버그는
+발견되지 않았으나(로직은 정확했음) 향후 회귀를 막는 안전망을 확보했다.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |
