@@ -406,6 +406,15 @@ SQLAlchemy 내부 평가기 `sqlalchemy.orm.evaluator._EvaluatorCompiler`로 정
 추가). `frontend/lib/api.ts::AlertListOut`·`AlertCenter.tsx`의 `getNextPageParam`도
 추정 로직 대신 이 필드를 그대로 쓰도록 갱신.
 
+**`reconcile_open_orders`의 사용자별 브로커 실패 무계측 후속**: `engine/reconcile.py::_broker`가
+브로커 생성 실패(`BrokerError`, 예: 자격증명 만료)를 로그만 남기고 `stats`
+어디에도 반영하지 않아, 특정 사용자의 자격증명이 계속 만료 상태여도
+`_reconcile_loop`의 실패 카운터(위 §23 첫 항목)가 못 보는 구멍이 있었다.
+`_broker`가 이제 실패 시 `stats["errors"]`를 올리고, `_reconcile_loop`는 하드
+예외뿐 아니라 `stats["errors"] > 0`도 같은 임계-교차 알림 로직에 반영한다.
+`tests/test_reconcile.py` 신설(브로커 생성 실패 시 errors 계측 확인 1건 + 정상
+경로 대조군 1건).
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |
