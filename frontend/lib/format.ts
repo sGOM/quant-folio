@@ -76,8 +76,8 @@ export function formatRelativeTime(iso: string | null | undefined): string {
   const t = new Date(iso).getTime();
   if (Number.isNaN(t)) return "-";
   const diffSec = Math.round((Date.now() - t) / 1000);
-  if (diffSec < 5) return "방금 전";
   if (diffSec < 0) return "곧";
+  if (diffSec < 5) return "방금 전";
   if (diffSec < 60) return `${diffSec}초 전`;
   const min = Math.round(diffSec / 60);
   if (min < 60) return `${min}분 전`;

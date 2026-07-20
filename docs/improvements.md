@@ -719,6 +719,58 @@ IDOR 방지 로직은 확신도 낮음(라우트 레벨 통합테스트 필요, 
 정밀 확인했다. 실제 버그는 발견되지 않았으나(로직은 정확했음) 향후 회귀를
 막는 안전망을 확보했다.
 
+## 전체 코드 버그 검사 (2026-07-21, §39~§40)
+
+사용자 요청으로 "문서 최신화 + 전체 코드 버그 검사"를 수행. 문서(CLAUDE.md·
+docs/PRD.md·docs/CONVENTIONS.md·help/README.md·docs/improvements.md)는
+review-fastapi/fork 점검 결과 대체로 최신 상태로 확인(PRD 의 `alerts` 테이블
+누락은 문서 최상단에 이미 "역사적 기록" 면책 배너가 있어 수정 불필요로
+판단). 백엔드 전체(review-fastapi)·프론트엔드 전체(review-nextjs)를 각각
+전담 리뷰 에이전트로 재점검해 실제 버그 2건을 발견·수정했다.
+
+## 39. `engine/main.py::_control_loop` 예외 미처리로 원격제어 마비 가능 — 수정 ✅
+
+좁게 잡힌 `except (json.JSONDecodeError, KeyError, ValueError)` 밖의 예외
+(예: Redis 순간 단절의 `ConnectionError`)가 `pubsub.get_message()`에서
+발생하면 `_control_loop` 태스크 자체가 아무도 모르게 조용히 종료됐다.
+`_heartbeat_loop`는 별도 태스크라 계속 살아 있어 `/api/engine/health`는
+"정상"으로 보이므로, 이후 전략 start/stop 원격제어(웹의 "중지" 버튼 등)가
+전부 무시돼도 운영자가 알아채기 어려웠다 — 진행 중이던 전략을 급히 멈춰야
+하는 상황에서 중지 명령이 반영되지 않는 실질적 리스크. `_reconcile_loop`/
+`_fill_notice_loop`와 동일한 패턴(넓은 `except Exception`으로 재구독 +
+연속 실패 임계-교차 시 1회 critical 알림 + 성공 시 카운트 리셋)으로
+수정했다. `test_control_loop.py` 신설(4건)로 정상 메시지 처리, 잘못된
+메시지 스킵, 예외 발생 시 재구독하며 임계 도달 시 알림 발행, 복구 후 실패
+카운트 리셋을 검증했다.
+
+## 40. 프론트엔드 WS 중복 연결 + `formatRelativeTime` 도달불가 분기 — 수정 ✅
+
+**WS 중복 연결(High)**: `RequireAuth`가 인증된 모든 화면에 항상
+`<AlertCenter />`를 마운트하고 `AlertCenter`가 자체적으로 `useEventSocket`을
+호출하는데, `app/monitor/page.tsx`의 `MonitorContent`도 별도로
+`useEventSocket`을 호출하고 있었다. `useEventSocket`은 호출될 때마다 새
+`WebSocket`을 만들었으므로, `/monitor` 접속 시 같은 클라이언트가 동일 이벤트
+스트림을 소켓 2개로 중복 수신하고(포지션/주문 invalidate 등이 이벤트 1건당
+2번 발생) 재접속 백오프도 독립적으로 동작해 서버 부하가 배가됐다.
+`lib/useWebSocket.ts`를 탭당 소켓 1개만 유지하는 모듈 싱글턴으로 재작성해
+호출부(AlertCenter/monitor 페이지) 변경 없이 근본 원인을 해소했다 —
+구독자(핸들러)를 Set 으로 관리하고, 마지막 구독자가 해제될 때만 실제 소켓을
+닫는다. `useWebSocket.test.tsx`에 다중 구독자 시나리오(소켓 1개만 생성·양쪽
+모두 이벤트 수신·부분 언마운트 시 유지·전원 언마운트 시 닫힘) 테스트 추가.
+
+**`formatRelativeTime` 도달불가 분기(Medium)**: `if (diffSec < 5) return
+"방금 전"; if (diffSec < 0) return "곧";` 순서상 음수(diffSec<0, 미래
+타임스탬프·시계 오차)는 항상 5보다 작아 먼저 걸리므로 `"곧"` 분기가 영원히
+실행되지 않는 죽은 코드였다. 조건 순서를 바꿔 수정하고 `format.test.ts`에
+미래 시각 케이스 테스트를 추가했다.
+
+**환경 제약**: 이 환경은 호스트 `node_modules`에 vitest 가 설치돼 있지 않고
+(frontend 패키지는 컨테이너 내부 설치가 원칙) Docker Desktop 도 오프라인이라
+프론트엔드 변경분은 `npx tsc --noEmit`으로 타입 검사만 확인했고(내 변경
+파일에 신규 에러 없음, 기존 vitest/playwright 관련 에러는 환경 전용이라
+무관) 실제 `npm run test`(vitest) 실행은 하지 못했다 — Docker 복구 후
+`docker compose exec frontend npm run test`로 재확인 필요.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |

@@ -57,6 +57,7 @@ _fill_notice_mgr = FillNoticeManager(redis_client)  # 사용자별 실시간 체
 # 발행한다(worker/tasks.py 의 db_backup_failed 등과 동일한 관례).
 _reconcile_fail_count = 0
 _fill_notice_fail_count = 0
+_control_fail_count = 0
 
 
 def _handle_signal(*_args) -> None:
@@ -228,29 +229,62 @@ async def _sync_fill_notices() -> None:
             logger.exception("FillNotice ensure 실패 user=%d", uid)
 
 
+_CONTROL_RETRY_DELAY = 5  # 초 — 재구독 실패 시 다음 시도까지 대기(과도한 재시도 방지)
+
+
 async def _control_loop() -> None:
-    """Redis pub/sub 제어 메시지 수신."""
-    pubsub = redis_client.pubsub()
-    await pubsub.subscribe(ENGINE_CONTROL_CHANNEL)
-    logger.info("제어 채널 구독: %s", ENGINE_CONTROL_CHANNEL)
-    try:
-        while not _shutdown.is_set():
-            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            if msg is None:
-                continue
+    """Redis pub/sub 제어 메시지 수신.
+
+    이 루프가 (Redis 순간 단절 등으로) 조용히 죽으면 전략 start/stop 원격제어
+    (웹의 "중지" 버튼 등)가 전부 무시된다. `_heartbeat_loop`는 별도 태스크라
+    계속 살아 있어 `/api/engine/health`는 "정상"으로 보이므로, 운영자가 알아채기
+    어려운 조용한 마비로 이어질 수 있었다(예전엔 좁은 except 로 예외를 못 잡으면
+    태스크 자체가 아무도 모르게 종료됐다). `_reconcile_loop`와 동일하게 예외를
+    넓게 잡아 재구독하고, 연속 실패는 임계-교차 1회 알림으로 알린다.
+    """
+    global _control_fail_count
+    while not _shutdown.is_set():
+        try:
+            pubsub = redis_client.pubsub()
+            await pubsub.subscribe(ENGINE_CONTROL_CHANNEL)
+            logger.info("제어 채널 구독: %s", ENGINE_CONTROL_CHANNEL)
             try:
-                data = json.loads(msg["data"])
-                action, sid = data["action"], int(data["strategy_id"])
-            except (json.JSONDecodeError, KeyError, ValueError):
-                logger.warning("잘못된 제어 메시지: %s", msg.get("data"))
-                continue
-            if action == "start":
-                await _start_strategy(sid)
-            elif action == "stop":
-                await _stop_strategy(sid)
-    finally:
-        await pubsub.unsubscribe(ENGINE_CONTROL_CHANNEL)
-        await pubsub.aclose()
+                while not _shutdown.is_set():
+                    msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if msg is None:
+                        continue
+                    try:
+                        data = json.loads(msg["data"])
+                        action, sid = data["action"], int(data["strategy_id"])
+                    except (json.JSONDecodeError, KeyError, ValueError):
+                        logger.warning("잘못된 제어 메시지: %s", msg.get("data"))
+                        continue
+                    if action == "start":
+                        await _start_strategy(sid)
+                    elif action == "stop":
+                        await _stop_strategy(sid)
+            finally:
+                await pubsub.unsubscribe(ENGINE_CONTROL_CHANNEL)
+                await pubsub.aclose()
+            _control_fail_count = 0
+        except Exception as e:  # noqa: BLE001
+            if _shutdown.is_set():
+                return
+            logger.exception("제어 루프 오류 — 재구독 시도")
+            _control_fail_count += 1
+            if _control_fail_count == FAILURE_ALERT_THRESHOLD:
+                await publish_alert(
+                    redis_client, user_id=None, strategy_id=0, severity="critical",
+                    code="runner_failures",
+                    message=(
+                        f"엔진 제어 루프 연속 {_control_fail_count}회 실패 — "
+                        f"전략 start/stop 원격제어가 반영되지 않고 있을 수 있음. 마지막 원인: {e}"
+                    ),
+                )
+            try:
+                await asyncio.wait_for(_shutdown.wait(), timeout=_CONTROL_RETRY_DELAY)
+            except asyncio.TimeoutError:
+                pass
 
 
 async def _recover() -> None:
