@@ -572,6 +572,27 @@ fills.py::record_fill`의 오버셀 무경보 클램프, `broker/factory.py`의 
 순수하게 검증했다. 실행 결과 실제 버그는 발견되지 않았으나(로직 자체는
 정확했음), 향후 회귀를 막는 안전망을 확보했다.
 
+## 신규 발굴 (2026-07-21 재점검, §32)
+
+§1~31 및 남은 과제(외부 자원 필요 4건)와 겹치지 않는 후보를 재탐색(6차).
+`engine/fills.py::record_fill`의 오버셀 무경보 클램프, `broker/factory.py`의
+시세 전용 헬퍼 테스트 공백은 5차에 이어 확신도 중간~낮음으로 이번에도 보류.
+
+## 32. `engine/runner.py::StrategyRunner` 단일종목 매매 핵심 로직 테스트 커버리지 0 해소 ✅
+
+`RebalanceRunner`(리밸런싱)는 `test_engine_e2e.py`로 종단 검증돼 있었지만,
+개별 종목을 손절%/익절%/트레일링·리스크 한도로 실거래 청산하는
+`StrategyRunner._tick_once`는 이제까지 참조하는 테스트가 전무했다(§신규발굴
+6차 1위). 손절이 매수 신호보다 우선 처리되는 순서, `RiskLimit.stop_loss_pct`
+손절과 전략 config 청산(손절%/익절%/트레일링)의 독립적 작동, 트레일링 고점의
+Redis 캐시 갱신·보유 종료 시 정리, `(user, symbol)` 포지션 락 경합 시 tick
+스킵, 계좌 공통 일일 손실 한도 초과 시 신규 매수 진입 차단 — 자금 리스크
+직결도가 가장 높은 이 계약들을 `test_strategy_runner.py` 신설(9건)로
+검증했다. `test_engine_e2e.py`와 동일한 인메모리 DB(FakeDB/`_Store`)·
+FakeBroker·FakeRedis로 실제 `risk.py`/`executor.py`를 그대로 태워 종단으로
+확인했으며(신호 자체는 `latest_signal`만 고정값으로 대역화), 실제 버그는
+발견되지 않았으나(로직은 정확했음) 향후 회귀를 막는 안전망을 확보했다.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |
