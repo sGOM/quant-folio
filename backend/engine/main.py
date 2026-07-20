@@ -19,6 +19,7 @@ from app.core.channels import (
     ACTIVE_STRATEGIES_KEY,
     ENGINE_CONTROL_CHANNEL,
     ENGINE_HEARTBEAT_KEY,
+    FAILURE_ALERT_THRESHOLD,
 )
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
@@ -49,6 +50,13 @@ _shutdown = asyncio.Event()           # 그레이스풀 셧다운 신호
 _runners: dict[int, dict] = {}        # strategy_id -> {task, stop} 실행 중 전략 러너
 _feed_mgr = PriceFeedManager(redis_client)  # 사용자별 실시간 시세 피드 관리자
 _fill_notice_mgr = FillNoticeManager(redis_client)  # 사용자별 실시간 체결통보 리스너
+
+# 전역 상시 루프(reconcile/fill_notice 재동기화)의 연속 실패 카운트 — base_runner
+# 의 러너별 _consecutive_failures 와 같은 목적. 이 두 루프는 특정 전략에 속하지
+# 않는 프로세스 전역 루프라 사용자를 특정할 수 없으므로 strategy_id=0(sentinel)로
+# 발행한다(worker/tasks.py 의 db_backup_failed 등과 동일한 관례).
+_reconcile_fail_count = 0
+_fill_notice_fail_count = 0
 
 
 def _handle_signal(*_args) -> None:
@@ -274,7 +282,13 @@ _RECONCILE_INTERVAL = 60  # 초
 
 
 async def _reconcile_loop() -> None:
-    """주기적으로 미체결(SUBMITTED/PARTIAL) 주문을 재조회해 체결·포지션을 정합한다."""
+    """주기적으로 미체결(SUBMITTED/PARTIAL) 주문을 재조회해 체결·포지션을 정합한다.
+
+    이 루프가 조용히 죽으면 미체결 주문이 영원히 SUBMITTED 로 남아 실제 금전
+    리스크로 이어질 수 있어, base_runner 의 러너별 연속 실패 알림과 같은 패턴
+    (임계 도달 '순간'에만 1회 발행, 성공하면 리셋)을 전역 루프에도 적용한다.
+    """
+    global _reconcile_fail_count
     from engine.reconcile import reconcile_open_orders
 
     while not _shutdown.is_set():
@@ -283,8 +297,19 @@ async def _reconcile_loop() -> None:
                 stats = await reconcile_open_orders(db, redis_client)
             if stats["filled"] or stats["partial"]:
                 logger.info("체결 재조회 정합: %s", stats)
-        except Exception:  # noqa: BLE001
+            _reconcile_fail_count = 0
+        except Exception as e:  # noqa: BLE001
             logger.exception("체결 재조회 루프 오류")
+            _reconcile_fail_count += 1
+            if _reconcile_fail_count == FAILURE_ALERT_THRESHOLD:
+                await publish_alert(
+                    redis_client, user_id=None, strategy_id=0, severity="critical",
+                    code="runner_failures",
+                    message=(
+                        f"체결 재조회 루프 연속 {_reconcile_fail_count}회 실패 — "
+                        f"미체결 주문이 정합되지 않고 있을 수 있음. 마지막 원인: {e}"
+                    ),
+                )
         try:
             await asyncio.wait_for(_shutdown.wait(), timeout=_RECONCILE_INTERVAL)
         except asyncio.TimeoutError:
@@ -298,13 +323,26 @@ async def _fill_notice_loop() -> None:
     """체결통보 리스너 구독 상태를 주기적으로 재동기화한다(자기 치유 안전망).
 
     _start_strategy/_stop_strategy 가 즉시 _sync_fill_notices 를 호출하지만,
-    자격증명 갱신 등으로 어긋난 경우를 대비해 주기적으로도 맞춘다.
+    자격증명 갱신 등으로 어긋난 경우를 대비해 주기적으로도 맞춘다. 연속 실패는
+    _reconcile_loop 와 동일한 임계-교차 1회 알림 패턴을 쓴다.
     """
+    global _fill_notice_fail_count
     while not _shutdown.is_set():
         try:
             await _sync_fill_notices()
-        except Exception:  # noqa: BLE001
+            _fill_notice_fail_count = 0
+        except Exception as e:  # noqa: BLE001
             logger.exception("체결통보 재동기화 루프 오류")
+            _fill_notice_fail_count += 1
+            if _fill_notice_fail_count == FAILURE_ALERT_THRESHOLD:
+                await publish_alert(
+                    redis_client, user_id=None, strategy_id=0, severity="critical",
+                    code="runner_failures",
+                    message=(
+                        f"체결통보 재동기화 루프 연속 {_fill_notice_fail_count}회 실패 — "
+                        f"체결통보 구독이 어긋난 상태일 수 있음. 마지막 원인: {e}"
+                    ),
+                )
         try:
             await asyncio.wait_for(_shutdown.wait(), timeout=_FILL_NOTICE_RESYNC_INTERVAL)
         except asyncio.TimeoutError:
