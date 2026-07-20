@@ -615,6 +615,28 @@ DB `idempotency_key` 기존 주문 스킵, `IntegrityError` UNIQUE 충돌 흡수
 FakeBroker·FakeRedis 를 팩토리 패치 없이 바로 사용했다. 실제 버그는
 발견되지 않았으나(로직은 정확했음) 향후 회귀를 막는 안전망을 확보했다.
 
+## 신규 발굴 (2026-07-21 재점검, §34)
+
+§1~33 및 남은 과제(외부 자원 필요 4건)와 겹치지 않는 후보를 재탐색(8차).
+`engine/fills.py::record_fill`의 오버셀 무경보 클램프, `broker/factory.py`의
+시세 전용 헬퍼 테스트 공백은 5~7차에 이어 확신도 중간~낮음으로 이번에도 보류.
+
+## 34. `engine/risk.py` evaluate_buy/evaluate_sell/check_stop_loss 순수 유닛 테스트 커버리지 0 해소 ✅
+
+`test_per_strategy_risk.py`는 `check_daily_loss_limit`/`_daily_pnl`만 정밀
+검증했고, 실제 주문 수량·청산 여부를 결정하는 `evaluate_buy`/`evaluate_sell`/
+`check_stop_loss`/`_aggregate_position`은 직접 호출하는 테스트가 전무했다
+(§신규발굴 8차 1위, grep 으로 재확인해 확신도 중간→높음 상향). `max_position_
+size` 잔여한도 소진 시 즉시 거부, 가용 현금이 1주 미만일 때 거부, 유효하지
+않은 가격 방어, `evaluate_sell`의 전략 스코프(자기 전략 보유분만) vs 계좌
+합산 스코프(여러 전략 합산) 분기, `check_stop_loss`의 RiskLimit 없음/
+`stop_loss_pct` 미설정/`avg_price<=0` 방어, `_aggregate_position`의 여러
+전략 동일 종목 수량가중 평균 계산 — 을 `test_risk_evaluate.py` 신설(15건)로
+검증했다. `test_per_strategy_risk.py`의 픽스처 패턴을 재사용하되, 이 세
+함수는 db.execute(JOIN)를 쓰지 않아 conftest 기본 FakeDB 로 충분했다. 실제
+버그는 발견되지 않았으나(경계 조건 전부 정확했음) 향후 회귀를 막는 안전망을
+확보했다.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |
