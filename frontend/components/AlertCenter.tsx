@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Bell, ShieldAlert, X } from "lucide-react";
 import { useEventSocket } from "@/lib/useWebSocket";
 import { cn } from "@/lib/utils";
@@ -24,6 +24,8 @@ interface ToastItem {
 const TOAST_TTL_MS = 8000;
 /** GET /api/alerts 폴링 주기 — WS 이벤트가 즉시 무효화해 주므로 이건 안전망(재연결 공백 등)용. */
 const REFETCH_INTERVAL_MS = 60_000;
+/** 한 번에 불러오는 알림 수 — "더보기"로 offset을 이만큼씩 넘겨 이전 이력을 이어 붙인다(§21). */
+const PAGE_SIZE = 50;
 
 /** 코드 → 사람이 읽을 라벨. */
 const CODE_LABEL: Record<string, string> = {
@@ -43,7 +45,8 @@ const CODE_LABEL: Record<string, string> = {
 /**
  * 엔진 알림 센터 — 서버 영속화(alerts 테이블, §17) + WS 실시간 토스트.
  * - 종 버튼은 서버 `unread_count` 배지를 달고, 패널을 열면 최신 50건(본인 + 전역 알림)을
- *   보여준다. 개별/전체 확인 처리는 서버에 반영되어 다른 세션·재접속에도 유지된다.
+ *   보여준다. 하단 "이전 알림 더보기"로 offset 페이지네이션(§21) 이력을 이어 붙인다.
+ *   개별/전체 확인 처리는 서버에 반영되어 다른 세션·재접속에도 유지된다.
  * - WS "alert" 이벤트는 별도로 토스트를 띄우고 목록 쿼리를 무효화해 즉시 반영한다
  *   (미접속 중 발행된 알림도 다음 접속 시 서버 목록에서 놓치지 않고 확인 가능).
  * 화면 콘텐츠를 가리지 않도록 fixed 코너에만 배치한다.
@@ -54,9 +57,14 @@ export function AlertCenter() {
   const seq = useRef(0);
   const qc = useQueryClient();
 
-  const list = useQuery({
+  const list = useInfiniteQuery({
     queryKey: ["alerts"],
-    queryFn: () => api.listAlerts(false, 50),
+    queryFn: ({ pageParam }) => api.listAlerts(false, PAGE_SIZE, pageParam),
+    initialPageParam: 0,
+    // 응답에 has_more 가 없으므로 마지막 페이지가 꽉 찼으면 다음 페이지가 있다고 본다
+    // (경계에서 마지막 "더보기"가 빈 페이지 한 번을 받을 수 있으나 무해).
+    getNextPageParam: (last, all) =>
+      last.items.length === PAGE_SIZE ? all.length * PAGE_SIZE : undefined,
     refetchInterval: REFETCH_INTERVAL_MS,
   });
 
@@ -93,8 +101,19 @@ export function AlertCenter() {
     setToasts((l) => l.filter((t) => t.id !== id));
   }
 
-  const alerts = list.data?.items ?? [];
-  const unreadCount = list.data?.unread_count ?? 0;
+  // 새 알림 유입으로 offset 이 밀리면 페이지 경계에서 같은 알림이 중복될 수 있어 id 로 걸러낸다.
+  const alerts = (() => {
+    const seen = new Set<number>();
+    const merged: AlertRecord[] = [];
+    for (const a of list.data?.pages.flatMap((p) => p.items) ?? []) {
+      if (!seen.has(a.id)) {
+        seen.add(a.id);
+        merged.push(a);
+      }
+    }
+    return merged;
+  })();
+  const unreadCount = list.data?.pages[0]?.unread_count ?? 0;
 
   return (
     <>
@@ -144,6 +163,17 @@ export function AlertCenter() {
                   <AlertListRow key={a.id} item={a} onMarkRead={() => markRead.mutate(a.id)} />
                 ))}
               </ul>
+            )}
+            {list.hasNextPage && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => list.fetchNextPage()}
+                disabled={list.isFetchingNextPage}
+                className="mt-1.5 h-7 w-full text-xs text-muted-foreground"
+              >
+                {list.isFetchingNextPage ? "불러오는 중…" : "이전 알림 더보기"}
+              </Button>
             )}
           </div>
         </Card>
