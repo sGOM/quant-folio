@@ -86,7 +86,7 @@ def _record_fill_spy(monkeypatch):
     """engine.fills.record_fill 을 대역화해 delta/price/fully_filled 인자를 기록한다."""
     calls: list[dict] = []
 
-    async def _fake(db, order, qty, price, *, fully_filled):
+    async def _fake(db, order, qty, price, *, fully_filled, redis=None):
         calls.append({"order": order, "qty": qty, "price": price, "fully_filled": fully_filled})
         order.status = OrderStatus.FILLED if fully_filled else OrderStatus.PARTIAL
 

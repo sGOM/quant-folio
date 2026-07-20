@@ -637,6 +637,22 @@ size` 잔여한도 소진 시 즉시 거부, 가용 현금이 1주 미만일 때
 버그는 발견되지 않았으나(경계 조건 전부 정확했음) 향후 회귀를 막는 안전망을
 확보했다.
 
+## 35. `engine/fills.py::record_fill` 오버셀 무경보 클램프 해소 ✅
+
+매도 체결이 보유수량을 초과하면 `pos.qty`가 조용히 0으로 클램프되고 로그·
+알림이 전혀 없었다(5~8차에 걸쳐 이월된 후보, 확신도 중간). 정합 경쟁(§31
+분산 락으로 대부분 막히지만 이론상 배제 불가)이나 이중 체결 기록이 발생하면
+포지션 수량이 흔적 없이 사라져 계정 상태 오류를 은폐할 수 있었다.
+`record_fill`에 선택적 `redis` 매개변수를 추가해, 오버셀 감지 시 warning
+로그와 함께(§21 알림 인프라 재사용) `oversell_clamped` 코드로 사용자별
+warning 알림을 발행하도록 수정했다. `engine.alerts`가 이미 `engine.fills`를
+import 하므로 순환 import 를 피하기 위해 함수 내부에서 지연 import 했다.
+3개 호출부(`executor.execute_signal`·`reconcile._apply`·`fill_notice.
+apply_fill_notice`) 모두 이미 갖고 있던 `redis`를 그대로 전달하도록
+수정(하위호환: `redis=None`이면 기존처럼 로그만). `test_multi_strategy_
+positions.py`에 오버셀 클램프+알림 발행 검증과 정상 매도는 알림이 없음을
+확인하는 대조군 테스트 2건을 추가했다.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |
