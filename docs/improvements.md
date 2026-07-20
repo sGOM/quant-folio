@@ -470,6 +470,15 @@ sentinel(`user_id=None`)이 아닌 실제 user_id 사용 — WS 토스트도 정
 `test_price_feed.py` 신설(4건 — 임계 교차 시 정확히 1회 알림, 임계 미달 무알림,
 성공 시 카운터 리셋). 이전까지 이 모듈은 테스트 0건이었다.
 
+## 26. `engine/kis_ws.py` 테스트 커버리지 0 해소 ✅
+
+실시간 매매의 가격 소스인 `KisWebSocketClient`(구독 메시지 생성·PINGPONG 응답·
+체결가 프레임 파싱)에 테스트가 전무했다. `test_kis_ws.py` 신설(7건 — 구독
+tr_type 1/2, PINGPONG 응답, 정상 체결가 파싱과 그 예외 경로들 — 잘못된
+tr_id·0가·파싱 불가 가격). 실제 WS 연결(`run`/`issue_approval_key`)은 실
+네트워크가 필요해 이 스위트 범위 밖 — `_handle`처럼 네트워크 없이 검증
+가능한 순수 로직만 다룬다.
+
 ## 남은 과제
 
 | 순위 | 항목 | 이유 |
