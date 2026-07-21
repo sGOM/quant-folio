@@ -12,15 +12,22 @@ const INPUT =
  * 종목코드 입력 + 자동완성. 코드/한글명/영문명으로 검색해 선택하면 코드를 채운다.
  * 직접 코드를 타이핑하는 방식도 그대로 지원한다(value 는 항상 종목코드).
  *
- * @param value    현재 종목코드
- * @param onChange 코드 변경 콜백(선택 또는 직접 입력)
+ * @param value        현재 종목코드
+ * @param onChange     코드 변경 콜백(선택 또는 직접 입력)
+ * @param commitOnType 기본 true — 숫자 0~6자리 패턴에 매치되면 매 키 입력마다 즉시
+ *                      onChange 를 호출한다(단일종목 선택용, "마지막 호출이 최종값"인 용도).
+ *                      false 로 넘기면 타이핑 중에는 onChange 를 호출하지 않고, 드롭다운
+ *                      선택 또는 Enter 로 확정할 때만 호출한다("추가(append)" 용도 — 이
+ *                      경우 타이핑 중간의 부분 문자열이 그대로 커밋되면 안 되기 때문).
  */
 export function SymbolSearch({
   value,
   onChange,
+  commitOnType = true,
 }: {
   value: string;
   onChange: (code: string) => void;
+  commitOnType?: boolean;
 }) {
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
@@ -60,6 +67,16 @@ export function SymbolSearch({
     setOpen(false);
   }
 
+  /** commitOnType=false 일 때 Enter 로 직접 입력한 코드를 확정 커밋. */
+  function commitTyped() {
+    const v = query.trim();
+    if (!v) return;
+    onChange(v);
+    setSelectedName(null);
+    setQuery("");
+    setOpen(false);
+  }
+
   return (
     <div ref={boxRef} className="relative">
       <input
@@ -69,8 +86,15 @@ export function SymbolSearch({
           setQuery(v);
           setOpen(true);
           setSelectedName(null);
-          // 숫자 코드를 직접 입력하는 경우 즉시 반영(자유 입력 지원).
-          if (/^\d{0,6}$/.test(v)) onChange(v);
+          // 숫자 코드를 직접 입력하는 경우 즉시 반영(단일종목 선택용 자유 입력 지원).
+          // append 용도(commitOnType=false)는 선택/Enter 확정 전까지 부모에 알리지 않는다.
+          if (commitOnType && /^\d{0,6}$/.test(v)) onChange(v);
+        }}
+        onKeyDown={(e) => {
+          if (!commitOnType && e.key === "Enter") {
+            e.preventDefault();
+            commitTyped();
+          }
         }}
         onFocus={() => {
           setQuery(value);
