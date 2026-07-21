@@ -786,4 +786,79 @@ id=23 A/B(§20, 2026-07-19) — 반기 교차 혼재로 현행(미적용) 유지
 "더보기" 프론트 UI(§21 부수, 2026-07-19) — `AlertCenter.tsx` `useInfiniteQuery`
 전환·이전 이력 로드 버튼 연동 완료.
 
+## 43. 로그인 실패 카운터 `X-Forwarded-For` 스푸핑으로 IP 스로틀 무력화 — 수정 ✅
+
+review-fastapi 가 발견한 보안 취약점.
+
+**문제**: `app/api/routes/auth.py::_client_ip`가 `X-Forwarded-For` 헤더의
+**첫 번째** 항목을 그대로 신뢰해 `login()`의 IP당 실패 카운터
+(`_LOGIN_FAIL_LIMIT_IP=50`, 15분 창)의 유일한 근거로 썼다. 그런데
+`Caddyfile`(리버스 프록시)의 `@backend` 블록은 이 헤더에 대해 `header_up`
+덮어쓰기나 신뢰 프록시 설정이 전혀 없었다.
+
+**근거**: Caddy(Go `httputil.ReverseProxy` 표준 동작)는 클라이언트가 이미
+보낸 `X-Forwarded-For` 를 지우지 않고 그 뒤에 실제 접속 IP만 추가한다.
+공격자가 `X-Forwarded-For: <임의값>` 을 직접 실어 보내면 Caddy 통과 후
+헤더는 `"<임의값>, <진짜 IP>"` 가 되는데, 신뢰해야 할 값은 **마지막**
+항목인데도 코드는 첫 항목을 취해 매 요청마다 이 값을 회전시키면 IP당
+50회 한도가 전혀 누적되지 않았다(이메일당 10회 한도는 여전히 적용되어
+단일 계정 크리덴셜 스터핑은 막히지만, 다계정 스프레이 방어가 우회됨).
+
+**수정**: 이중 방어.
+1. `Caddyfile` `@backend` 블록의 `reverse_proxy web:8000 { ... }` 내부에
+   `header_up X-Forwarded-For {remote_host}` 를 추가해, 클라이언트가
+   실어 보낸 기존 값을 Caddy 가 실제로 관측한 접속 IP로 항상 덮어쓰게
+   했다(반드시 `reverse_proxy` 블록 안에 중첩해야 함 — 최상위
+   `header_up` 은 `handle` 블록에서 인식되지 않는 디렉티브라 `caddy
+   validate` 가 파싱 에러를 낸다).
+2. `_client_ip`도 방어 이중화 차원에서 콤마 구분 값 중 **마지막** 항목을
+   취하도록 변경(`fwd.rsplit(",", 1)[-1]`)하고, Caddy 의 `header_up` 이
+   이 값을 신뢰 가능한 단일 값으로 만든다는 근거를 주석에 명시했다.
+
+**검증**: `docker compose exec proxy caddy validate --config
+/etc/caddy/Caddyfile` 통과(문법 경고 1건은 "기본 동작이 이미 헤더를
+전달한다"는 일반 정적 분석 문구로, 의도적인 override와 무관). `proxy`/
+`web` 재기동 후 `curl -H "X-Forwarded-For: 1.2.3.4" http://127.0.0.1:8080/health`
+호출 시 web 로그엔 실제 접속 IP(127.0.0.1)만 기록되어 스푸핑 값이
+반영되지 않음을 확인. ASGI 레벨에서 `x-forwarded-for: 9.9.9.9, 5.6.7.8`
+2단 값을 직접 실어 `/api/auth/login` 호출 시 `_client_ip` 가 마지막
+항목(`5.6.7.8`)을 취함을 확인. `docker compose exec web pytest
+tests/test_auth_routes.py` 15건 전체 통과(회귀 없음).
+
+## 44. `SymbolSearch` append 재사용 시 타이핑 중 부분 문자열 코드가 universe 에 커밋되는 버그 — 수정 ✅
+
+review-nextjs 가 발견한 실제 버그.
+
+**문제**: `components/SymbolSearch.tsx`의 입력 `onChange` 핸들러는 자유
+타이핑을 지원하기 위해 값이 숫자 0~6자리 패턴(`/^\d{0,6}$/`)에 매치될
+때마다 매 키 입력 즉시 부모 `onChange` 를 호출했다. 이 설계는
+`StrategyForm.tsx`의 단일종목 선택("마지막 호출이 최종값을 덮어쓰는"
+용도)에는 문제가 없었지만, `components/strategy-form/RebalanceFields.tsx`
+는 같은 컴포넌트를 `addSymbol`(universe 배열에 **추가**)의 의미로
+재사용했다. 사용자가 자동완성 없이 종목코드(예: "005930")를 직접
+타이핑하면 "0"→"00"→"005"→…→"005930" 각 부분 문자열이 매번
+`config.universe.includes(c)` 를 통과(서로 다른 문자열이라 매번 "신규"로
+판정)해, 무효한 개별 코드들이 그대로 universe 배열에 커밋됐다.
+`validate.ts::validateRebalance`는 빈 문자열·중복만 걸러내 이 무효
+코드들을 막지 못했다.
+
+**수정**: `SymbolSearch`에 `commitOnType?: boolean`(기본 `true`, 기존
+동작 유지) prop을 추가했다. `true`(기본)면 기존대로 숫자 타이핑마다
+즉시 `onChange`를 호출한다(`StrategyForm.tsx`/`news/page.tsx`의 단일종목
+선택 용도는 그대로 유지, prop 미지정). `false`면 타이핑 중에는 부모
+`onChange`를 호출하지 않고, 드롭다운 `pick()` 선택 또는 입력창에서
+Enter(신규 `commitTyped()` — `onKeyDown`에서 처리)로 확정할 때만 호출한다.
+`RebalanceFields.tsx`의 `<SymbolSearch value={addCode} onChange={addSymbol}
+commitOnType={false} />`로 배선해, `addSymbol`이 완성된 코드에 대해서만
+호출되도록 정정했다.
+
+**검증**: `docker compose exec frontend npx tsc --noEmit`,
+`npx eslint`(대상 파일) 통과. 신규 단위 테스트
+`components/__tests__/SymbolSearch.test.tsx`(4건 — 기본 모드 즉시 반영
+유지, `commitOnType=false` 타이핑 중 미호출, Enter 확정, 드롭다운 선택
+확정)와 `components/strategy-form/__tests__/RebalanceFields.test.tsx`(2건
+— 부분 문자열 미커밋, Enter 확정 시 정확히 1개만 universe 에 추가)를
+신설. `docker compose exec frontend npm run test -- --run` 전체
+12파일/130건 통과(회귀 없음).
+
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.
