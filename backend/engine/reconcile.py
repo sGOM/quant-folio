@@ -24,6 +24,7 @@ from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.channels import RECONCILE_LOCK_TTL, reconcile_lock_key
 from app.core.config import settings
 from app.models import Execution, Order, OrderSide, OrderStatus, User
 from app.services.broker import BrokerClient, BrokerError, make_broker_for_user
@@ -34,11 +35,11 @@ logger = logging.getLogger("engine.reconcile")
 # 아직 체결이 마무리되지 않아 재조회 대상인 상태.
 _OPEN_STATUSES = (OrderStatus.SUBMITTED, OrderStatus.PARTIAL)
 
-# 같은 주문을 여러 프로세스(엔진 _reconcile_loop + 수동 scripts/reconcile_fills.py)가
-# 동시에 정합하면, 둘 다 커밋 전에 executions 합을 읽어 같은 체결을 이중 기록할 수 있다.
-# 주문 단위 분산 락(SET NX)으로 한 번에 한 프로세스만 해당 주문을 처리하게 직렬화한다.
-_RECONCILE_LOCK_PREFIX = "reconcile:lock:"
-_RECONCILE_LOCK_TTL = 30  # 초
+# 같은 주문을 여러 프로세스(엔진 _reconcile_loop + 수동 scripts/reconcile_fills.py)나
+# 같은 프로세스의 다른 경로(실시간 체결통보 fill_notice)가 동시에 정합하면, 둘 다
+# 커밋 전에 executions 합을 읽어 같은 체결을 이중 기록할 수 있다. 주문 단위 분산 락
+# (SET NX)으로 한 번에 한 경로만 해당 주문을 처리하게 직렬화한다. 락 키·TTL 은
+# app.core.channels 에 두어 fill_notice 와 공유한다(서로 배제되도록 키 통일).
 
 
 def _balance_map(balance) -> dict[str, tuple[int, Decimal | None]]:
@@ -189,9 +190,9 @@ async def reconcile_open_orders(
         await _apply(order, delta, price, fully)
 
     for order in orders:
-        lock_key = f"{_RECONCILE_LOCK_PREFIX}{order.id}"
-        if not await redis.set(lock_key, "1", nx=True, ex=_RECONCILE_LOCK_TTL):
-            continue  # 다른 프로세스가 이 주문을 정합 중 — 건너뛴다.
+        lock_key = reconcile_lock_key(order.id)
+        if not await redis.set(lock_key, "1", nx=True, ex=RECONCILE_LOCK_TTL):
+            continue  # 다른 경로가 이 주문을 정합 중 — 건너뛴다.
         try:
             await _process_one(order)
         finally:

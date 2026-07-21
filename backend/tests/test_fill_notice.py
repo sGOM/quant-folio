@@ -164,12 +164,31 @@ class _FakeSession:
 
 
 class _FakeRedis:
+    """publish + 분산 락(SET NX/DELETE/GET) 을 지원하는 인메모리 Redis 대역.
+
+    apply_fill_notice 가 reconcile 과 공유하는 주문 단위 정합 락(reconcile_lock_key)
+    을 SET NX 로 잡으므로, 락 관련 동작(이미 잡혀 있으면 실패)을 재현한다.
+    """
+
     def __init__(self):
         self.published: list[tuple[str, str]] = []
+        self.store: dict[str, str] = {}
 
     async def publish(self, channel, data):
         self.published.append((channel, data))
         return 1
+
+    async def set(self, k, v, ex=None, nx=False):
+        if nx and k in self.store:
+            return None
+        self.store[k] = v
+        return True
+
+    async def get(self, k):
+        return self.store.get(k)
+
+    async def delete(self, k):
+        self.store.pop(k, None)
 
 
 def _order(order_id: int, user_id: int, symbol: str, qty: int, kis_order_id: str) -> Order:
@@ -265,6 +284,100 @@ async def test_partial_then_full_fill_accumulates_without_duplication(monkeypatc
     # 첫 4주 + 이번 델타 6주 = 누적 10주. 중복 기록 없이 정확히 두 건.
     assert len(session.executions) == 2
     assert sum(int(e.filled_qty) for e in session.executions) == 10
+
+
+# ─────── 4-b) reconcile 폴링과의 동시성: 주문 단위 공유 락으로 이중 기록 방지 ───────
+
+
+async def _reconcile_critical_section(session, order, redis, cum_qty: int) -> bool:
+    """reconcile_open_orders 의 임계구역(주문 단위 공유 락 + 델타 멱등 기록)을 축약 재현.
+
+    실제 reconcile 은 브로커 조회가 필요해 이 단위 테스트에서 곧바로 돌리기 무겁다.
+    핵심은 fill_notice 와 '같은' 락 키(reconcile_lock_key)로 상호 배제되는지이므로,
+    reconcile 이 쓰는 락 획득→_order_recorded_qty→record_fill→commit→락 해제 순서를
+    동일하게 재현한다. 락을 못 잡으면(fill_notice 가 선점) 스킵한다.
+    """
+    from app.core.channels import RECONCILE_LOCK_TTL, reconcile_lock_key
+    from engine.fills import record_fill
+    from engine.reconcile import _order_recorded_qty
+
+    lock_key = reconcile_lock_key(order.id)
+    if not await redis.set(lock_key, "1", nx=True, ex=RECONCILE_LOCK_TTL):
+        return False  # fill_notice 가 이 주문을 정합 중 — 다음 주기에 재수렴.
+    try:
+        already = await _order_recorded_qty(session, order.id)
+        delta = cum_qty - already
+        if delta <= 0:
+            return False
+        fully = (already + delta) >= int(order.qty)
+        await record_fill(session, order, delta, Decimal("70000"), fully_filled=fully, redis=redis)
+        await session.commit()
+        return True
+    finally:
+        await redis.delete(lock_key)
+
+
+async def test_fill_notice_skips_when_reconcile_holds_lock(monkeypatch):
+    """reconcile 이 주문 단위 락을 잡고 체결을 기록·커밋하는 동안 같은 주문의 실시간
+    체결통보가 도착해도, 공유 락 때문에 fill_notice 는 스킵해 이중 기록하지 않는다."""
+    from app.core.channels import reconcile_lock_key
+    from engine import fill_notice
+    from engine.fills import record_fill
+
+    session = _FakeSession()
+    order = _order(1, user_id=7, symbol="005930", qty=10, kis_order_id="ODNO010")
+    session.orders.append(order)
+    monkeypatch.setattr(fill_notice, "AsyncSessionLocal", lambda: session)
+    redis = _FakeRedis()
+
+    # reconcile 이 먼저 락을 잡고 전량 체결(10주)을 기록·커밋한 상태(락은 아직 보유 중).
+    lock_key = reconcile_lock_key(order.id)
+    assert await redis.set(lock_key, "1", nx=True, ex=30) is True
+    await record_fill(session, order, 10, Decimal("70000"), fully_filled=True, redis=redis)
+    await session.commit()
+
+    # 동시에 도착한 실시간 체결통보(같은 누적 10주) — 락이 잡혀 있어 스킵된다.
+    notice = parse_fill_notice(_notice_plain("ODNO010", "005930", 10, "70000"))
+    applied = await apply_fill_notice(7, notice, redis)
+    assert applied is False
+    assert len(session.executions) == 1  # 이중 기록 없음
+
+    # reconcile 종료로 락이 풀린 뒤 재통보가 와도 델타 멱등으로 스킵(재수렴).
+    await redis.delete(lock_key)
+    applied2 = await apply_fill_notice(7, notice, redis)
+    assert applied2 is False
+    assert len(session.executions) == 1
+
+
+async def test_concurrent_reconcile_and_fill_notice_records_once(monkeypatch):
+    """reconcile 과 fill_notice 가 같은 주문·같은 누적 체결을 '동시에'(asyncio.gather)
+    처리해도, 공유 주문 단위 락 + 델타 멱등으로 체결은 정확히 한 번만 기록된다.
+
+    락을 먼저 잡은 쪽이 이기고, 진 쪽은 스킵하거나(락 실패) 잡더라도 델타 0으로 스킵한다."""
+    import asyncio
+
+    from engine import fill_notice
+
+    session = _FakeSession()
+    order = _order(1, user_id=7, symbol="005930", qty=10, kis_order_id="ODNO011")
+    session.orders.append(order)
+    monkeypatch.setattr(fill_notice, "AsyncSessionLocal", lambda: session)
+    redis = _FakeRedis()
+
+    notice = parse_fill_notice(_notice_plain("ODNO011", "005930", 10, "70000"))
+    results = await asyncio.gather(
+        _reconcile_critical_section(session, order, redis, cum_qty=10),
+        apply_fill_notice(7, notice, redis),
+    )
+
+    assert results.count(True) == 1  # 정확히 한 경로만 기록
+    assert len(session.executions) == 1
+    assert sum(int(e.filled_qty) for e in session.executions) == 10
+    assert order.status == OrderStatus.FILLED
+    # 락 키는 양쪽 모두 종료 후 해제되어 남지 않는다.
+    from app.core.channels import reconcile_lock_key
+
+    assert reconcile_lock_key(order.id) not in redis.store
 
 
 # ─────────────────────────── 5) KIS_HTS_ID 미설정 시 no-op ───────────────────────────

@@ -41,6 +41,7 @@ from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from sqlalchemy import select
 
+from app.core.channels import RECONCILE_LOCK_TTL, reconcile_lock_key
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models import Order
@@ -131,6 +132,14 @@ async def apply_fill_notice(user_id: int, notice: FillNoticeData, redis) -> bool
 
     reconcile.py 와 동일하게 "이미 기록된 누적 체결수량" 대비 델타만 record_fill 에
     넘겨 executor 즉시체결·reconcile 폴링과 중복 기록되지 않게 한다.
+
+    동시성: reconcile 폴링(engine/main.py._reconcile_loop)과 이 실시간 체결통보는
+    같은 프로세스의 별도 asyncio 태스크로 동시에 돈다. `_order_recorded_qty` 는
+    await 포인트를 포함하므로, 락 없이 두 경로가 같은 주문의 executions 합을 커밋
+    전에 각자 읽으면 같은 체결을 이중 기록·이중 가산할 수 있다. reconcile 과 동일한
+    주문 단위 분산 락(app.core.channels.reconcile_lock_key, SET NX)을 공유해 읽기-
+    델타-기록-커밋 구간을 상호 배제한다. 락을 잡지 못하면(다른 경로가 정합 중) 이번
+    통보는 스킵하고 False 를 반환한다 — 델타 멱등이라 다음 통보/폴링에서 재수렴된다.
     """
     async with AsyncSessionLocal() as db:
         order = await db.scalar(
@@ -143,20 +152,31 @@ async def apply_fill_notice(user_id: int, notice: FillNoticeData, redis) -> bool
             )
             return False
 
-        already = await _order_recorded_qty(db, order.id)
-        target = int(order.qty)
-        delta = notice.qty - already
-        if delta <= 0:
+        lock_key = reconcile_lock_key(order.id)
+        if not await redis.set(lock_key, "1", nx=True, ex=RECONCILE_LOCK_TTL):
+            # reconcile 폴링 등 다른 경로가 이 주문을 정합 중 — 이중 기록을 피해 스킵.
+            # 델타 멱등이라 다음 체결통보 또는 다음 reconcile 주기에서 재수렴한다.
             logger.debug(
-                "체결통보 중복/이미 반영 — 스킵 odno=%s 누적통보=%d 기록됨=%d",
-                notice.odno, notice.qty, already,
+                "체결통보 정합 락 획득 실패(다른 경로 처리 중) — 스킵 odno=%s", notice.odno,
             )
             return False
+        try:
+            already = await _order_recorded_qty(db, order.id)
+            target = int(order.qty)
+            delta = notice.qty - already
+            if delta <= 0:
+                logger.debug(
+                    "체결통보 중복/이미 반영 — 스킵 odno=%s 누적통보=%d 기록됨=%d",
+                    notice.odno, notice.qty, already,
+                )
+                return False
 
-        fully = (already + delta) >= target
-        price = notice.price if notice.price and notice.price > 0 else order.price
-        await record_fill(db, order, delta, price, fully_filled=fully, redis=redis)
-        await db.commit()
+            fully = (already + delta) >= target
+            price = notice.price if notice.price and notice.price > 0 else order.price
+            await record_fill(db, order, delta, price, fully_filled=fully, redis=redis)
+            await db.commit()
+        finally:
+            await redis.delete(lock_key)
 
         await publish_event(redis, {
             "type": "execution", "user_id": user_id, "order_id": order.id,

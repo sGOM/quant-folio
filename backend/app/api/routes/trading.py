@@ -2,7 +2,7 @@
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -81,16 +81,16 @@ async def list_positions(
 
 @router.get("/orders", response_model=list[OrderOut])
 async def list_orders(
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=200),
     current: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """최근 주문 내역을 최신순으로 반환한다(감사 로그). limit 최대 200."""
+    """최근 주문 내역을 최신순으로 반환한다(감사 로그). limit 1~200."""
     rows = await db.scalars(
         select(Order)
         .where(Order.user_id == current.id)
         .order_by(Order.created_at.desc())
-        .limit(min(limit, 200))
+        .limit(limit)
     )
     return [
         OrderOut(
