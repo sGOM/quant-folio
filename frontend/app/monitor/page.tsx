@@ -551,7 +551,7 @@ const DEFAULT_SUGGEST = ["AAPL", "TSLA", "NVDA"];
  * @param broker    주문 브로커(시세 미연동 시 안내·플레이스홀더 결정)
  * @param tossQuote 통합 시세(토스) 연동 여부
  */
-function Watchlist({
+export function Watchlist({
   broker,
   tossQuote,
 }: {
@@ -576,9 +576,18 @@ function Watchlist({
   }, []);
 
   // 변경 시 영속(복원 전에는 쓰지 않는다).
+  // localStorage.setItem 은 Safari 프라이빗 브라우징(quota 0)·저장공간 가득 참·
+  // 브라우저 저장소 차단 등에서 동기적으로 예외(QuotaExceededError 등)를 던질 수
+  // 있다. try/catch 없이 두면 effect 커밋 단계 예외가 에러 바운더리로 전파돼
+  // 페이지 전체가 크래시하므로, 읽기(getItem)와 동일하게 방어한다. 저장 실패는
+  // 치명적이지 않다(다음 세션에 복원 안 될 뿐이므로 조용히 무시).
   useEffect(() => {
     if (!hydrated.current) return;
-    localStorage.setItem(WATCHLIST_KEY, JSON.stringify(symbols));
+    try {
+      localStorage.setItem(WATCHLIST_KEY, JSON.stringify(symbols));
+    } catch {
+      /* 저장 실패(용량 초과·프라이빗 모드 등) 무시 */
+    }
   }, [symbols]);
 
   function add(raw: string) {

@@ -786,4 +786,85 @@ id=23 A/B(§20, 2026-07-19) — 반기 교차 혼재로 현행(미적용) 유지
 "더보기" 프론트 UI(§21 부수, 2026-07-19) — `AlertCenter.tsx` `useInfiniteQuery`
 전환·이전 이력 로드 버튼 연동 완료.
 
+## 41. 체결품질 M2 노출·`LineChart` 테스트·App Router 에러 바운더리 ✅
+
+review-nextjs 가 발견한 프론트엔드 후보 3건. 코드는 작업 트리에 이미 반영돼
+있었으나 커밋이 누락돼 있었다.
+
+**M2 시점 규약 표류 미노출**: `backend/app/services/backtest/fill_quality.py`가
+계산하는 M2(`m2_time` — 라이브가 체결한 당일 종가와 백테스트가 가정하는 익일
+종가 사이의 시장 이동)가 `lib/api.ts::FillQualityReport.m2_time` 타입으로만
+정의되고 `app/monitor/page.tsx::FillQualityPanel`은 M1/M3만 카드로 렌더해
+완전히 버려지고 있었다. M2는 백엔드 `grades`에 별도 등급이 없는 진단 보조
+지표라는 점을 확인한 뒤, M1/M3 사이에 M2 카드를 추가하고 "참고용, 별도 등급
+없음" 문구로 명시했다. `FillQualityMetric`의 `grade` prop을 선택적으로 바꿔
+등급 없는 지표도 뱃지 없이 렌더할 수 있게 확장.
+
+**`LineChart`/`OverlayLineChart` 테스트 신설**: 프로젝트 전체가 의존하는 자체
+SVG 차트(외부 라이브러리 미사용 정책)에 테스트가 0건이었다.
+`components/__tests__/LineChart.test.tsx` 신설로 NaN/Infinity 필터링,
+span=0(전 구간 동일값) 0 나눗셈 방지, 데이터 2개 미만 시 안내 문구,
+`OverlayLineChart`의 "두 시리즈 길이가 달라도 각자 인덱스 기준 독립 정규화"
+계약을 검증.
+
+**App Router 최상위 에러 바운더리 부재**: `frontend/app`에 `error.tsx`가 0건이라
+컴포넌트 렌더 중 예외가 나면 Next.js 기본 에러 화면으로 전체가 깨지고 재시도
+경로가 없었다. `app/error.tsx` 신설(`'use client'`, `error`/`reset` props,
+다크 테마 일관 스타일, "다시 시도"/"새로고침" 버튼).
+
+**검증**: `npx tsc --noEmit`/`npx eslint` 변경 파일 통과. `docker compose exec
+frontend npm run test` 로 vitest 재확인 필요(작성 시점엔 Docker 오프라인).
+
+## 42. `auth.py`/`deps.py` HTTP 라우트 + `engine.py` start/stop 테스트 커버리지 0 해소 ✅
+
+`register`/`login`/`logout`/`me`/`update_me` 핸들러와 모든 인증 요청이 거치는
+의존성 `get_current_user`(`app/api/deps.py`), 실거래 진입/중지를 트리거하는
+`app/api/routes/engine.py`의 `start_strategy`/`stop_strategy`가 단 한 번도
+직접 테스트된 적이 없었다.
+
+**auth 라우트**(`backend/tests/test_auth_routes.py`, 신설): `test_alerts_route.py`
+관례(HTTP 계층 없이 핸들러 함수 직접 호출) + `conftest.FakeDB`/`FakeRedis`를
+재사용해 회원가입(이메일 중복 409·비밀번호 해싱), 로그인(성공 시 쿠키 발급+
+실패 카운터 리셋, 실패 시 401+카운터 증가, 브루트포스 임계 도달 시 429 —
+이때 DB 조회 자체가 발생하지 않음을 확인), 로그아웃(세션 폐기+쿠키 삭제),
+`me`/`update_me`(닉네임 공백 정규화)를 검증. `get_current_user`는 쿠키 없음/
+세션 무효/세션은 있으나 DB에 사용자 없음/정상 세션의 4가지 분기를 모두 검증.
+
+**engine start/stop**(`backend/tests/test_engine_control_routes.py`, 신설):
+`user_has_credentials` 자격증명 체크가 DB 상태 변경·Redis
+`ENGINE_CONTROL_CHANNEL` 발행보다 먼저 실행되는지(순서 회귀 방지),
+`_get_owned`의 소유권 체크로 타인 전략에 대한 start/stop이 404로 차단되는지
+(IDOR 방지), 정상 케이스에서 DB 갱신+Redis 발행이 함께 일어나는지를 검증.
+컨테이너 환경(secrets 마운트로 실제 KIS 자격증명이 설정됨)에서는
+`user_has_credentials`가 빈 User만으로는 항상 False가 되지 않으므로,
+"자격증명 없음" 케이스는 해당 함수 자체를 monkeypatch 로 고정해 재현했다.
+
+**실제 버그는 발견되지 않음** — 두 라우트 모두 계약대로 동작했다.
+
+**검증**: `docker compose exec web pytest` 전체 589건 통과(신규 20건 포함).
+
+## 43. `app/monitor/page.tsx` 워치리스트 저장 시 `localStorage.setItem` 무방비 예외로 페이지 크래시 — 수정 ✅
+
+`Watchlist` 컴포넌트의 워치리스트 영속 effect가 읽기(`getItem`/`JSON.parse`)는
+try/catch로 방어하면서 바로 아래 쓰기(`setItem`)는 무방비였다. Safari 프라이빗
+브라우징(quota 0)·저장공간 가득 참·브라우저 저장소 차단 등에서
+`localStorage.setItem`은 동기적으로 `QuotaExceededError` 등을 던지는데, 이
+예외가 `useEffect` 커밋 단계에서 발생하면 React가 가장 가까운 에러 바운더리
+(`app/error.tsx`)로 전파시켜 관심종목을 추가/삭제할 때마다 `/monitor` 페이지
+전체가 에러 화면으로 튕겨나갈 수 있었다.
+
+**수정**(`frontend/app/monitor/page.tsx`): 저장 effect를 읽기와 동일하게
+try/catch로 감쌌다. 저장 실패는 앱 동작에 치명적이지 않으므로(다음 세션엔
+복원 안 될 뿐) 조용히 무시한다.
+
+**테스트**(`frontend/app/monitor/__tests__/Watchlist.test.tsx`, 신설):
+`Watchlist`를 테스트 가능하도록 export 하고, `Storage.prototype.setItem`을
+예외를 던지도록 모킹한 뒤 종목을 추가해도 화면이 정상 갱신되는지(크래시하지
+않는지), 정상 상황에서는 `localStorage.setItem`이 실제로 호출되는지 검증.
+
+**검증**: `docker compose exec frontend npx vitest run`(전체 11 파일·126건
+통과, 신규 2건 포함), `docker compose exec frontend npx tsc --noEmit`,
+`docker compose exec frontend npx eslint app/monitor/page.tsx
+app/monitor/__tests__/Watchlist.test.tsx` 모두 이상 없음.
+
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.
