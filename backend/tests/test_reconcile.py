@@ -326,6 +326,42 @@ async def test_balance_fallback_respects_qty_already_consumed_by_other_orders(mo
     assert stats["partial"] == 1
 
 
+async def test_ack_unknown_order_without_kis_id_resolved_via_paper_balance(monkeypatch):
+    """executor 의 order_ack_unknown 경로가 남긴 주문(SUBMITTED·kis_order_id=None)은
+    일별체결조회 키가 없어 실전 경로를 못 타지만, 모의투자 BUY 는 잔고 폴백으로
+    자기수렴돼 고아화되지 않는다. get_order_execution 은 주문번호가 없어 아예 호출조차
+    되지 않아야 한다(None 을 넘겨 브로커를 깨우지 않음)."""
+    user = User(email="t@example.com", password_hash="x")
+    user.id = 1
+    order = _order(1, user_id=1, qty=10, side=OrderSide.BUY)
+    order.kis_order_id = None  # 응답 불확정 — 주문번호 미수신
+    session = _FakeSession([order], user)
+    redis = FakeRedis()
+    calls = _record_fill_spy(monkeypatch)
+    _patch_recorded_qty(monkeypatch, order_qty=0, symbol_qty=0)
+    monkeypatch.setattr(reconcile, "settings", type("S", (), {"is_paper_trading": True})())
+
+    exec_calls = []
+
+    class _NoIdBroker(_FakeBroker):
+        async def get_order_execution(self, order_id, symbol=None):
+            exec_calls.append(order_id)
+            return await super().get_order_execution(order_id, symbol)
+
+    broker = _NoIdBroker(
+        balance_positions=[{"symbol": "005930", "qty": 10, "avg_price": "71000"}],
+    )
+    monkeypatch.setattr(reconcile, "make_broker_for_user", lambda _u: broker)
+
+    stats = await reconcile.reconcile_open_orders(session, redis)
+
+    assert exec_calls == []  # 주문번호 없어 일별체결조회를 건너뛴다.
+    assert len(calls) == 1
+    assert calls[0]["qty"] == 10  # 잔고 보유 10주 전량 이 주문에 배정
+    assert calls[0]["fully_filled"] is True
+    assert stats["filled"] == 1
+
+
 async def test_lock_skip_when_another_process_holds_lock(monkeypatch):
     """다른 프로세스가 이미 이 주문의 락을 쥐고 있으면 브로커 생성조차 시도하지 않는다."""
     user = User(email="t@example.com", password_hash="x")

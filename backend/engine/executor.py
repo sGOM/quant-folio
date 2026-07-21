@@ -25,6 +25,7 @@ from app.models import (
     OrderStatus,
 )
 from app.services.broker import BrokerClient, BrokerError
+from engine.alerts import publish_alert
 from engine.fills import publish_event as _publish
 from engine.fills import record_fill as _record_fill
 
@@ -102,11 +103,53 @@ async def execute_signal(
             order.kis_order_org_no = res.order_org_no
             order.status = OrderStatus.SUBMITTED
         except BrokerError as e:
+            # 브로커가 명시적으로 주문을 거부했다(HTTP 오류 status·rt_cd 오류 등 응답을
+            # 정상 수신했고 그 응답이 실패). 주문이 접수되지 않았음이 확정이므로 REJECTED.
             order.status = OrderStatus.REJECTED
             await db.commit()
             logger.warning("주문 거부됨 %s: %s", idempotency_key, e)
             await _publish(redis, {"type": "order", "user_id": user_id,
                                    "order_id": order.id, "status": "rejected", "symbol": symbol})
+            return order
+        except Exception as e:  # noqa: BLE001
+            # BrokerError 가 아닌 예외(httpx.TimeoutException·ConnectError·HTTPError,
+            # json.JSONDecodeError 등 네트워크/파싱 레벨)는 "브로커가 거부했다"는 확정
+            # 신호가 아니다. 요청은 브로커에 도달·처리됐는데 응답 수신 단계에서만 끊긴
+            # 흔한 실패 패턴이라, 실제로는 주문이 접수·체결됐을 수 있다.
+            #
+            # 이때 REJECTED 로 확정하면(포지션 없음으로 오판) 실제 체결분이 무관리
+            # 상태로 남고 다음 신호에서 중복 매수돼 계좌가 과다 노출될 수 있다. 반대로
+            # 주문이 실제로 실패했더라도 SUBMITTED 로 남기면 그 신호봉 한 건을 놓칠 뿐
+            # (idempotency_key 로 같은 봉 재주문은 차단됨) 팬텀 포지션은 생기지 않는다.
+            # 두 오류 중 후자가 훨씬 안전하므로 보수적으로 SUBMITTED(주문 여부 불확정)로
+            # 남긴다. kis_order_id 는 수신하지 못했으므로 None 그대로 둔다.
+            #
+            # 모의투자 BUY 는 reconcile 의 잔고 폴백이 자기수렴시키고(engine/reconcile.py),
+            # 실전은 주문번호 없이 자동 정합이 불가하므로 critical 알림으로 사람이 증권사
+            # 콘솔에서 직접 확인·처리하도록 유도한다("모르면 사람이 확인하게 만든다").
+            order.status = OrderStatus.SUBMITTED
+            await db.commit()
+            logger.error(
+                "주문 전송 응답 불확정 — SUBMITTED 유지, 사람 확인 필요 %s: %r",
+                idempotency_key, e, exc_info=True,
+            )
+            await publish_alert(
+                redis,
+                user_id=user_id,
+                strategy_id=strategy_id,
+                severity="critical",
+                code="order_ack_unknown",
+                message=(
+                    f"주문 전송 응답 불확정 — {symbol} {side} {qty:,}주. "
+                    f"브로커 도달 여부 불명({type(e).__name__}). 실제 체결됐을 수 있으니 "
+                    f"증권사 콘솔에서 주문·체결 여부를 직접 확인 후 처리하세요(주문번호 미수신)."
+                ),
+            )
+            await _publish(redis, {
+                "type": "order", "user_id": user_id, "order_id": order.id,
+                "symbol": symbol, "side": side, "status": "submitted",
+                "kis_order_id": None,
+            })
             return order
 
         # 5) 실제 체결 조회 후 기록 + 포지션 갱신.

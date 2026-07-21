@@ -80,11 +80,12 @@ async def reconcile_open_orders(
     :param user_id: 지정 시 해당 사용자 주문만(엔진은 전체, 스크립트는 선택적으로 좁힘).
     :returns: {"checked", "filled", "partial", "errors"} 처리 통계.
     """
-    stmt = select(Order).where(
-        Order.status.in_(_OPEN_STATUSES),
-        Order.kis_order_id.isnot(None),
-        Order.kis_order_id != "",
-    )
+    # kis_order_id 유무로 거르지 않는다. 주문번호가 있는 정상 미체결은 일별체결조회로,
+    # 주문번호가 없는 '응답 불확정' 주문(executor 의 order_ack_unknown 경로 — 네트워크/
+    # 파싱 예외로 접수 응답을 못 받아 SUBMITTED·kis_order_id=None 으로 남은 건)은
+    # 모의투자 BUY 한정으로 잔고 폴백이 자기수렴시킨다. 후자를 제외하면 실제로는
+    # 체결됐을 수 있는 주문이 영원히 정합 대상에서 빠져 고아화된다(무관리 포지션).
+    stmt = select(Order).where(Order.status.in_(_OPEN_STATUSES))
     if user_id is not None:
         stmt = stmt.where(Order.user_id == user_id)
     orders = list(await db.scalars(stmt))
@@ -144,15 +145,19 @@ async def reconcile_open_orders(
         already = await _order_recorded_qty(db, order.id)
 
         # ── 1) 일별주문체결조회(실전 정확 경로) ──
+        # 주문번호가 없는 '응답 불확정' 주문은 이 경로로 조회할 수 없다(주문 키 부재) —
+        # 건너뛰고 아래 잔고 폴백(모의투자 BUY)에 맡긴다. 실전이면 폴백도 못 타므로
+        # SUBMITTED 로 남아 executor 가 발행한 critical 알림대로 사람이 처리한다.
         kis_filled = -1  # -1: 조회 실패/무응답
         avg_price: Decimal | None = None
-        try:
-            info = await broker.get_order_execution(order.kis_order_id, order.symbol)
-            kis_filled = int(info.filled_qty or 0)
-            avg_price = info.avg_price
-        except BrokerError as e:
-            logger.debug("체결 재조회 실패 order=%s: %s", order.id, e)
-            stats["errors"] += 1
+        if order.kis_order_id:
+            try:
+                info = await broker.get_order_execution(order.kis_order_id, order.symbol)
+                kis_filled = int(info.filled_qty or 0)
+                avg_price = info.avg_price
+            except BrokerError as e:
+                logger.debug("체결 재조회 실패 order=%s: %s", order.id, e)
+                stats["errors"] += 1
 
         if kis_filled > 0:
             delta = kis_filled - already

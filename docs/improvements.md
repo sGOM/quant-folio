@@ -867,4 +867,50 @@ try/catch로 감쌌다. 저장 실패는 앱 동작에 치명적이지 않으므
 `docker compose exec frontend npx eslint app/monitor/page.tsx
 app/monitor/__tests__/Watchlist.test.tsx` 모두 이상 없음.
 
+## 44. `engine/executor.py::execute_signal` 주문 전송 중 non-BrokerError(네트워크/파싱) 예외로 인한 주문 고아화 — 수정 ✅
+
+**문제**: `execute_signal`은 `Order(status=PENDING)`을 커밋한 뒤 `broker.place_order()`를
+호출하는데, 이를 감싸는 예외 처리가 `except BrokerError` 하나뿐이었다.
+`kis/client.py::_request_json`·`broker/toss.py::_request`는 HTTP status·`rt_cd` 오류만
+`KisError`/`TossError`(=`BrokerError`)로 정규화하고, `httpx.TimeoutException`·
+`httpx.ConnectError`·`json.JSONDecodeError` 등 네트워크/파싱 레벨 예외는 그대로 통과시킨다.
+이런 예외가 `place_order` 중 발생하면 이미 커밋된 주문이 `status=PENDING`·`kis_order_id=None`
+으로 DB에 영구히 남고, 러너 루프(`base_runner.py:141`)는 로그·연속실패 카운트만 남기고
+다음 틱으로 넘어간다. 결정적으로 `reconcile.py`가 `_OPEN_STATUSES=(SUBMITTED, PARTIAL)` +
+`kis_order_id.isnot(None)` 조건으로 이 주문을 정합 대상에서 완전히 제외해, **실제로는
+브로커에 주문이 도달·체결됐을 수 있는데도**(요청은 처리됐으나 응답 수신 단계에서 타임아웃/
+커넥션 끊김이 발생하는 흔한 실패 패턴) 시스템이 이 주문을 영원히 다시 들여다보지 않았다.
+
+**근거(왜 이 방향인가)**: 두 오류를 저울질하면 —
+- REJECTED로 확정(방향 1) → 실제로 체결됐다면 포지션 없음으로 오판, 체결분이 무관리
+  상태로 남고 다음 신호에서 중복 매수돼 계좌가 과다 노출됨(자금 사고).
+- SUBMITTED(불확정)로 남김 → 주문이 실제로 실패했더라도 그 신호봉 한 건을 놓칠 뿐
+  (`idempotency_key`로 같은 봉 재주문은 차단), 팬텀 포지션은 생기지 않음.
+
+후자가 명백히 안전하므로, non-BrokerError는 REJECTED로 확정하지 않는다. 브로커가 명시적
+응답으로 거부한 `BrokerError`만 REJECTED로 두는 기존 의미도 보존한다(방향 1은 "실제로는
+들어간 주문을 REJECTED로 오기록"할 위험이 있어 기각).
+
+**수정**(방향 2 채택):
+- `execute_signal`에 `except BrokerError` 다음으로 `except Exception` 분기 추가 —
+  상태를 `SUBMITTED`(주문 여부 불확정)로 남기고(주문번호 미수신이라 `kis_order_id=None`
+  유지), critical 등급 `publish_alert`(`code="order_ack_unknown"`)로 사람이 증권사
+  콘솔에서 직접 확인·처리하도록 유도("모르면 사람이 확인하게 만든다"). 주문 이벤트도
+  `submitted`로 발행.
+- `reconcile.py`: 질의에서 `kis_order_id.isnot(None)` 조건을 제거해 이 불확정 주문도
+  정합 대상에 포함. `_process_one`의 일별체결조회 경로는 `if order.kis_order_id:`로 가드해
+  주문번호가 없으면 건너뛰고, **모의투자 BUY**는 잔고 폴백으로 자기수렴시킨다(실전은
+  주문번호 없이 자동 정합 불가하므로 위 critical 알림대로 사람이 처리).
+
+**테스트**:
+- `tests/test_executor.py::test_network_error_on_place_order_keeps_submitted_and_alerts`
+  — `place_order`가 `httpx.TimeoutException`을 던지면 REJECTED가 아니라 SUBMITTED로 남고
+  (`kis_order_id=None`), 체결·포지션이 생기지 않으며 critical 알림·submitted 이벤트가
+  발행됨을 검증.
+- `tests/test_reconcile.py::test_ack_unknown_order_without_kis_id_resolved_via_paper_balance`
+  — `kis_order_id=None`인 SUBMITTED BUY가 일별체결조회를 건너뛰고(브로커 미호출) 잔고
+  폴백으로 전량 FILLED 수렴됨을 검증.
+
+**검증**: `docker compose exec web pytest` 전체 591건 통과(신규 2건 포함, 회귀 없음).
+
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.

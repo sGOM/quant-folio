@@ -13,6 +13,7 @@ FakeBroker·FakeRedis 를 쓰되, execute_signal 은 세션을 인자로 직접 
 import json
 from decimal import Decimal
 
+import httpx
 from sqlalchemy.exc import IntegrityError
 
 from app.core.channels import ORDER_LOCK_PREFIX
@@ -158,6 +159,57 @@ async def test_broker_rejection_marks_order_rejected_and_publishes_event():
         json.loads(data) for _, data in redis.published if json.loads(data).get("status") == "rejected"
     ]
     assert len(rejected_events) >= 1
+
+
+async def test_network_error_on_place_order_keeps_submitted_and_alerts(monkeypatch):
+    """place_order 가 BrokerError 가 아닌 네트워크/파싱 예외(httpx.TimeoutException 등)를
+    던지면 — 응답 수신 실패라 실제로는 브로커에 주문이 도달·체결됐을 수 있는 흔한 패턴 —
+    주문을 REJECTED 로 확정하지 않고 SUBMITTED(주문 여부 불확정)로 남겨 reconcile 대상에
+    포함(_OPEN_STATUSES)되게 하고, kis_order_id 는 미수신이므로 None 으로 두며, 사람이
+    증권사 콘솔에서 직접 확인하도록 critical 알림을 발행한다."""
+
+    class _FlakyBroker(FakeBroker):
+        async def place_order(self, *a, **k):
+            raise httpx.TimeoutException("read timeout")
+
+    store = _Store()
+    db = FakeDB(store)
+    redis = FakeRedis()
+    broker = _FlakyBroker({_SYMBOL: 70_000})
+
+    # publish_alert 의 DB 영속화(AsyncSessionLocal)·텔레그램 경로는 이 단위 테스트의
+    # 관심 밖 — WS 알림 발행(FakeRedis)만 순수 검증하도록 대역화한다.
+    alerts_published: list[dict] = []
+
+    async def _fake_publish_alert(_redis, **kwargs):
+        alerts_published.append(kwargs)
+
+    monkeypatch.setattr("engine.executor.publish_alert", _fake_publish_alert)
+
+    order = await execute_signal(
+        db, redis, broker, user_id=_USER_ID, strategy_id=_STRATEGY_ID, symbol=_SYMBOL,
+        side="buy", qty=10, price=Decimal("70000"), idempotency_key=_key(),
+        reason="테스트 매수",
+    )
+
+    assert order is not None
+    # REJECTED 로 오판하지 않는다 — 실제 체결분이 무관리 상태로 남지 않도록 보수적 처리.
+    assert order.status == OrderStatus.SUBMITTED
+    assert order.kis_order_id is None  # 주문번호 미수신
+    # 팬텀 포지션·체결을 만들지 않는다.
+    assert store.all(Execution) == []
+    assert store.all(Position) == []
+    # 사람이 확인하도록 critical 알림이 발행됐다.
+    assert len(alerts_published) == 1
+    alert = alerts_published[0]
+    assert alert["severity"] == "critical"
+    assert alert["code"] == "order_ack_unknown"
+    # 주문 이벤트도 submitted 로 발행돼 프론트가 고아 주문을 인지할 수 있다.
+    order_events = [
+        json.loads(data) for _, data in redis.published
+        if json.loads(data).get("type") == "order"
+    ]
+    assert any(e.get("status") == "submitted" for e in order_events)
 
 
 async def test_zero_fill_keeps_order_submitted_without_execution_or_position():
