@@ -82,6 +82,10 @@ function validateRebalance(config: Extract<StrategyConfig, { type: "rebalance" }
     return "배정 자본은 0보다 커야 합니다.";
   if (!/^\d{1,2}:\d{2}$/.test(config.rebalance_time))
     return "실행 시각은 HH:MM 형식이어야 합니다.";
+  if (!Number.isFinite(config.fees) || config.fees < 0 || config.fees > 0.01)
+    return "위탁수수료는 0~1% 사이여야 합니다.";
+  if (!Number.isFinite(config.tax) || config.tax < 0 || config.tax > 0.01)
+    return "증권거래세는 0~1% 사이여야 합니다.";
   return null;
 }
 

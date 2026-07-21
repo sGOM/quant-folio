@@ -73,7 +73,18 @@ function NewsContent() {
     staleTime: 5 * 60 * 1000,
   });
 
-  const items: NewsItem[] = query.data?.pages.flatMap((p) => p.items) ?? [];
+  // 새 기사 유입으로 offset 이 밀리면 페이지 경계에서 같은 기사가 중복될 수 있어 id 로 걸러낸다.
+  const items: NewsItem[] = (() => {
+    const seen = new Set<number>();
+    const merged: NewsItem[] = [];
+    for (const item of query.data?.pages.flatMap((p) => p.items) ?? []) {
+      if (!seen.has(item.id)) {
+        seen.add(item.id);
+        merged.push(item);
+      }
+    }
+    return merged;
+  })();
 
   return (
     <>

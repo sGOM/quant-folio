@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, SymbolHit } from "@/lib/api";
 
@@ -11,6 +11,7 @@ const INPUT =
 /**
  * 종목코드 입력 + 자동완성. 코드/한글명/영문명으로 검색해 선택하면 코드를 채운다.
  * 직접 코드를 타이핑하는 방식도 그대로 지원한다(value 는 항상 종목코드).
+ * WAI-ARIA combobox 패턴(role="combobox"/listbox/option, 방향키·Enter·Escape)을 따른다.
  *
  * @param value    현재 종목코드
  * @param onChange 코드 변경 콜백(선택 또는 직접 입력)
@@ -25,7 +26,9 @@ export function SymbolSearch({
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
   const [selectedName, setSelectedName] = useState<string | null>(null);
+  const [activeIndex, setActiveIndex] = useState(-1);
   const boxRef = useRef<HTMLDivElement>(null);
+  const listId = useId();
 
   // 디바운스: 입력이 멈춘 뒤 250ms 후에만 검색어를 확정한다.
   const [debounced, setDebounced] = useState("");
@@ -40,6 +43,13 @@ export function SymbolSearch({
     enabled: open && debounced.length >= 1,
     staleTime: 60_000,
   });
+
+  const options = results.data ?? [];
+
+  // 검색어가 바뀌어 목록이 갱신되면 활성 옵션 인덱스를 초기화한다.
+  useEffect(() => {
+    setActiveIndex(-1);
+  }, [debounced, results.data]);
 
   // 바깥 클릭 시 드롭다운 닫기.
   useEffect(() => {
@@ -58,6 +68,30 @@ export function SymbolSearch({
     setSelectedName(s.name);
     setQuery("");
     setOpen(false);
+    setActiveIndex(-1);
+  }
+
+  function optionId(i: number): string {
+    return `${listId}-option-${i}`;
+  }
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (!open || options.length === 0) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActiveIndex((i) => (i + 1) % options.length);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIndex((i) => (i <= 0 ? options.length - 1 : i - 1));
+    } else if (e.key === "Enter") {
+      if (activeIndex >= 0 && activeIndex < options.length) {
+        e.preventDefault();
+        pick(options[activeIndex]);
+      }
+    } else if (e.key === "Escape") {
+      setOpen(false);
+      setActiveIndex(-1);
+    }
   }
 
   return (
@@ -76,9 +110,15 @@ export function SymbolSearch({
           setQuery(value);
           setOpen(true);
         }}
+        onKeyDown={onKeyDown}
         placeholder="코드/종목명 검색 (예: 005930, 삼성, samsung)"
         className={INPUT}
         autoComplete="off"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-expanded={open}
+        aria-controls={listId}
+        aria-activedescendant={activeIndex >= 0 ? optionId(activeIndex) : undefined}
       />
 
       {!open && selectedName && (
@@ -88,21 +128,28 @@ export function SymbolSearch({
       )}
 
       {open && debounced.length >= 1 && (
-        <ul className="absolute z-20 mt-1 max-h-64 w-full overflow-y-auto rounded-md border bg-popover shadow-xl">
+        <ul
+          id={listId}
+          role="listbox"
+          className="absolute z-20 mt-1 max-h-64 w-full overflow-y-auto rounded-md border bg-popover shadow-xl"
+        >
           {results.isLoading && (
             <li className="px-3 py-2 text-xs text-muted-foreground">검색 중…</li>
           )}
-          {results.data?.length === 0 && (
+          {options.length === 0 && !results.isLoading && (
             <li className="px-3 py-2 text-xs text-muted-foreground">
               일치하는 종목이 없습니다.
             </li>
           )}
-          {results.data?.map((s) => (
-            <li key={s.code}>
+          {options.map((s, i) => (
+            <li key={s.code} id={optionId(i)} role="option" aria-selected={i === activeIndex}>
               <button
                 type="button"
                 onClick={() => pick(s)}
-                className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-accent"
+                onMouseEnter={() => setActiveIndex(i)}
+                className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-accent ${
+                  i === activeIndex ? "bg-accent" : ""
+                }`}
               >
                 <span>
                   <span className="font-medium">{s.name}</span>
