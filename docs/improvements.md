@@ -786,4 +786,94 @@ id=23 A/B(§20, 2026-07-19) — 반기 교차 혼재로 현행(미적용) 유지
 "더보기" 프론트 UI(§21 부수, 2026-07-19) — `AlertCenter.tsx` `useInfiniteQuery`
 전환·이전 이력 로드 버튼 연동 완료.
 
+## 41. `frontend-next` review-nextjs 후보 3건 구현 ✅
+
+review-nextjs 가 발견한 프론트엔드 후보 3건을 `frontend-next` 에이전트가 구현.
+
+**리밸런싱 전략 fees/tax 검증 누락**: `components/strategy-form/validate.ts::
+validateStrategyForm`의 단일종목 경로(184~189행)는 `fees`/`tax`를 `0~0.01`
+범위로 명시 검증하는데, 리밸런싱 경로(`validateRebalance`)는 같은 스키마
+필드(`RebalanceConfig.fees`/`tax`, `lib/api.ts` 394~438행, 백엔드
+`app/schemas/strategy.py`의 `ge=0, le=0.01`과 동일 계약)를 전혀 검증하지 않아
+`StrategyForm.tsx`의 "거래비용" fieldset이 HTML5 native constraint
+(`CostField`의 `min=0 max=1`)에만 의존하고 있었다. `validateRebalance`
+말미에 단일종목 경로와 동일한 범위 체크·에러 메시지("위탁수수료는 0~1%
+사이여야 합니다"/"증권거래세는 0~1% 사이여야 합니다")를 추가해 검증 로직을
+일치시켰다.
+
+**뉴스 무한 스크롤 id dedup 부재**: `app/news/page.tsx`가 `useInfiniteQuery`
+페이지들을 단순 `flatMap`으로 합쳐 렌더했는데, 같은 오프셋 페이지네이션+지속
+증가 데이터셋 패턴을 쓰는 `components/AlertCenter.tsx`(105~116행)는 새 알림
+유입으로 오프셋이 밀릴 때 페이지 경계에서 같은 항목이 중복되는 문제를 이미
+`id` 기반 `Set` dedup 으로 막아뒀다. 동일한 병합 로직을 `NewsContent`의
+`items` 계산에 이식해 새 기사 유입 중 "더 보기"를 눌러도 같은 기사가 중복
+렌더되지 않도록 했다.
+
+**`SymbolSearch` 콤보박스 접근성 부재**: `role="combobox"`/
+`aria-expanded`/`aria-activedescendant` 등 WAI-ARIA combobox 속성이 전혀
+없고 방향키로 옵션을 순회하는 키보드 핸들러도 없어 마우스로만 종목 선택이
+가능했다. 뉴스/스크리너/전략폼/리밸런스필드 등 여러 화면이 공유하는
+컴포넌트라 영향 범위가 넓다. 입력 요소에 `role="combobox"`/
+`aria-autocomplete="list"`/`aria-expanded`/`aria-controls`/
+`aria-activedescendant`를, 목록에 `role="listbox"`를, 각 옵션에
+`role="option"`/`id`/`aria-selected`를 추가했다. 위/아래 화살표로
+`activeIndex` state를 순환 이동시키고, Enter로 활성 옵션 선택, Escape로
+드롭다운을 닫는 키보드 핸들러(`onKeyDown`)를 신설했다. 마우스 클릭(`pick`)
+경로와 `onMouseEnter`로 활성 옵션을 동기화해 기존 동작은 그대로 유지했다.
+
+**검증**: `npx tsc --noEmit` — 변경 3개 파일(`validate.ts`/`news/page.tsx`/
+`SymbolSearch.tsx`)에 신규 타입 에러 없음(vitest/playwright 모듈 누락 에러는
+호스트 devDependencies 미설치 때문으로 §40에서 이미 확인된 것과 동일
+원인, 변경 파일과 무관). `npx eslint` 변경 파일 전체 통과. Docker Desktop이
+가동 중이라 `docker compose exec frontend npm run test`(vitest) 전체
+10 파일 124건 통과 확인(`components/strategy-form/__tests__/validate.test.ts`
+21건 포함, dedup·콤보박스 신규 단위 테스트는 이번에 추가하지 않았으나 기존
+스위트 회귀 없음).
+
+## 42. 체결통보-정합 동시성 이중 기록 방어(주문 단위 락 공유) ✅
+
+**문제**: 엔진(`engine/main.py`)은 `_reconcile_loop`(60초 주기,
+`reconcile.py::reconcile_open_orders`)와 실시간 체결통보 리스너
+(`FillNoticeManager` → `fill_notice.py::apply_fill_notice`)를 같은 프로세스의
+별도 asyncio 태스크로 동시에 돌린다. `reconcile.py`는 "같은 주문을 여러 경로가
+동시에 정합하면 둘 다 커밋 전에 executions 합을 읽어 같은 체결을 이중 기록할 수
+있다"는 위험을 스스로 문서화하고 주문 단위 분산 락(Redis `SET NX`,
+`reconcile.py:191~198`)으로 방어했다. 그러나 `apply_fill_notice`(구
+`fill_notice.py:146~159`)는 이 락을 전혀 잡지 않고 곧바로
+`_order_recorded_qty`(await 포인트 포함) → 델타 계산 → `record_fill` → commit 을
+수행했다.
+
+**근거**: `_order_recorded_qty` 가 await 를 포함하므로, 같은 주문이
+`_reconcile_loop` 에 의해 동시 처리 중이면 두 경로가 서로 커밋 전 상태를 읽어
+같은 체결을 이중 기록하고 `Position.qty` 를 이중 가산할 수 있다. 이는 이후
+손절·포지션 한도 판정(`engine/risk.py`)까지 오염시킨다. 체결 반영 경로가
+셋(executor 즉시체결·reconcile 폴링·fill_notice 실시간)이라 이 창은 실계정
+전환 시 실제로 열린다.
+
+**수정 내용**:
+- 주문 단위 정합 락 키·TTL 을 `app/core/channels.py` 로 승격해 공용 헬퍼로 노출
+  (`RECONCILE_LOCK_PREFIX`/`RECONCILE_LOCK_TTL`/`reconcile_lock_key(order_id)`).
+  `reconcile.py` 는 기존 로컬 상수(`_RECONCILE_LOCK_PREFIX`/`_RECONCILE_LOCK_TTL`)를
+  버리고 이 헬퍼를 재사용(락 키 문자열 `reconcile:lock:{id}` 는 그대로라 회귀 없음).
+- `apply_fill_notice` 가 주문 매칭 직후 `reconcile_lock_key(order.id)` 로 같은
+  락을 `SET NX` 로 잡고, `_order_recorded_qty` → `record_fill` → commit 임계구역을
+  `try/finally` 로 감싸 커밋 후 락을 해제하도록 변경. 두 경로가 **같은 키**를
+  공유하므로 주문 단위로 상호 배제된다.
+- 락 획득 실패(다른 경로가 정합 중) 시의 정책은 reconcile 의 기존 패턴(스킵)을
+  그대로 따른다 — 이번 통보는 `False` 로 스킵하고, 델타 멱등이라 다음 체결통보
+  또는 다음 reconcile 주기에서 재수렴한다.
+
+**검증**: `backend/tests/test_fill_notice.py` 에 동시성 테스트 3건 추가
+(로컬 `_FakeRedis` 에 `SET NX`/`GET`/`DELETE` 락 동작 확장):
+① reconcile 이 락을 잡은 채 체결을 기록·커밋하는 동안 도착한 같은 주문 체결통보가
+스킵되어 이중 기록 안 됨, ② 락 해제 후 재통보도 델타 멱등으로 스킵, ③
+`asyncio.gather` 로 reconcile 임계구역과 `apply_fill_notice` 를 동시에 돌려도
+체결이 정확히 한 번만 기록되고(`results.count(True) == 1`) 락 키가 잔존하지 않음.
+`docker compose exec web pytest` 전체 591건 통과.
+
+**부수 수정(Low)**: `app/api/routes/trading.py::list_orders` 의
+`limit: int = 50` 에 하한 검증이 없어 음수를 넘기면 그대로 SQL `LIMIT` 에
+전달됐다(`symbols.py:17` 의 `Query(20, ge=1, le=50)` 대비 누락). `Query(50,
+ge=1, le=200)` 로 통일하고 `min(limit, 200)` 클램프를 제거했다.
+
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.
