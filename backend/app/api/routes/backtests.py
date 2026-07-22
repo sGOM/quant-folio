@@ -200,6 +200,34 @@ def _fundamentals_provider_with_neutralize_cols(
     return fdf
 
 
+def _provider_with_flow(base_provider, window: int, denom: str):
+    """base_provider 결과에 수급(flow) 팩터 컬럼(flow_norm)을 덧붙이는 provider 를 만든다.
+
+    factor_weights.flow>0 인 score 전략 백테스트에서만 쓴다. metrics.compute_flow_norm
+    (외국인+기관 누적 순매수/정규화 분모)을 as_of 시점으로 조회한다. 조회 실패/부재면
+    flow_norm 컬럼을 붙이지 않으므로 스코어러가 자연히 중립(0) 처리한다.
+    """
+    from app.services.metrics import compute_flow_norm
+
+    def _p(as_of_date, codes):
+        norm_codes = [str(c).zfill(6) for c in codes]
+        fdf = base_provider(as_of_date, codes) if base_provider is not None else None
+        try:
+            flow = compute_flow_norm(norm_codes, as_of_date, window=window, denom=denom)
+        except Exception:  # noqa: BLE001
+            flow = None
+        if flow is None or flow.empty:
+            return fdf
+        s = flow.reindex(norm_codes)
+        if fdf is None:
+            return pd.DataFrame({"flow_norm": s})
+        fdf = fdf.copy()
+        fdf["flow_norm"] = s.reindex(fdf.index)
+        return fdf
+
+    return _p
+
+
 def _build_pit_pool(config: dict, start, end):
     """universe_rule.source 가 지수명이면 (합집합 universe, pool_provider) 를 만든다.
 
@@ -305,6 +333,16 @@ async def _run_rebalance_backtest(
         provider = partial(
             _fundamentals_provider_with_neutralize_cols, use_ttm=use_ttm, neutralize=_neutralize,
         )
+    # 수급(flow) 팩터: factor_weights.flow>0 이면 provider 에 flow_norm 컬럼을 덧붙인다.
+    if method == "score":
+        _sel = config.get("selection", {})
+        _flow_w = float((_sel.get("factor_weights") or {}).get("flow", 0.0) or 0.0)
+        if _flow_w > 0:
+            provider = _provider_with_flow(
+                provider,
+                int(_sel.get("flow_window", 90)),
+                _sel.get("flow_denom", "mcap"),
+            )
 
     # 현금화 오버레이(레짐 필터): 켜져 있으면 기준지수 종가 시리즈를 적재해 주입한다.
     regime_series = None

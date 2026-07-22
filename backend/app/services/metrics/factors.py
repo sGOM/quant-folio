@@ -14,7 +14,12 @@ import pandas as pd
 
 from app.services.data.loader import bounded_socket_timeout
 from app.services.metrics.common import _approx_start, _is_nan, _ymd
-from app.services.metrics.fetch import _fetch_fundamentals, _fetch_price_change
+from app.services.metrics.fetch import (
+    _fetch_fundamentals,
+    _fetch_market_cap,
+    _fetch_net_purchases,
+    _fetch_price_change,
+)
 
 logger = logging.getLogger("app.services.metrics")
 
@@ -48,7 +53,76 @@ def _winsorize_zscore(s: pd.Series, invert: bool = False) -> pd.Series:
 #: 전략은 해당 컬럼 부재로 중립(0) 처리되어 영향받지 않는다.
 DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
     "momentum": 0.4, "value": 0.3, "lowvol": 0.3, "quality": 0.0, "growth": 0.0,
+    "flow": 0.0,
 }
+
+#: 수급(flow) 팩터 기본 파라미터 — 누적창(거래일)·정규화 분모.
+#: financial-expert 설계상 60~120일 누적 지속(persistence) 신호. 워크포워드 확정 전
+#: 잠정 기본값(90일·시가총액). window 는 거래일 수, denom 은 "mcap"(시가총액) 또는
+#: "value"(동일창 누적 거래대금).
+FLOW_DEFAULT_WINDOW = 90
+FLOW_DEFAULT_DENOM = "mcap"
+
+
+def compute_flow_norm(
+    codes: list[str],
+    as_of: date,
+    window: int = FLOW_DEFAULT_WINDOW,
+    denom: str = FLOW_DEFAULT_DENOM,
+) -> pd.Series:
+    """수급(flow) 팩터 원값 flow_norm 을 계산한다(외국인+기관 누적 순매수 / 정규화 분모).
+
+    지속(persistence) accumulation 신호: [as_of-window, as_of] 구간 누적 외국인+기관
+    순매수 '대금'을 시가총액(denom="mcap") 또는 동일 구간 누적 거래대금(denom="value")으로
+    나눠 스케일-프리하게 만든다. 회전율 억제를 위해 단기 반전이 아닌 수개월 누적을 본다.
+
+    미래참조 방지: as_of 이하 확정 데이터만 사용한다(호출자가 직전 확정 영업일로 넘긴다).
+    조회 실패 종목은 결과에서 빠져(중립 폴백 대상), 전량 실패면 빈 Series 를 반환한다
+    (호출자가 리밸런싱 스킵 판단). window 는 거래일 수 → _approx_start 로 달력일 근사.
+
+    :return: index=종목코드(6자리), 값=flow_norm(float). 계산 불가 종목은 제외.
+    """
+    if not codes:
+        return pd.Series(dtype="float64")
+    norm_codes = [str(c).strip().zfill(6) for c in codes]
+    mkts = ["KOSPI", "KOSDAQ"]
+    as_of_ymd = _ymd(as_of)
+    start_ymd = _ymd(_approx_start(as_of, window))
+
+    with bounded_socket_timeout(30):
+        npf = _fetch_net_purchases(start_ymd, as_of_ymd, mkts)
+        if denom == "value":
+            denom_df = _fetch_price_change(start_ymd, as_of_ymd, mkts)  # 거래대금=구간 누적
+        else:
+            denom_df = _fetch_market_cap(as_of_ymd, mkts)  # 시가총액=시점값
+
+    if npf is None or npf.empty:
+        return pd.Series(dtype="float64")  # 전량 실패 — 호출자가 스킵 판단
+
+    npf = npf.copy()
+    npf.index = npf.index.astype(str).str.zfill(6)
+    net = npf["net_buy_value"].reindex(norm_codes)
+
+    denom_series: pd.Series | None = None
+    if denom_df is not None and not denom_df.empty:
+        denom_df = denom_df.copy()
+        denom_df.index = denom_df.index.astype(str).str.zfill(6)
+        col = "거래대금" if denom == "value" else "시가총액"
+        if col in denom_df.columns:
+            denom_series = pd.to_numeric(
+                denom_df[col], errors="coerce"
+            ).reindex(norm_codes)
+
+    out: dict[str, float] = {}
+    for code in norm_codes:
+        nv = net.get(code)
+        if nv is None or _is_nan(nv):
+            continue
+        dv = denom_series.get(code) if denom_series is not None else None
+        if dv is None or _is_nan(dv) or dv <= 0:
+            continue
+        out[code] = float(nv) / float(dv)
+    return pd.Series(out, dtype="float64")
 
 
 def _neutralize_size(df: pd.DataFrame, factor_cols: list[str]) -> pd.DataFrame:
@@ -217,17 +291,27 @@ def _compute_stock_scores(
     z_turn = _zc("turnaround")
     score_growth = pd.concat([z_opg, z_netg, z_turn], axis=1).mean(axis=1)
 
+    # ── 수급(flow) 카테고리 z-score (외국인+기관 누적 순매수/시총·거래대금) ──
+    # 지속(persistence) accumulation 신호. 60~120일 누적 순매수 대금을 시총 또는
+    # 거래대금으로 정규화한 flow_norm 을 그대로 z-score 한다(높을수록 순매수 지속 →
+    # invert 불필요). flow_norm 컬럼이 없으면(=미배선) score_flow 는 전부 0(중립)이
+    # 되어 flow 가중치 0 인 기존 전략은 영향받지 않는다.
+    z_flow = _zc("flow_norm")
+    score_flow = z_flow
+
     # 카테고리 점수를 프레임에 싣는다(중립화·종합점수 산출의 기준).
     result["score_momentum"] = score_momentum
     result["score_value"] = score_value
     result["score_lowvol"] = score_lowvol
     result["score_quality"] = score_quality
     result["score_growth"] = score_growth
+    result["score_flow"] = score_flow
 
     # ── 팩터 중립화(P1-3 사이즈, §20 섹터): 종합 전에 각 카테고리 점수를 지정 축에
     # 직교화한다. "size_sector"는 둘 다 순차 적용(사이즈 먼저 — 연속축 잔차화 후
     # 범주형 demean 이 사이즈 조정된 값 위에서 섹터 쏠림만 추가로 제거한다).
-    cat_cols = ["score_momentum", "score_value", "score_lowvol", "score_quality", "score_growth"]
+    cat_cols = ["score_momentum", "score_value", "score_lowvol", "score_quality",
+                "score_growth", "score_flow"]
     if neutralize in ("size", "size_sector"):
         result = _neutralize_size(result, cat_cols)
     if neutralize in ("sector", "size_sector"):
@@ -240,6 +324,7 @@ def _compute_stock_scores(
         + w.get("lowvol", DEFAULT_FACTOR_WEIGHTS["lowvol"]) * result["score_lowvol"]
         + w.get("quality", DEFAULT_FACTOR_WEIGHTS["quality"]) * result["score_quality"]
         + w.get("growth", DEFAULT_FACTOR_WEIGHTS["growth"]) * result["score_growth"]
+        + w.get("flow", DEFAULT_FACTOR_WEIGHTS["flow"]) * result["score_flow"]
     )
     result["score"] = score.round(4)
     for c in cat_cols:
@@ -254,6 +339,8 @@ def compute_universe_scores(
     factor_weights: dict[str, float] | None = None,
     neutralize: str = "none",
     financial_period: str = "annual",
+    flow_window: int = FLOW_DEFAULT_WINDOW,
+    flow_denom: str = FLOW_DEFAULT_DENOM,
 ) -> dict[str, float]:
     """리밸런싱 selection.method="score" 전용: 지정 종목들의 종합점수를 계산한다.
 
@@ -270,6 +357,8 @@ def compute_universe_scores(
     :param factor_weights: {"momentum","value","lowvol"} 카테고리 가중치. None 이면 기본값.
     :param financial_period: "annual"(기본)/"ttm" — 퀄리티 팩터(OpenDART)의 재무 반영
         주기(§8/§3, RebalanceConfig.financial_period). "ttm"이면 분기 TTM 경로로 조회한다.
+    :param flow_window: 수급(flow) 팩터 누적창(거래일). flow 가중치>0 일 때만 조회.
+    :param flow_denom: 수급 팩터 정규화 분모("mcap"=시가총액, "value"=구간 누적 거래대금).
     :return: {종목코드: score} dict. 데이터 부족(예: mom_6m 결측)으로 계산 불가한
         종목은 결과에서 제외된다(compute_target_weights 가 자연히 후순위/미선정 처리).
     """
@@ -379,6 +468,24 @@ def compute_universe_scores(
             df["sector"] = pd.Series(
                 {c: smap.get(c) for c in df.index}, dtype="object"
             ).reindex(df.index)
+
+    # 수급(flow) 팩터: flow 가중치>0 인 전략에서만 조회(외국인+기관 누적 순매수/분모).
+    if float(_w.get("flow", 0.0) or 0.0) > 0:
+        try:
+            flow = compute_flow_norm(codes, as_of, window=flow_window, denom=flow_denom)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("수급(flow) 팩터 조회 실패 — 중립 처리: %s", e)
+            flow = pd.Series(dtype="float64")
+        # 전량 실패 방어(모멘텀 팩터와 동일 취지): flow 가중치가 유의미한데 순매수
+        # 조회가 통째로 비었으면 개별 종목 정상 결측이 아니라 KRX 조회 일시 장애다.
+        # 이 상태로 진행하면 스코어러가 남은 팩터만으로 재정규화해 왜곡된 목표를
+        # 산출하므로, 예외를 올려 이번 리밸런싱을 건너뛰고 다음 주기에 재시도한다.
+        if flow.empty:
+            raise RuntimeError(
+                "수급(flow) 팩터 데이터 전량 조회 실패(외국인+기관 순매수 빈 응답) — "
+                "왜곡된 목표 산출 방지 위해 리밸런싱 건너뜀(다음 주기 재시도)"
+            )
+        df["flow_norm"] = flow.reindex(df.index)
 
     scored = _compute_stock_scores(df, weights=factor_weights, neutralize=neutralize)
     return {

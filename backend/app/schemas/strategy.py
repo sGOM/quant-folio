@@ -300,14 +300,22 @@ class FactorWeights(BaseModel):
         default=0.0, ge=0, le=1,
         description="성장 카테고리 가중치(영업이익/순이익 YoY·흑자전환, OpenDART 필요)",
     )
+    flow: float = Field(
+        default=0.0, ge=0, le=1,
+        description="수급 카테고리 가중치(외국인+기관 누적 순매수/시총·거래대금, pykrx 필요). "
+        "id=23 등 기존 전략은 flow=0 이라 무영향(컬럼 부재 시 중립 0 처리).",
+    )
 
     @model_validator(mode="after")
     def _sum_to_one(self):
-        total = self.momentum + self.value + self.lowvol + self.quality + self.growth
+        total = (
+            self.momentum + self.value + self.lowvol
+            + self.quality + self.growth + self.flow
+        )
         if abs(total - 1.0) > 1e-6:
             raise ValueError(
                 "factor_weights 합은 1.0 이어야 합니다"
-                f"(momentum+value+lowvol+quality+growth={total:.4f})."
+                f"(momentum+value+lowvol+quality+growth+flow={total:.4f})."
             )
         return self
 
@@ -398,6 +406,16 @@ class RebalanceSelection(BaseModel):
     top_n: int = Field(default=5, ge=1, le=50, description="선정 종목 수(momentum/score)")
     factor_weights: FactorWeights = Field(
         default_factory=FactorWeights, description="종합점수 카테고리 가중치(method=score)"
+    )
+    # 수급(flow) 팩터 파라미터(factor_weights.flow>0 일 때만 사용). 누적창(거래일)과
+    # 정규화 분모를 지정한다 — financial-expert 설계상 반기 워크포워드로 결정한다.
+    flow_window: int = Field(
+        default=90, ge=20, le=250,
+        description="수급 팩터 누적창(거래일, 60/90/120 권장). 지속 accumulation 신호.",
+    )
+    flow_denom: Literal["mcap", "value"] = Field(
+        default="mcap",
+        description="수급 팩터 정규화 분모. mcap=시가총액, value=동일창 누적 거래대금.",
     )
     # 팩터 중립화(P1-3, method="score" 전용). 각 카테고리 z-score 를 지정 축에 대해
     # 직교화(residualize)해 의도치 않은 스타일 베팅을 제거한다.

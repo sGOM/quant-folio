@@ -145,6 +145,61 @@ def _fetch_price_change(start_ymd: str, end_ymd: str, mkts: list[str]) -> pd.Dat
     )
 
 
+#: 수급(flow) 팩터 기본 투자자군 — 외국인 + 기관합계 순매수. KRX 투자자 분류 라벨.
+_FLOW_INVESTORS: tuple[str, ...] = ("외국인", "기관합계")
+
+
+def _fetch_net_purchases(
+    start_ymd: str,
+    end_ymd: str,
+    mkts: list[str],
+    investors: tuple[str, ...] = _FLOW_INVESTORS,
+) -> pd.DataFrame:
+    """기간 [start_ymd, end_ymd] 누적 투자자별 순매수 대금을 전 종목 일괄 조회한다(수급 팩터).
+
+    pykrx get_market_net_purchases_of_equities(fromdate, todate, market, investor) 는
+    한 번 호출로 그 시장 전 종목의 기간 누적 순매수(거래량·거래대금)를 투자자군별로
+    반환한다(get_market_price_change 와 같은 '시장당 1회' 급 비용). 외국인+기관합계 두
+    투자자군을 합산해 종목별 순매수 '대금'(원)만 남긴다.
+
+    반환: 티커 인덱스, 컬럼 ["net_buy_value"](외국인+기관 순매수거래대금 합, 원).
+    개별 (시장, 투자자) 조회 실패는 경고 후 건너뛰고(그 부분만 결측 → 호출자가 중립
+    처리), 전량 실패면 빈 프레임을 반환한다(호출자가 리밸런싱 스킵 판단).
+
+    미래참조 방지: 호출자가 end_ymd 를 as_of(직전 확정 영업일) 이하로 넘겨야 한다.
+    """
+    stock = _pykrx_stock()
+    # 종목별 순매수거래대금을 (시장, 투자자)에 걸쳐 누적 합산한다.
+    accum: dict[str, float] = {}
+    any_ok = False
+    for mkt in mkts:
+        for investor in investors:
+            try:
+                df = stock.get_market_net_purchases_of_equities(
+                    start_ymd, end_ymd, mkt, investor
+                )
+                if df is None or df.empty or "순매수거래대금" not in df.columns:
+                    continue
+                any_ok = True
+                vals = pd.to_numeric(df["순매수거래대금"], errors="coerce")
+                for ticker, v in vals.items():
+                    if pd.isna(v):
+                        continue
+                    key = str(ticker).zfill(6)
+                    accum[key] = accum.get(key, 0.0) + float(v)
+            except Exception:
+                logger.warning(
+                    "투자자별 순매수 조회 실패 (%s %s %s~%s)",
+                    mkt, investor, start_ymd, end_ymd, exc_info=True,
+                )
+
+    if not any_ok or not accum:
+        return pd.DataFrame(columns=["net_buy_value"])
+    out = pd.DataFrame.from_dict(accum, orient="index", columns=["net_buy_value"])
+    out.index.name = "티커"
+    return out
+
+
 def _fetch_market_ohlcv_snapshot(date_ymd: str, mkt: str) -> pd.DataFrame | None:
     """단일 거래일의 전 종목 OHLCV 스냅샷을 조회한다(패닉셀 S9 신저가 브레드스 등).
 
