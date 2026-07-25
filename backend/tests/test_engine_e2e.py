@@ -39,7 +39,8 @@ _NOW = datetime(2025, 4, 15, 14, 30, tzinfo=KST)
 def _patch_scores(monkeypatch, scores: dict[str, float]) -> None:
     """compute_universe_scores 를 고정 점수 dict 로 대체한다(팩터 조회 네트워크 제거)."""
     def _fake(universe, as_of, factor_weights, neutralize="none", financial_period="annual",
-              flow_window=90, flow_denom="mcap"):  # noqa: ARG001
+              flow_window=90, flow_denom="mcap", resid_mom_reg_window=36,
+              resid_mom_window=11, resid_mom_skip=1, pead_lookback_q=8):  # noqa: ARG001
         return {sym: scores[sym] for sym in universe if sym in scores}
 
     monkeypatch.setattr(rebalance_runner, "compute_universe_scores", _fake)
