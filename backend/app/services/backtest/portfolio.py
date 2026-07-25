@@ -332,7 +332,7 @@ def _targets_at(
                 # 프레임에 합류한다. 존재하지 않는 컬럼은 건너뛰어 중립 처리되게 한다.
                 for col in ("PER", "PBR", "DIV", "roe", "debt_ratio", "fcf", "f_score",
                             "op_growth", "net_growth", "turnaround", "market_cap",
-                            "sector", "flow_norm"):
+                            "sector", "flow_norm", "resid_mom", "pead_sue"):
                     if col in fdf.columns:
                         fac[col] = fdf[col].reindex(fac.index)
         weights = config.get("selection", {}).get("factor_weights")

@@ -13,10 +13,11 @@ import pandas as pd
 
 from app.services._num import _safe
 
-# 팩터 IC/IR·성과귀속(P1-1)에서 다루는 팩터 점수 컬럼(개별 6팩터 + 종합).
+# 팩터 IC/IR·성과귀속(P1-1)에서 다루는 팩터 점수 컬럼(개별 팩터 + 종합).
 _FACTOR_SCORE_COLS = (
     "score_momentum", "score_value", "score_lowvol",
-    "score_quality", "score_growth", "score_flow", "score",
+    "score_quality", "score_growth", "score_flow",
+    "score_residual_momentum", "score_pead", "score",
 )
 
 

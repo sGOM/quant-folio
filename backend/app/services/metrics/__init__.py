@@ -41,6 +41,9 @@ from app.services.metrics.factors import (
     _neutralize_size,
     _winsorize_zscore,
     compute_flow_norm,
+    compute_pead_sue,
+    compute_residual_momentum,
+    compute_residual_momentum_panel,
     compute_universe_scores,
 )
 from app.services.metrics.fetch import (
@@ -89,6 +92,9 @@ __all__ = [
     "DEFAULT_FACTOR_WEIGHTS", "_compute_stock_scores", "_neutralize_size",
     "_neutralize_sector", "_winsorize_zscore", "compute_universe_scores",
     "compute_flow_norm",
+    "compute_pead_sue",
+    "compute_residual_momentum",
+    "compute_residual_momentum_panel",
     # sectors
     "SECTORS_CACHE_TTL", "_KOSDAQ_REF_TICKER", "_KOSPI_REF_TICKER",
     "_compute_one_sector", "compute_sectors",

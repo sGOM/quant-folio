@@ -481,10 +481,14 @@ class RebalanceRunner(BaseRunner):
             financial_period = self._cfg.get("financial_period", "annual")
             flow_window = int(selection.get("flow_window", 90))
             flow_denom = selection.get("flow_denom", "mcap")
+            rm_reg = int(selection.get("resid_mom_reg_window", 36))
+            rm_win = int(selection.get("resid_mom_window", 11))
+            rm_skip = int(selection.get("resid_mom_skip", 1))
+            pead_lookback_q = int(selection.get("pead_lookback_q", 8))
             scores = await asyncio.to_thread(
                 compute_universe_scores,
                 universe, as_of, factor_weights, neutralize, financial_period,
-                flow_window, flow_denom,
+                flow_window, flow_denom, rm_reg, rm_win, rm_skip, pead_lookback_q,
             )
             logger.info("전략 %d 종합점수 산정 완료: %d종목", self.strategy_id, len(scores))
         targets = compute_target_weights(history, cfg, scores=scores)
