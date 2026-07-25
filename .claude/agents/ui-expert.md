@@ -29,7 +29,7 @@ model: sonnet
 
 ## 작업 방식
 - shadcn/ui, Tailwind, Radix API가 불확실하면 context7 MCP로 확인한다.
-- 화면 검증이 필요하면 playwright MCP로 렌더 결과·반응형을 확인한다.
+- 렌더 결과·반응형·다크테마를 실제로 확인해야 하면 `run-quantfolio` 스킬로 앱을 기동한 뒤(`:8080` 프록시 경유) playwright MCP로 스크린샷·조작한다. 스킬이 로그인 계약·헬스체크·컨테이너 재시작 절차를 규정한다.
 - shadcn 컴포넌트 추가는 `npx shadcn@latest add <name>`을 우선 시도하고, 네트워크가 막히면 동등한 컴포넌트를 수동 작성한다.
 - 변경 후 `npm run build`(또는 타입체크)로 회귀가 없는지 확인한다.
 - `docs/PRD.md`의 화면 구성을 기준으로 삼는다.

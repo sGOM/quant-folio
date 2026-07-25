@@ -14,7 +14,12 @@ import pandas as pd
 
 from app.services.data.loader import bounded_socket_timeout
 from app.services.metrics.common import _approx_start, _is_nan, _ymd
-from app.services.metrics.fetch import _fetch_fundamentals, _fetch_price_change
+from app.services.metrics.fetch import (
+    _fetch_fundamentals,
+    _fetch_market_cap,
+    _fetch_net_purchases,
+    _fetch_price_change,
+)
 
 logger = logging.getLogger("app.services.metrics")
 
@@ -46,9 +51,277 @@ def _winsorize_zscore(s: pd.Series, invert: bool = False) -> pd.Series:
 #: 기본 팩터 카테고리 가중치(모멘텀/밸류/저변동/퀄리티/성장). 합=1.0.
 #: quality·growth 기본 0.0 — OpenDART 재무데이터가 필요하며, 배선하지 않은 기존
 #: 전략은 해당 컬럼 부재로 중립(0) 처리되어 영향받지 않는다.
+#: residual_momentum 기본 0.0 — 잔차(베타 조정) 모멘텀 옵트인 대체 팩터(컬럼 부재 시 중립).
 DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
     "momentum": 0.4, "value": 0.3, "lowvol": 0.3, "quality": 0.0, "growth": 0.0,
+    "flow": 0.0, "residual_momentum": 0.0, "pead": 0.0,
 }
+
+#: PEAD(실적 서프라이즈 드리프트) 기본 파라미터 — SUE 표준화 lookback 분기수.
+#: OpenDART 정기공시 접수일 기준 PIT 로 단일분기 순이익 YoY 서프라이즈를 계산해
+#: 최근 lookback 분기 표준편차로 표준화한다(opendart.pead_sue_by_symbol).
+PEAD_DEFAULT_LOOKBACK_Q = 8
+
+#: 잔차 모멘텀(Residual Momentum, Blitz·Huij·Martens 2011) 기본 파라미터(월 단위).
+#: reg_window: 시장 회귀 롤링 윈도우(월). mom_window: 형성창(월, 최근 skip 제외).
+#: skip: 최근 단기 반전(reversal) 제거용 스킵 개월. min_obs: 회귀 최소 월 관측치.
+RESID_MOM_DEFAULT_REG_WINDOW = 36
+RESID_MOM_DEFAULT_WINDOW = 11
+RESID_MOM_DEFAULT_SKIP = 1
+RESID_MOM_MIN_OBS = 24
+
+
+def compute_residual_momentum_panel(
+    close_panel: pd.DataFrame,
+    market_close: pd.Series,
+    as_of: date,
+    codes: list[str] | None = None,
+    reg_window: int = RESID_MOM_DEFAULT_REG_WINDOW,
+    mom_window: int = RESID_MOM_DEFAULT_WINDOW,
+    skip: int = RESID_MOM_DEFAULT_SKIP,
+    min_obs: int = RESID_MOM_MIN_OBS,
+) -> pd.Series:
+    """잔차(베타 조정) 모멘텀 원값 resid_mom 을 계산한다(Blitz·Huij·Martens 2011).
+
+    개별 종목 월수익률을 시장(KOSPI200 지수) 월수익률에 회귀(as_of 이하 reg_window 개월
+    롤링)해 시장·베타 성분을 제거한 잔차 시계열을 얻고, 형성창(최근 mom_window 개월,
+    최근 skip 개월 제외) 잔차의 평균/표준편차(잔차 정보비율)를 모멘텀 스코어로 삼는다.
+    std 로 나눠 고변동 종목의 과대 노출을 억제하는 것이 원시 모멘텀 대비 핵심 차이다.
+
+    설계 근거: id=23 저베타 방어형에선 원시 모멘텀이 사실상 베타/변동성 베팅으로 변질돼
+    IR 이 음(−0.18)이었다(팩터 IC/IR 분석). 시장 성분을 회귀로 걷어낸 잔차만 누적하면
+    그 오염을 구조적으로 제거할 수 있는지 검증하기 위한 옵트인 대체 팩터.
+
+    미래참조 방지: as_of 이하 확정 종가만 사용한다(월말 리샘플·회귀·형성 모두 as_of 컷).
+    사이즈(로그시총) 조정은 이 시계열 회귀 대신 스코어러의 크로스섹션 사이즈 중립화
+    (selection.neutralize="size")로 처리한다 — 시계열 회귀에 SMB 수익 시계열이 없어도
+    되고(외부 데이터 불요), 사이즈는 본질적으로 크로스섹션 특성이기 때문이다.
+
+    :param close_panel: index=일자, columns=종목코드, 값=종가(워밍업 포함, 최소 reg_window
+        개월 이상 과거를 포함해야 함).
+    :param market_close: 시장 지수(KOSPI200) 종가 Series(동일 구간).
+    :param codes: 계산 대상 종목(None 이면 close_panel 전 컬럼).
+    :return: index=종목코드, 값=resid_mom(float). 관측치 부족 종목은 제외(중립 폴백 대상).
+    """
+    if close_panel is None or close_panel.empty or market_close is None or market_close.empty:
+        return pd.Series(dtype="float64")
+
+    as_of_ts = pd.Timestamp(pd.Timestamp(as_of).date())
+
+    def _monthly_returns(obj: pd.DataFrame | pd.Series) -> pd.DataFrame | pd.Series:
+        # tz-naive 정규화 → as_of 컷 → 월(period) 말 종가 → 월수익률.
+        idx = obj.index
+        if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
+            idx = idx.tz_localize(None)
+        obj = obj.copy()
+        obj.index = pd.DatetimeIndex(idx).normalize()
+        obj = obj[obj.index <= as_of_ts]
+        if obj.empty:
+            return obj
+        monthly = obj.groupby(obj.index.to_period("M")).last()
+        # fill_method=None: 데이터 공백(상폐·거래정지) 월의 수익률을 pad 로 날조하지 않고
+        # NaN 으로 남긴다(회귀 표본에서 자연 제외 — notna 마스크가 처리). 선행 NaN(미상장)도 유지.
+        return monthly.pct_change(fill_method=None)
+
+    stock_ret = _monthly_returns(close_panel)
+    mkt_ret = _monthly_returns(market_close)
+    if isinstance(stock_ret, pd.Series):
+        stock_ret = stock_ret.to_frame()
+    if stock_ret.empty or mkt_ret.empty:
+        return pd.Series(dtype="float64")
+
+    # 회귀 윈도우: 형성창(mom_window+skip)보다 넉넉히 길어야 잔차 추정이 안정적이다.
+    need = mom_window + skip
+    reg_window = max(reg_window, need)
+
+    # 최근 reg_window 개월로 제한(as_of 기준 롤링). 시장·종목 공통 월 인덱스에 정렬.
+    mkt = mkt_ret.dropna()
+    mkt = mkt.iloc[-reg_window:]
+    if len(mkt) < min_obs:
+        return pd.Series(dtype="float64")
+    x = mkt.to_numpy(dtype=float)
+
+    target_codes = list(codes) if codes is not None else list(stock_ret.columns)
+    norm_map = {str(c).strip().zfill(6): c for c in stock_ret.columns}
+    out: dict[str, float] = {}
+    for code in target_codes:
+        col = code if code in stock_ret.columns else norm_map.get(str(code).strip().zfill(6))
+        if col is None:
+            continue
+        y_full = stock_ret[col].reindex(mkt.index)
+        m = y_full.notna()
+        n = int(m.sum())
+        if n < min_obs:
+            continue
+        yv = y_full[m].to_numpy(dtype=float)
+        xv = x[m.to_numpy()]
+        xvar = float(((xv - xv.mean()) ** 2).sum())
+        if not (xvar > 0):
+            continue
+        beta = float(((xv - xv.mean()) * (yv - yv.mean())).sum() / xvar)
+        alpha = float(yv.mean() - beta * xv.mean())
+        resid = yv - alpha - beta * xv  # 시장·베타 성분 제거 잔차(정렬 순서 = mkt.index)
+        # 형성창: 최근 skip 개월 제외 후 mom_window 개월. resid 는 유효월만 남았으므로
+        # 인덱스 기준 최근값에서 잘라낸다(월 결측이 섞여도 순서는 보존).
+        tail = resid[-(mom_window + skip):]
+        formation = tail[:-skip] if skip > 0 else tail
+        if len(formation) < 2:
+            continue
+        mu = float(formation.mean())
+        sd = float(formation.std(ddof=1))
+        out[str(code).strip().zfill(6)] = mu / sd if sd > 0 else mu
+    return pd.Series(out, dtype="float64")
+
+
+def compute_residual_momentum(
+    codes: list[str],
+    as_of: date,
+    reg_window: int = RESID_MOM_DEFAULT_REG_WINDOW,
+    mom_window: int = RESID_MOM_DEFAULT_WINDOW,
+    skip: int = RESID_MOM_DEFAULT_SKIP,
+    market_ticker: str = "1028",
+) -> pd.Series:
+    """실거래(compute_universe_scores) 경로용 잔차 모멘텀: 종가·KOSPI200 지수를 조회해 계산.
+
+    각 종목 종가 이력(reg_window+2 개월 버퍼)과 시장 지수(market_ticker, 기본 KOSPI200
+    =1028) 종가를 조회해 compute_residual_momentum_panel 로 위임한다. 외부 데이터는
+    종가+지수뿐이며(벤치마크·레짐이 이미 쓰는 소스 재사용), 조회 실패 종목·전량 실패는
+    빈/부분 Series 로 반환한다(호출자가 중립 폴백/스킵 판단).
+
+    미래참조 방지: as_of 이하 종가만 조회·사용한다.
+    """
+    if not codes:
+        return pd.Series(dtype="float64")
+    from app.services.data.loader import load_ohlcv
+    from app.services.metrics.fetch import _fetch_index_ohlcv
+
+    norm_codes = [str(c).strip().zfill(6) for c in codes]
+    # reg_window 개월 ≈ reg_window×22 거래일. 형성창·버퍼 포함 넉넉히 조회.
+    lookback_days = int((reg_window + 3) * 22)
+    start_ymd = _ymd(_approx_start(as_of, lookback_days, buffer=45))
+    as_of_ymd = _ymd(as_of)
+
+    with bounded_socket_timeout(30):
+        idx_df = _fetch_index_ohlcv(start_ymd, as_of_ymd, market_ticker)
+        if idx_df is None or idx_df.empty or "close" not in idx_df.columns:
+            return pd.Series(dtype="float64")  # 시장 지수 없으면 계산 불가(전량 실패 신호)
+        market_close = idx_df["close"].astype(float)
+
+        columns: dict[str, pd.Series] = {}
+        for code in norm_codes:
+            try:
+                df = load_ohlcv(code, start_ymd, as_of_ymd)
+            except Exception:  # noqa: BLE001
+                continue
+            if df is None or df.empty or "close" not in df.columns:
+                continue
+            columns[code] = df["close"].astype(float)
+
+    if not columns:
+        return pd.Series(dtype="float64")
+    panel = pd.DataFrame(columns)
+    return compute_residual_momentum_panel(
+        panel, market_close, as_of, codes=norm_codes,
+        reg_window=reg_window, mom_window=mom_window, skip=skip,
+    )
+
+#: 수급(flow) 팩터 기본 파라미터 — 누적창(거래일)·정규화 분모.
+#: financial-expert 설계상 60~120일 누적 지속(persistence) 신호. 워크포워드 확정 전
+#: 잠정 기본값(90일·시가총액). window 는 거래일 수, denom 은 "mcap"(시가총액) 또는
+#: "value"(동일창 누적 거래대금).
+FLOW_DEFAULT_WINDOW = 90
+FLOW_DEFAULT_DENOM = "mcap"
+
+
+def compute_flow_norm(
+    codes: list[str],
+    as_of: date,
+    window: int = FLOW_DEFAULT_WINDOW,
+    denom: str = FLOW_DEFAULT_DENOM,
+) -> pd.Series:
+    """수급(flow) 팩터 원값 flow_norm 을 계산한다(외국인+기관 누적 순매수 / 정규화 분모).
+
+    지속(persistence) accumulation 신호: [as_of-window, as_of] 구간 누적 외국인+기관
+    순매수 '대금'을 시가총액(denom="mcap") 또는 동일 구간 누적 거래대금(denom="value")으로
+    나눠 스케일-프리하게 만든다. 회전율 억제를 위해 단기 반전이 아닌 수개월 누적을 본다.
+
+    미래참조 방지: as_of 이하 확정 데이터만 사용한다(호출자가 직전 확정 영업일로 넘긴다).
+    조회 실패 종목은 결과에서 빠져(중립 폴백 대상), 전량 실패면 빈 Series 를 반환한다
+    (호출자가 리밸런싱 스킵 판단). window 는 거래일 수 → _approx_start 로 달력일 근사.
+
+    :return: index=종목코드(6자리), 값=flow_norm(float). 계산 불가 종목은 제외.
+    """
+    if not codes:
+        return pd.Series(dtype="float64")
+    norm_codes = [str(c).strip().zfill(6) for c in codes]
+    mkts = ["KOSPI", "KOSDAQ"]
+    as_of_ymd = _ymd(as_of)
+    start_ymd = _ymd(_approx_start(as_of, window))
+
+    with bounded_socket_timeout(30):
+        npf = _fetch_net_purchases(start_ymd, as_of_ymd, mkts)
+        if denom == "value":
+            denom_df = _fetch_price_change(start_ymd, as_of_ymd, mkts)  # 거래대금=구간 누적
+        else:
+            denom_df = _fetch_market_cap(as_of_ymd, mkts)  # 시가총액=시점값
+
+    if npf is None or npf.empty:
+        return pd.Series(dtype="float64")  # 전량 실패 — 호출자가 스킵 판단
+
+    npf = npf.copy()
+    npf.index = npf.index.astype(str).str.zfill(6)
+    net = npf["net_buy_value"].reindex(norm_codes)
+
+    denom_series: pd.Series | None = None
+    if denom_df is not None and not denom_df.empty:
+        denom_df = denom_df.copy()
+        denom_df.index = denom_df.index.astype(str).str.zfill(6)
+        col = "거래대금" if denom == "value" else "시가총액"
+        if col in denom_df.columns:
+            denom_series = pd.to_numeric(
+                denom_df[col], errors="coerce"
+            ).reindex(norm_codes)
+
+    out: dict[str, float] = {}
+    for code in norm_codes:
+        nv = net.get(code)
+        if nv is None or _is_nan(nv):
+            continue
+        dv = denom_series.get(code) if denom_series is not None else None
+        if dv is None or _is_nan(dv) or dv <= 0:
+            continue
+        out[code] = float(nv) / float(dv)
+    return pd.Series(out, dtype="float64")
+
+
+def compute_pead_sue(
+    codes: list[str],
+    as_of: date,
+    lookback_q: int = PEAD_DEFAULT_LOOKBACK_Q,
+) -> pd.Series:
+    """PEAD 팩터 원값 pead_sue 를 계산한다(표준화 기대외 이익, OpenDART 접수일 PIT).
+
+    opendart.pead_sue_by_symbol 로 위임한다 — 각 종목의 실제 정기공시 접수일(rcept_dt)
+    기준으로 as_of 시점에 이미 공시된 분기 실적만 사용해(미래참조 없음) 단일분기 순이익
+    YoY 서프라이즈를 최근 lookback_q 분기 표준편차로 표준화한다. 컨센서스 부재로 기대치는
+    계절적 랜덤워크(전년 동기) 프록시를 쓴다. 조회 실패/표본 부족 종목은 결과에서 빠지고
+    (중립 폴백 대상), 전량 실패면 빈 Series 를 반환한다(호출자가 리밸런싱 스킵 판단).
+
+    :return: index=종목코드(6자리), 값=pead_sue(float). 계산 불가 종목은 제외.
+    """
+    if not codes:
+        return pd.Series(dtype="float64")
+    from app.services.data import opendart
+
+    norm_codes = [str(c).strip().zfill(6) for c in codes]
+    try:
+        sue = opendart.pead_sue_by_symbol(norm_codes, as_of, lookback_q=lookback_q)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("PEAD(SUE) 팩터 조회 실패 — 중립 처리: %s", e)
+        return pd.Series(dtype="float64")
+    if not sue:
+        return pd.Series(dtype="float64")
+    return pd.Series(sue, dtype="float64")
 
 
 def _neutralize_size(df: pd.DataFrame, factor_cols: list[str]) -> pd.DataFrame:
@@ -217,17 +490,45 @@ def _compute_stock_scores(
     z_turn = _zc("turnaround")
     score_growth = pd.concat([z_opg, z_netg, z_turn], axis=1).mean(axis=1)
 
+    # ── 수급(flow) 카테고리 z-score (외국인+기관 누적 순매수/시총·거래대금) ──
+    # 지속(persistence) accumulation 신호. 60~120일 누적 순매수 대금을 시총 또는
+    # 거래대금으로 정규화한 flow_norm 을 그대로 z-score 한다(높을수록 순매수 지속 →
+    # invert 불필요). flow_norm 컬럼이 없으면(=미배선) score_flow 는 전부 0(중립)이
+    # 되어 flow 가중치 0 인 기존 전략은 영향받지 않는다.
+    z_flow = _zc("flow_norm")
+    score_flow = z_flow
+
+    # ── 잔차(베타 조정) 모멘텀 카테고리 z-score (Blitz·Huij·Martens 2011) ──
+    # 시장 회귀 잔차의 형성창 정보비율(resid_mom)을 그대로 z-score 한다(높을수록 우량 →
+    # invert 불필요). resid_mom 컬럼이 없으면(=미배선/데이터 부족) score_residual_momentum
+    # 은 전부 0(중립)이 되어 residual_momentum 가중치 0 인 기존 전략은 영향받지 않는다.
+    # 원시 모멘텀(score_momentum)과 별개 슬롯 — 원시 필드는 그대로 두고 병행하는 옵트인 대체.
+    z_resmom = _zc("resid_mom")
+    score_residual_momentum = z_resmom
+
+    # ── PEAD(실적 서프라이즈 드리프트) 카테고리 z-score (OpenDART 접수일 PIT) ──
+    # 표준화 기대외 이익(SUE, 단일분기 순이익 YoY 서프라이즈/표준편차)을 그대로 z-score
+    # 한다(높을수록 양(+)의 서프라이즈 → 상방 드리프트 기대 → invert 불필요). pead_sue
+    # 컬럼이 없으면(=미배선/데이터 부족) score_pead 는 전부 0(중립)이 되어 pead 가중치
+    # 0 인 기존 전략은 영향받지 않는다.
+    z_pead = _zc("pead_sue")
+    score_pead = z_pead
+
     # 카테고리 점수를 프레임에 싣는다(중립화·종합점수 산출의 기준).
     result["score_momentum"] = score_momentum
     result["score_value"] = score_value
     result["score_lowvol"] = score_lowvol
     result["score_quality"] = score_quality
     result["score_growth"] = score_growth
+    result["score_flow"] = score_flow
+    result["score_residual_momentum"] = score_residual_momentum
+    result["score_pead"] = score_pead
 
     # ── 팩터 중립화(P1-3 사이즈, §20 섹터): 종합 전에 각 카테고리 점수를 지정 축에
     # 직교화한다. "size_sector"는 둘 다 순차 적용(사이즈 먼저 — 연속축 잔차화 후
     # 범주형 demean 이 사이즈 조정된 값 위에서 섹터 쏠림만 추가로 제거한다).
-    cat_cols = ["score_momentum", "score_value", "score_lowvol", "score_quality", "score_growth"]
+    cat_cols = ["score_momentum", "score_value", "score_lowvol", "score_quality",
+                "score_growth", "score_flow", "score_residual_momentum", "score_pead"]
     if neutralize in ("size", "size_sector"):
         result = _neutralize_size(result, cat_cols)
     if neutralize in ("sector", "size_sector"):
@@ -240,6 +541,10 @@ def _compute_stock_scores(
         + w.get("lowvol", DEFAULT_FACTOR_WEIGHTS["lowvol"]) * result["score_lowvol"]
         + w.get("quality", DEFAULT_FACTOR_WEIGHTS["quality"]) * result["score_quality"]
         + w.get("growth", DEFAULT_FACTOR_WEIGHTS["growth"]) * result["score_growth"]
+        + w.get("flow", DEFAULT_FACTOR_WEIGHTS["flow"]) * result["score_flow"]
+        + w.get("residual_momentum", DEFAULT_FACTOR_WEIGHTS["residual_momentum"])
+        * result["score_residual_momentum"]
+        + w.get("pead", DEFAULT_FACTOR_WEIGHTS["pead"]) * result["score_pead"]
     )
     result["score"] = score.round(4)
     for c in cat_cols:
@@ -254,6 +559,12 @@ def compute_universe_scores(
     factor_weights: dict[str, float] | None = None,
     neutralize: str = "none",
     financial_period: str = "annual",
+    flow_window: int = FLOW_DEFAULT_WINDOW,
+    flow_denom: str = FLOW_DEFAULT_DENOM,
+    resid_mom_reg_window: int = RESID_MOM_DEFAULT_REG_WINDOW,
+    resid_mom_window: int = RESID_MOM_DEFAULT_WINDOW,
+    resid_mom_skip: int = RESID_MOM_DEFAULT_SKIP,
+    pead_lookback_q: int = PEAD_DEFAULT_LOOKBACK_Q,
 ) -> dict[str, float]:
     """리밸런싱 selection.method="score" 전용: 지정 종목들의 종합점수를 계산한다.
 
@@ -270,6 +581,14 @@ def compute_universe_scores(
     :param factor_weights: {"momentum","value","lowvol"} 카테고리 가중치. None 이면 기본값.
     :param financial_period: "annual"(기본)/"ttm" — 퀄리티 팩터(OpenDART)의 재무 반영
         주기(§8/§3, RebalanceConfig.financial_period). "ttm"이면 분기 TTM 경로로 조회한다.
+    :param flow_window: 수급(flow) 팩터 누적창(거래일). flow 가중치>0 일 때만 조회.
+    :param flow_denom: 수급 팩터 정규화 분모("mcap"=시가총액, "value"=구간 누적 거래대금).
+    :param resid_mom_reg_window: 잔차 모멘텀 시장 회귀 롤링 윈도우(월). residual_momentum
+        가중치>0 일 때만 종가+KOSPI200 지수를 조회해 계산한다.
+    :param resid_mom_window: 잔차 모멘텀 형성창(월, 최근 skip 제외).
+    :param resid_mom_skip: 잔차 모멘텀 최근 스킵 개월(단기 반전 제거).
+    :param pead_lookback_q: PEAD SUE 표준화 lookback 분기수. pead 가중치>0 일 때만 OpenDART
+        접수일 PIT 로 조회한다(컬럼 부재 시 중립 처리).
     :return: {종목코드: score} dict. 데이터 부족(예: mom_6m 결측)으로 계산 불가한
         종목은 결과에서 제외된다(compute_target_weights 가 자연히 후순위/미선정 처리).
     """
@@ -379,6 +698,64 @@ def compute_universe_scores(
             df["sector"] = pd.Series(
                 {c: smap.get(c) for c in df.index}, dtype="object"
             ).reindex(df.index)
+
+    # 수급(flow) 팩터: flow 가중치>0 인 전략에서만 조회(외국인+기관 누적 순매수/분모).
+    if float(_w.get("flow", 0.0) or 0.0) > 0:
+        try:
+            flow = compute_flow_norm(codes, as_of, window=flow_window, denom=flow_denom)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("수급(flow) 팩터 조회 실패 — 중립 처리: %s", e)
+            flow = pd.Series(dtype="float64")
+        # 전량 실패 방어(모멘텀 팩터와 동일 취지): flow 가중치가 유의미한데 순매수
+        # 조회가 통째로 비었으면 개별 종목 정상 결측이 아니라 KRX 조회 일시 장애다.
+        # 이 상태로 진행하면 스코어러가 남은 팩터만으로 재정규화해 왜곡된 목표를
+        # 산출하므로, 예외를 올려 이번 리밸런싱을 건너뛰고 다음 주기에 재시도한다.
+        if flow.empty:
+            raise RuntimeError(
+                "수급(flow) 팩터 데이터 전량 조회 실패(외국인+기관 순매수 빈 응답) — "
+                "왜곡된 목표 산출 방지 위해 리밸런싱 건너뜀(다음 주기 재시도)"
+            )
+        df["flow_norm"] = flow.reindex(df.index)
+
+    # 잔차(베타 조정) 모멘텀 팩터: residual_momentum 가중치>0 인 전략에서만 조회
+    # (종가+KOSPI200 지수 회귀 잔차). 컬럼 부재 시 스코어러가 중립 처리한다.
+    if float(_w.get("residual_momentum", 0.0) or 0.0) > 0:
+        try:
+            resid_mom = compute_residual_momentum(
+                codes, as_of, reg_window=resid_mom_reg_window,
+                mom_window=resid_mom_window, skip=resid_mom_skip,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("잔차 모멘텀 팩터 조회 실패 — 중립 처리: %s", e)
+            resid_mom = pd.Series(dtype="float64")
+        # 전량 실패 방어(모멘텀·flow 와 동일 취지): 가중치가 유의미한데 조회가 통째로
+        # 비었으면 개별 종목 정상 결측이 아니라 KRX/지수 조회 일시 장애다. 남은 팩터로
+        # 재정규화한 왜곡 목표를 막기 위해 예외를 올려 이번 리밸런싱을 건너뛴다.
+        if resid_mom.empty:
+            raise RuntimeError(
+                "잔차 모멘텀 팩터 데이터 전량 조회 실패(종가/KOSPI200 지수 빈 응답) — "
+                "왜곡된 목표 산출 방지 위해 리밸런싱 건너뜀(다음 주기 재시도)"
+            )
+        df["resid_mom"] = resid_mom.reindex(df.index)
+
+    # PEAD(실적 서프라이즈 드리프트) 팩터: pead 가중치>0 인 전략에서만 조회(OpenDART
+    # 정기공시 접수일 PIT 로 단일분기 순이익 YoY 서프라이즈를 표준화). 컬럼 부재 시
+    # 스코어러가 중립 처리한다.
+    if float(_w.get("pead", 0.0) or 0.0) > 0:
+        try:
+            pead = compute_pead_sue(codes, as_of, lookback_q=pead_lookback_q)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("PEAD(SUE) 팩터 조회 실패 — 중립 처리: %s", e)
+            pead = pd.Series(dtype="float64")
+        # 전량 실패 방어(모멘텀·flow·잔차 모멘텀과 동일 취지): 가중치가 유의미한데 조회가
+        # 통째로 비었으면 개별 종목 정상 결측이 아니라 OpenDART 조회 일시 장애/키부재다.
+        # 남은 팩터로 재정규화한 왜곡 목표를 막기 위해 예외를 올려 이번 리밸런싱을 건너뛴다.
+        if pead.empty:
+            raise RuntimeError(
+                "PEAD(SUE) 팩터 데이터 전량 조회 실패(정기공시/재무 빈 응답) — "
+                "왜곡된 목표 산출 방지 위해 리밸런싱 건너뜀(다음 주기 재시도)"
+            )
+        df["pead_sue"] = pead.reindex(df.index)
 
     scored = _compute_stock_scores(df, weights=factor_weights, neutralize=neutralize)
     return {

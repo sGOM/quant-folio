@@ -9,5 +9,31 @@
       "mcp__playwright__browser_console_messages",
       "mcp__redis__list"
     ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/block-secret-edit.js",
+            "statusMessage": "시크릿 파일 편집 여부 확인 중..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/backend-restart-reminder.js 2>/dev/null || true",
+            "statusMessage": "backend 재시작 필요 여부 확인 중..."
+          }
+        ]
+      }
+    ]
   }
 }

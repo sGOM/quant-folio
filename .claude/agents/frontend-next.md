@@ -24,6 +24,6 @@ model: sonnet
 
 ## 작업 방식
 - Next.js/TanStack Query/Radix API가 불확실하면 context7 MCP로 확인한다.
-- 화면 검증이 필요하면 playwright MCP로 동작을 확인한다.
+- 화면 검증이 필요하면 `run-quantfolio` 스킬로 앱을 기동·확인한다(빌드/헬스체크 절차, `:8080` 프록시 경유, 로그인 form-encoded 계약, 백엔드 변경 시 `docker compose restart web` 필요 등 함정을 스킬이 규정). 브라우저 조작 자체는 스킬이 안내하는 대로 playwright MCP를 쓴다.
 - 백엔드 API 계약은 backend-fastapi 에이전트 구현과 정합성을 맞춘다.
 - `docs/PRD.md`의 화면 구성을 기준으로 삼는다.

@@ -200,6 +200,98 @@ def _fundamentals_provider_with_neutralize_cols(
     return fdf
 
 
+def _provider_with_flow(base_provider, window: int, denom: str):
+    """base_provider 결과에 수급(flow) 팩터 컬럼(flow_norm)을 덧붙이는 provider 를 만든다.
+
+    factor_weights.flow>0 인 score 전략 백테스트에서만 쓴다. metrics.compute_flow_norm
+    (외국인+기관 누적 순매수/정규화 분모)을 as_of 시점으로 조회한다. 조회 실패/부재면
+    flow_norm 컬럼을 붙이지 않으므로 스코어러가 자연히 중립(0) 처리한다.
+    """
+    from app.services.metrics import compute_flow_norm
+
+    def _p(as_of_date, codes):
+        norm_codes = [str(c).zfill(6) for c in codes]
+        fdf = base_provider(as_of_date, codes) if base_provider is not None else None
+        try:
+            flow = compute_flow_norm(norm_codes, as_of_date, window=window, denom=denom)
+        except Exception:  # noqa: BLE001
+            flow = None
+        if flow is None or flow.empty:
+            return fdf
+        s = flow.reindex(norm_codes)
+        if fdf is None:
+            return pd.DataFrame({"flow_norm": s})
+        fdf = fdf.copy()
+        fdf["flow_norm"] = s.reindex(fdf.index)
+        return fdf
+
+    return _p
+
+
+def _provider_with_resid_mom(base_provider, panel, market_close, reg_window, mom_window, skip):
+    """base_provider 결과에 잔차(베타 조정) 모멘텀 컬럼(resid_mom)을 덧붙이는 provider.
+
+    factor_weights.residual_momentum>0 인 score 전략 백테스트에서만 쓴다. 이미 적재한
+    종가 패널(panel)과 벤치마크(KOSPI200) 종가(market_close)를 재사용해
+    compute_residual_momentum_panel 로 as_of 시점 잔차 모멘텀을 산출한다(외부 조회 없음).
+    시장 지수(market_close)가 없거나 데이터 부족이면 컬럼을 붙이지 않아 스코어러가 중립
+    처리한다. 미래참조 없음: 함수 내부가 as_of 이하 종가만 사용한다.
+    """
+    from app.services.metrics.factors import compute_residual_momentum_panel
+
+    def _p(as_of_date, codes):
+        norm_codes = [str(c).zfill(6) for c in codes]
+        fdf = base_provider(as_of_date, codes) if base_provider is not None else None
+        if market_close is None or panel is None or panel.empty:
+            return fdf
+        try:
+            rm = compute_residual_momentum_panel(
+                panel, market_close, as_of_date, codes=norm_codes,
+                reg_window=reg_window, mom_window=mom_window, skip=skip,
+            )
+        except Exception:  # noqa: BLE001
+            rm = None
+        if rm is None or rm.empty:
+            return fdf
+        s = rm.reindex(norm_codes)
+        if fdf is None:
+            return pd.DataFrame({"resid_mom": s})
+        fdf = fdf.copy()
+        fdf["resid_mom"] = s.reindex(fdf.index)
+        return fdf
+
+    return _p
+
+
+def _provider_with_pead(base_provider, lookback_q: int):
+    """base_provider 결과에 PEAD 팩터 컬럼(pead_sue)을 덧붙이는 provider 를 만든다.
+
+    factor_weights.pead>0 인 score 전략 백테스트에서만 쓴다. metrics.compute_pead_sue
+    (OpenDART 정기공시 접수일 PIT 로 단일분기 순이익 YoY 서프라이즈 표준화)를 as_of
+    시점으로 조회한다. 조회 실패/부재면 pead_sue 컬럼을 붙이지 않으므로 스코어러가
+    자연히 중립(0) 처리한다. 미래참조 없음: 함수 내부가 rcept_dt<=as_of 만 사용한다.
+    """
+    from app.services.metrics import compute_pead_sue
+
+    def _p(as_of_date, codes):
+        norm_codes = [str(c).zfill(6) for c in codes]
+        fdf = base_provider(as_of_date, codes) if base_provider is not None else None
+        try:
+            pead = compute_pead_sue(norm_codes, as_of_date, lookback_q=lookback_q)
+        except Exception:  # noqa: BLE001
+            pead = None
+        if pead is None or pead.empty:
+            return fdf
+        s = pead.reindex(norm_codes)
+        if fdf is None:
+            return pd.DataFrame({"pead_sue": s})
+        fdf = fdf.copy()
+        fdf["pead_sue"] = s.reindex(fdf.index)
+        return fdf
+
+    return _p
+
+
 def _build_pit_pool(config: dict, start, end):
     """universe_rule.source 가 지수명이면 (합집합 universe, pool_provider) 를 만든다.
 
@@ -305,6 +397,16 @@ async def _run_rebalance_backtest(
         provider = partial(
             _fundamentals_provider_with_neutralize_cols, use_ttm=use_ttm, neutralize=_neutralize,
         )
+    # 수급(flow) 팩터: factor_weights.flow>0 이면 provider 에 flow_norm 컬럼을 덧붙인다.
+    if method == "score":
+        _sel = config.get("selection", {})
+        _flow_w = float((_sel.get("factor_weights") or {}).get("flow", 0.0) or 0.0)
+        if _flow_w > 0:
+            provider = _provider_with_flow(
+                provider,
+                int(_sel.get("flow_window", 90)),
+                _sel.get("flow_denom", "mcap"),
+            )
 
     # 현금화 오버레이(레짐 필터): 켜져 있으면 기준지수 종가 시리즈를 적재해 주입한다.
     regime_series = None
@@ -327,6 +429,25 @@ async def _run_rebalance_backtest(
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("벤치마크 지수 적재 실패(상대지표 미산출): %s", e)
+
+    # 잔차(베타 조정) 모멘텀 팩터: factor_weights.residual_momentum>0 이면 provider 에
+    # resid_mom 컬럼을 덧붙인다(적재한 종가 패널 + 벤치마크 재사용, 외부 조회 없음). 벤치마크
+    # 적재 이후에 배선해야 시장 회귀 소스를 확보한다.
+    if method == "score":
+        _sel = config.get("selection", {})
+        _rm_w = float((_sel.get("factor_weights") or {}).get("residual_momentum", 0.0) or 0.0)
+        if _rm_w > 0:
+            provider = _provider_with_resid_mom(
+                provider, panel, benchmark_series,
+                int(_sel.get("resid_mom_reg_window", 36)),
+                int(_sel.get("resid_mom_window", 11)),
+                int(_sel.get("resid_mom_skip", 1)),
+            )
+        # PEAD 팩터: factor_weights.pead>0 이면 provider 에 pead_sue 컬럼을 덧붙인다
+        # (OpenDART 정기공시 접수일 PIT 조회).
+        _pead_w = float((_sel.get("factor_weights") or {}).get("pead", 0.0) or 0.0)
+        if _pead_w > 0:
+            provider = _provider_with_pead(provider, int(_sel.get("pead_lookback_q", 8)))
 
     # 패닉 오버레이(P2): 켜져 있으면 롤링 패닉 지표 시계열을 적재해 주입한다. 브레드스는
     # pykrx 특성상 거래일마다 조회가 필요해 최초 실행이 느릴 수 있다(로컬 파일 캐시로

@@ -27,6 +27,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+import statistics
 import zipfile
 from datetime import date
 
@@ -530,8 +531,12 @@ def annual_metrics(corp_code: str, bsns_year: int) -> dict[str, float | None]:
             accounts = acc
             break
 
+    # 조회 실패/무자료(accounts 없음)는 파생결과를 캐시하지 않는다 — 캐시하면 일시적
+    # 네트워크 실패(SSL 타임아웃·요율 초과)의 all-None 결과가 프로세스 수명 동안 굳어져
+    # 이후 재시도가 막힌다(_ACCOUNTS_CACHE 는 성공만 저장하므로 재조회는 이 가드에 달림).
     metrics = derive_metrics(accounts or [])
-    _METRICS_CACHE[key] = metrics
+    if accounts:
+        _METRICS_CACHE[key] = metrics
     return metrics
 
 
@@ -568,8 +573,12 @@ def _period_metrics(corp_code: str, bsns_year: int, reprt_code: str) -> dict[str
             accounts = acc
             break
 
+    # 실패/무자료는 캐시하지 않는다(annual_metrics 와 동일 취지 — 일시 실패의 all-None
+    # 결과가 굳어져 재시도를 막지 않도록). PEAD 는 분기 원자료 다수를 연쇄 조회하므로
+    # 이 재시도 보장이 특히 중요하다(전 분기 poisoning 시 SUE 전량 소실).
     metrics = derive_metrics(accounts or [])
-    _PERIOD_METRICS_CACHE[key] = metrics
+    if accounts:
+        _PERIOD_METRICS_CACHE[key] = metrics
     return metrics
 
 
@@ -718,3 +727,184 @@ def _turnaround_flag(net_cur: float | None, net_prev: float | None) -> float | N
     if net_cur is None or net_prev is None:
         return None
     return 1.0 if (net_prev <= 0 and net_cur > 0) else 0.0
+
+
+# ─────────────────── PEAD(실적 서프라이즈 드리프트) SUE ───────────────────
+# Post-Earnings-Announcement Drift: 발표 직후 서프라이즈 방향으로 수익률이 수주간
+# 지속(drift)한다는 아노말리. 컨센서스 추정치가 없어 기대치는 '계절적 랜덤워크'
+# (전년 동기 = 기대치)로 프록시하고, 표준화 기대외 이익(SUE)을 다음처럼 정의한다:
+#
+#   단일분기 순이익 Q(y, rc)   = 누적순이익(y, rc) − 누적순이익(y, 직전분기)   ← 누적 해제
+#   서프라이즈 s(y, rc)        = Q(y, rc) − Q(y−1, rc)                         ← 계절적 랜덤워크
+#   SUE                        = s(최근공시분기) / std(최근 lookback_q개 서프라이즈)
+#
+# 미래참조 방지의 핵심: 어떤 분기를 '이미 공시된 것'으로 볼지를 통계적 마감일(추정)이
+# 아니라 **실제 접수일(rcept_dt)** 로 판정한다. disclosure_calendar 가 정기공시 목록
+# (list.json)에서 각 보고서의 실제 접수일을 읽어오고, pead_sue_by_symbol 은 as_of
+# 시점에 접수일이 도래한(rcept_dt <= as_of) 보고서만 사용한다. 서프라이즈에 쓰는
+# 전년 동기·직전분기 보고서는 모두 그보다 과거라 항상 이미 공시돼 있어 룩어헤드가 없다.
+
+# 정기공시(list.json pblntf_ty="A") report_nm 파싱: "분기보고서 (2023.09)" 등.
+_PERIODIC_REPORT_RE = re.compile(r"(분기보고서|반기보고서|사업보고서)\s*\((\d{4})\.(\d{2})\)")
+# report_nm 의 월(03/06/09/12) → 보고서코드.
+_MONTH_TO_REPRT = {
+    "03": REPORT_Q1, "06": REPORT_HALF, "09": REPORT_Q3, "12": REPORT_ANNUAL,
+}
+# 단일분기 순이익 누적해제용 직전분기 매핑(1분기는 그 자체가 단일분기).
+_QUARTER_PRED = {REPORT_HALF: REPORT_Q1, REPORT_Q3: REPORT_HALF, REPORT_ANNUAL: REPORT_Q3}
+
+# 정기공시 접수일 캘린더 캐시: (corp_code, ref_year) -> [(rcept_date, bsns_year, reprt_code)].
+_CALENDAR_CACHE: dict[tuple, list[tuple[date, int, str]]] = {}
+
+
+def _parse_periodic_report(report_nm: str, rcept_dt: str) -> tuple[date, int, str] | None:
+    """정기공시 목록 항목(report_nm, rcept_dt)에서 (접수일, 사업연도, 보고서코드)를 파싱.
+
+    "[기재정정]" 등 접두사가 붙어도 정규식 search 로 본문을 잡는다. 파싱 불가/비정기
+    공시면 None. rcept_dt 는 "YYYYMMDD" 8자리.
+    """
+    m = _PERIODIC_REPORT_RE.search(report_nm or "")
+    if not m:
+        return None
+    reprt = _MONTH_TO_REPRT.get(m.group(3))
+    if reprt is None:
+        return None
+    s = (rcept_dt or "").strip()
+    if len(s) != 8 or not s.isdigit():
+        return None
+    try:
+        d = date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+    except ValueError:
+        return None
+    return (d, int(m.group(2)), reprt)
+
+
+def disclosure_calendar(corp_code: str, ref_year: int) -> list[tuple[date, int, str]]:
+    """법인의 정기공시(분기·반기·사업보고서) 실제 접수일 캘린더를 반환한다.
+
+    list.json(pblntf_ty="A", 정기공시)에서 ref_year 기준 최근 6년치를 조회해 각
+    보고서의 (접수일 rcept_dt, 사업연도, 보고서코드)를 파싱한다. 동일 (사업연도,
+    보고서코드)가 원공시+정정공시로 여러 번 나오면 **최초 접수일**만 남긴다(정정으로
+    가용시점이 앞당겨지지 않도록 — PIT 보수성). 접수일 오름차순 정렬(가용 순서).
+    (corp_code, ref_year) 로 캐시한다. 키부재/실패/무자료 시 빈 리스트.
+    """
+    key = (corp_code, ref_year)
+    cached = _CALENDAR_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    data = _get(
+        "list.json",
+        {
+            "corp_code": corp_code,
+            "bgn_de": f"{ref_year - 5}0101",
+            "end_de": f"{ref_year}1231",
+            "pblntf_ty": "A",
+            "page_count": "100",
+        },
+    )
+    earliest: dict[tuple[int, str], date] = {}
+    if data:
+        for item in data.get("list", []):
+            parsed = _parse_periodic_report(item.get("report_nm", ""), item.get("rcept_dt", ""))
+            if parsed is None:
+                continue
+            d, year, reprt = parsed
+            k = (year, reprt)
+            if k not in earliest or d < earliest[k]:
+                earliest[k] = d
+    out = sorted(((d, y, rc) for (y, rc), d in earliest.items()), key=lambda x: (x[0], x[1], x[2]))
+    # 빈 결과(조회 실패/무자료)는 캐시하지 않는다 — 일시 실패가 굳으면 그 종목 PEAD 가
+    # 프로세스 수명 동안 소실된다(재시도 보장). data 가 정상(성공)일 때만 저장한다.
+    if data is not None:
+        _CALENDAR_CACHE[key] = out
+    return out
+
+
+def _single_quarter_net_income(corp_code: str, bsns_year: int, reprt_code: str) -> float | None:
+    """단일분기 순이익(누적 해제)을 반환한다.
+
+    OpenDART 분기 금액은 사업연도 초부터의 누적치이므로, 단일분기 = 당해 누적 −
+    직전분기 누적. 1분기는 누적=단일분기라 그대로. 필요한 누적치(당해 또는 직전분기)가
+    없으면 None(호출부가 해당 서프라이즈를 건너뜀). 연결 우선·개별 폴백은 _period_metrics
+    가 처리한다.
+    """
+    cur = _period_metrics(corp_code, bsns_year, reprt_code).get("net_income")
+    if cur is None:
+        return None
+    if reprt_code == REPORT_Q1:
+        return cur
+    pred_rc = _QUARTER_PRED.get(reprt_code)
+    if pred_rc is None:
+        return None
+    pred = _period_metrics(corp_code, bsns_year, pred_rc).get("net_income")
+    if pred is None:
+        return None
+    return cur - pred
+
+
+def _pead_sue_one(
+    corp_code: str, as_of: date, lookback_q: int, min_obs: int
+) -> float | None:
+    """단일 법인의 SUE(표준화 기대외 이익)를 as_of 시점 PIT 로 계산한다.
+
+    disclosure_calendar 에서 접수일이 as_of 이하인(이미 공시된) 정기공시만 취해,
+    각 보고서의 단일분기 서프라이즈(전년 동기 대비)를 시계열로 만든 뒤 최근 값을
+    최근 lookback_q개 서프라이즈의 표준편차로 나눈다. 유효 서프라이즈가 min_obs 미만
+    이거나 표준편차가 0/정의불가면 None(중립 폴백 대상).
+    """
+    calendar = disclosure_calendar(corp_code, as_of.year)
+    disclosed = [(d, y, rc) for (d, y, rc) in calendar if d <= as_of]
+    if len(disclosed) < min_obs:
+        return None
+
+    surprises: list[float] = []
+    for _d, year, reprt in disclosed:
+        cur_q = _single_quarter_net_income(corp_code, year, reprt)
+        prev_q = _single_quarter_net_income(corp_code, year - 1, reprt)
+        if cur_q is None or prev_q is None:
+            continue
+        surprises.append(cur_q - prev_q)
+
+    if len(surprises) < min_obs:
+        return None
+    window = surprises[-lookback_q:]
+    if len(window) < 2:
+        return None
+    try:
+        sd = statistics.stdev(window)  # 표본표준편차(ddof=1)
+    except statistics.StatisticsError:
+        return None
+    if not (sd > 0):
+        return None
+    return surprises[-1] / sd
+
+
+def pead_sue_by_symbol(
+    codes: list[str], as_of: date, lookback_q: int = 8, min_obs: int = 6
+) -> dict[str, float]:
+    """유니버스 종목들의 PEAD SUE(표준화 기대외 이익)를 {종목코드: sue} 로 반환한다.
+
+    미래참조 없음: 각 종목의 실제 접수일(rcept_dt) 기준으로 as_of 시점에 이미 공시된
+    정기공시만 사용한다(disclosure_calendar 가 접수일을 공급, _pead_sue_one 이 컷).
+    키 미승인/조회 실패/서프라이즈 표본 부족 종목은 결과에서 제외된다(호출부가 중립
+    처리). 블로킹 함수이므로 호출자는 스레드풀에서 실행한다.
+
+    :param lookback_q: SUE 표준화 분모에 쓸 최근 서프라이즈 시계열 길이(분기 수).
+    :param min_obs: SUE 산출에 필요한 최소 유효 서프라이즈 개수(신뢰도 하한).
+    """
+    if not is_enabled() or not codes:
+        return {}
+    corp_map = cached_corp_code_map()
+    if not corp_map:
+        return {}
+    out: dict[str, float] = {}
+    for raw in codes:
+        code = str(raw).strip().zfill(6)
+        corp = corp_map.get(code)
+        if not corp:
+            continue
+        sue = _pead_sue_one(corp, as_of, lookback_q, min_obs)
+        if sue is not None:
+            out[code] = sue
+    return out

@@ -26,5 +26,5 @@ model: sonnet
 ## 작업 방식
 - 라이브러리 API가 불확실하면 context7 MCP로 FastAPI/SQLAlchemy/Celery 최신 문서를 확인한다.
 - DB 스키마 변경이 필요하면 db-architect 에이전트와 정합성을 맞춘다.
-- 구현 후 관련 엔드포인트의 동작을 간단한 스크립트나 pytest로 검증한다.
+- 구현 후 관련 엔드포인트의 동작을 pytest로 검증하거나, 컨테이너를 띄운 전체 스택에서 확인해야 하면 `run-quantfolio` 스킬의 `smoke.sh`(헬스체크→회원가입→로그인→인증 `/me`)를 쓴다. 코드 변경 후 `web`은 핫리로드가 안 되므로 스킬이 안내하는 대로 `docker compose restart web`을 먼저 한다.
 - `docs/PRD.md`의 데이터 모델·기능 정의를 기준으로 삼는다.

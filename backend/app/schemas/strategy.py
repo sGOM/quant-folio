@@ -300,14 +300,38 @@ class FactorWeights(BaseModel):
         default=0.0, ge=0, le=1,
         description="성장 카테고리 가중치(영업이익/순이익 YoY·흑자전환, OpenDART 필요)",
     )
+    flow: float = Field(
+        default=0.0, ge=0, le=1,
+        description="수급 카테고리 가중치(외국인+기관 누적 순매수/시총·거래대금, pykrx 필요). "
+        "id=23 등 기존 전략은 flow=0 이라 무영향(컬럼 부재 시 중립 0 처리).",
+    )
+    residual_momentum: float = Field(
+        default=0.0, ge=0, le=1,
+        description="잔차(베타·사이즈 조정) 모멘텀 카테고리 가중치(Blitz·Huij·Martens 2011). "
+        "개별 종목 월수익률을 KOSPI200 에 회귀한 잔차의 형성창 정보비율(종가+지수만 필요). "
+        "원시 모멘텀(momentum)과 별개 슬롯 — 저베타 전략에서 원시 모멘텀이 베타/변동성 "
+        "베팅으로 변질되는 오염을 회귀로 제거한 옵트인 대체 팩터. 기존 전략은 0 이라 무영향.",
+    )
+    pead: float = Field(
+        default=0.0, ge=0, le=1,
+        description="PEAD(실적 서프라이즈 드리프트) 카테고리 가중치. OpenDART 정기공시 접수일 "
+        "(rcept_dt) PIT 로 단일분기 순이익 YoY 서프라이즈를 표준화(SUE, 컨센서스 부재로 "
+        "기대치는 전년 동기 계절적 랜덤워크 프록시). OpenDART 필요. 기존 전략은 0 이라 무영향"
+        "(컬럼 부재 시 중립 0 처리).",
+    )
 
     @model_validator(mode="after")
     def _sum_to_one(self):
-        total = self.momentum + self.value + self.lowvol + self.quality + self.growth
+        total = (
+            self.momentum + self.value + self.lowvol
+            + self.quality + self.growth + self.flow + self.residual_momentum
+            + self.pead
+        )
         if abs(total - 1.0) > 1e-6:
             raise ValueError(
                 "factor_weights 합은 1.0 이어야 합니다"
-                f"(momentum+value+lowvol+quality+growth={total:.4f})."
+                "(momentum+value+lowvol+quality+growth+flow+residual_momentum+pead"
+                f"={total:.4f})."
             )
         return self
 
@@ -398,6 +422,36 @@ class RebalanceSelection(BaseModel):
     top_n: int = Field(default=5, ge=1, le=50, description="선정 종목 수(momentum/score)")
     factor_weights: FactorWeights = Field(
         default_factory=FactorWeights, description="종합점수 카테고리 가중치(method=score)"
+    )
+    # 수급(flow) 팩터 파라미터(factor_weights.flow>0 일 때만 사용). 누적창(거래일)과
+    # 정규화 분모를 지정한다 — financial-expert 설계상 반기 워크포워드로 결정한다.
+    flow_window: int = Field(
+        default=90, ge=20, le=250,
+        description="수급 팩터 누적창(거래일, 60/90/120 권장). 지속 accumulation 신호.",
+    )
+    flow_denom: Literal["mcap", "value"] = Field(
+        default="mcap",
+        description="수급 팩터 정규화 분모. mcap=시가총액, value=동일창 누적 거래대금.",
+    )
+    # 잔차 모멘텀(residual_momentum) 파라미터(factor_weights.residual_momentum>0 일 때만
+    # 사용). 월 단위 — reg_window=시장 회귀 롤링 윈도우, window=형성창, skip=최근 반전 제외.
+    resid_mom_reg_window: int = Field(
+        default=36, ge=12, le=60,
+        description="잔차 모멘텀 시장 회귀 롤링 윈도우(월, 24~36 권장). Blitz 원논문=36.",
+    )
+    resid_mom_window: int = Field(
+        default=11, ge=3, le=24,
+        description="잔차 모멘텀 형성창(월, 최근 skip 제외). Blitz 원논문=11(t-12..t-2).",
+    )
+    resid_mom_skip: int = Field(
+        default=1, ge=0, le=3,
+        description="잔차 모멘텀 최근 스킵 개월(단기 반전 제거). 0=스킵 없음.",
+    )
+    # PEAD(실적 서프라이즈 드리프트) 파라미터(factor_weights.pead>0 일 때만 사용).
+    pead_lookback_q: int = Field(
+        default=8, ge=4, le=16,
+        description="PEAD SUE 표준화 lookback 분기수(최근 N개 서프라이즈의 표준편차로 표준화). "
+        "OpenDART 정기공시 접수일 PIT 로 단일분기 순이익 YoY 서프라이즈를 산출.",
     )
     # 팩터 중립화(P1-3, method="score" 전용). 각 카테고리 z-score 를 지정 축에 대해
     # 직교화(residualize)해 의도치 않은 스타일 베팅을 제거한다.

@@ -18,10 +18,6 @@ Docker Compose로 뜨는 별도 프로세스들. 서로 **Redis(pub/sub·큐·�
 | `redis` | 세션·큐·pub/sub | — |
 | `proxy` | Caddy | — |
 
-- 백엔드 소스: `backend/app`(web) · `backend/engine`(엔진) · `backend/worker`(celery) · `backend/tests`
-- 프론트: `frontend/app`(라우트) · `frontend/components` · `frontend/lib`
-- DB 마이그레이션: `backend/alembic/versions`
-
 ## 자주 쓰는 명령
 
 ```bash
@@ -90,5 +86,4 @@ docker compose exec frontend npm run build
 ## 컨벤션
 
 - 커밋 메시지·주석·문서: **한국어**.
-- 백엔드: FastAPI + Pydantic v2 + SQLAlchemy 2 (async). 테스트는 `pytest` (`asyncio_mode=auto`).
 - 프론트: TypeScript strict, 자체 SVG 차트(외부 차트 라이브러리 미사용).
