@@ -31,6 +31,13 @@
     "shadcn": {
       "command": "cmd",
       "args": ["/c", "npx", "shadcn@latest", "mcp"]
+    },
+    "github": {
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      }
     }
   }
 }

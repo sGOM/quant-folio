@@ -27,3 +27,4 @@ model: opus
 - vectorbt/pandas/asyncio API가 불확실하면 context7 MCP로 확인한다.
 - 백테스트 결과는 단순 수치뿐 아니라 가정·한계를 함께 보고한다.
 - `docs/PRD.md`의 전략·리스크·DB 정의를 기준으로 삼는다.
+- 엔진 변경 후 모의투자 종단 검증이나 API 스모크가 필요하면 `run-quantfolio` 스킬로 스택을 기동·재시작(`docker compose restart engine`/`web`)하고 `smoke.sh` 또는 헬스체크로 확인한다.
