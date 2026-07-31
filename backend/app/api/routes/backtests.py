@@ -326,6 +326,14 @@ def _build_pit_pool(config: dict, start, end):
         if m > 12:
             y, m = y + 1, 1
     union = sorted({c for codes in by_month.values() for c in codes})
+    if not union:
+        # 조용히 넘어가면 빈 패널 위에서 백테스트가 '성공'하며 무의미한 수치를 낸다
+        # (KRX 로그인 차단 시 실제로 관측됨 — 모든 월이 0종목). 소리내어 남긴다.
+        logger.error(
+            "PIT 후보풀이 비었다(source=%s, %s~%s, %d개월 전부 0종목) — "
+            "KRX 인증 실패 가능성. 이 상태로 만든 백테스트 결과는 신뢰할 수 없다.",
+            source, start, end, len(by_month),
+        )
 
     def pool_provider(ts):
         return by_month.get((ts.year, ts.month), [])
