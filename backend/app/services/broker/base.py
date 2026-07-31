@@ -48,20 +48,40 @@ class Quote:
 
 # KIS `iscd_stat_cls_code` 중 체결 불가로 취급할 코드.
 # 51 관리종목·52 투자위험·53 투자경고·54 투자주의는 거래가 되므로 제외한다.
-# 주의: KIS 문서 기준값이며 실계좌 응답으로 교차 확인이 필요하다.
+# 실응답 확인(2026-07-31 삼성전자·SK하이닉스): 정상 종목은 '55'(신용가능) 였다.
+# 58(거래정지)의 실제 관측은 아직 없다 — 정지 종목을 만나면 값을 재확인할 것.
 HALT_STATUS_CODES = frozenset({"58"})
 
 
-def is_halted_status(temp_stop_yn: str | None, status_code: str | None) -> bool:
+def is_halted_status(
+    temp_stop_yn: str | None,
+    status_code: str | None,
+    vi_cls_code: str | None = None,
+) -> bool:
     """증권사 원본 필드로 체결 불가 여부를 판정한다.
 
     브로커 응답 → `Quote.halted` 정규화의 단일 출처. 엔진(`engine/halt.py`)이
     이 결과를 받아 시장 CB 를 판정하므로 판정 기준을 두 곳에 두지 않는다.
 
-    :param temp_stop_yn: KIS 임시정지여부('Y'/'N'). VI 발동 중에도 Y 로 온다.
+    :param temp_stop_yn: KIS 임시정지여부('Y'/'N').
     :param status_code: KIS 종목상태구분코드(`iscd_stat_cls_code`).
+    :param vi_cls_code: KIS VI(변동성완화장치) 발동 구분('Y'/'N'). 제공하지 않는
+        브로커는 None.
+
+    ## VI 를 별도 필드로 보는 이유
+    처음에는 "VI 도 `temp_stop_yn` 에 Y 로 온다"고 보고 이 인자가 없었다. 그러나
+    실응답(2026-07-31)에 `vi_cls_code`·`ovtm_vi_cls_code`(시간외) **전용 필드가
+    따로 존재**하는 것이 확인돼, `temp_stop_yn` 만으로는 VI 를 놓칠 수 있다고 판단해
+    분리했다. VI 발동 시 2분간 단일가매매로 전환되므로 시장가 주문이 즉시 체결되지
+    않는다 — 주문을 내보내지 말고 다음 틱에 재평가하는 편이 안전하다.
+
+    **아직 미검증**: 정상 상태('N')만 관측했고 실제 발동 시 'Y' 가 오는지는 확인하지
+    못했다(정지·VI 종목을 만나야 확인 가능). 필드명·용도에 근거한 판정이며, 실제
+    값이 다르면 여기와 `HALT_STATUS_CODES` 를 함께 고칠 것.
     """
     if str(temp_stop_yn or "").strip().upper() == "Y":
+        return True
+    if str(vi_cls_code or "").strip().upper() == "Y":
         return True
     return str(status_code or "").strip() in HALT_STATUS_CODES
 

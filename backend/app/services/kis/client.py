@@ -252,7 +252,10 @@ class KisClient:
             currency="KRW",  # KIS 는 국내주식 전용
             # 정지 상태는 여기서만 정규화한다 — 이전에는 inquire-price 응답에 실려
             # 오는데도 Quote 로 옮기지 않아 엔진이 정지 종목에 주문을 냈다.
-            halted=is_halted_status(o.get("temp_stop_yn"), status_code),
+            # VI 는 temp_stop_yn 이 아니라 전용 필드(vi_cls_code)로 오므로 함께 넘긴다.
+            halted=is_halted_status(
+                o.get("temp_stop_yn"), status_code, o.get("vi_cls_code")
+            ),
             status_code=status_code,
         )
 

@@ -32,6 +32,17 @@ class TestIsHaltedStatus:
 
     def test_값이_없으면_정지가_아니다(self):
         assert is_halted_status(None, None) is False
+        assert is_halted_status(None, None, None) is False
+
+    def test_VI_발동은_전용_필드로_판정한다(self):
+        # VI 는 temp_stop_yn 이 아니라 vi_cls_code 로 온다(실응답에 전용 필드 존재).
+        # 이 인자가 없던 초기 구현은 VI 를 통째로 놓쳤다.
+        assert is_halted_status("N", "55", "Y") is True
+        assert is_halted_status("N", "55", "N") is False
+
+    def test_실응답으로_관측된_정상상태는_정지가_아니다(self):
+        # 2026-07-31 삼성전자·SK하이닉스 실응답 값 그대로.
+        assert is_halted_status("N", "55", "N") is False
 
     def test_Quote_기본값은_정지_아님(self):
         # 정지 여부를 제공하지 않는 브로커(토스 등)는 이 기본값으로 남는다.
