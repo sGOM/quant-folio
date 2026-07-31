@@ -23,6 +23,7 @@ from datetime import date, timedelta
 
 from app.core.database import AsyncSessionLocal
 from app.services.data.loader import bounded_socket_timeout
+from app.services.market import is_business_day
 
 logger = logging.getLogger(__name__)
 
@@ -401,3 +402,108 @@ def membership_union(dates: list[date], index: str = "KOSPI200") -> dict[str, li
     for d in dates:
         out[d.strftime("%Y%m%d")] = index_members(d, index)
     return out
+
+
+# ─────────────────────────── 레버리지 ETF 잔고 ───────────────────────────
+#
+# 지수 구성종목과 소스(같은 MDC 포털·같은 인증 세션)가 같아 이 모듈에 둔다.
+# 용도는 다르다 — 이쪽은 생존편향 제거가 아니라 시장 **취약성**(레버리지 축적) 관측이다.
+# 2026-07 폭락의 동력이 단일종목 레버리지 ETF 의 강제 리밸런싱 나선이었고, 그 축적은
+# 가격이 오르는 동안 관측된다(사전 지표). 미수금·신용융자 쪽은 app/services/data/kofia.py.
+
+_BLD_ETF_ALL = "dbms/MDC/STAT/standard/MDCSTAT04301"
+
+# 종목명으로 레버리지 여부를 판별한다. KRX 응답에 배수·기초자산 구분 필드가 없어
+# 종목명이 유일한 단서다. '인버스'는 하락 베팅이라 상승장 취약성 축적과 성격이 달라
+# 레버리지 집계에서 제외한다(인버스2X 는 레버리지이기도 하지만 방향이 반대).
+_LEV_KEYWORDS = ("레버리지",)
+# 단일종목 레버리지 — 2026-07 나선의 진앙. 개별 종목 변동성이 그대로 증폭돼
+# 지수형 레버리지보다 청산 압력이 크다.
+_SINGLE_STOCK_KEYWORD = "단일종목"
+
+
+def _krx_num(v: object) -> float:
+    """KRX 응답의 콤마 포함 숫자 문자열을 float 로(파싱 실패 시 0.0)."""
+    try:
+        return float(str(v or "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def etf_leverage_exposure(as_of: date) -> dict:
+    """as_of 시점 레버리지 ETF 잔고 집계. 미인증·실패 시 빈 dict.
+
+    반환: `{as_of, total_mktcap, leveraged_mktcap, single_stock_mktcap,
+    leveraged_ratio, single_stock_ratio, leveraged_count, single_stock_count}`
+    (금액 단위: 원, 비율은 0~1).
+
+    **`MKTCAP`(시가총액)을 쓴다.** 같은 응답의 `INVSTASST_NETASST_TOTAMT`(순자산총액)은
+    2026-07-31 기준 1155 종목 전부 0 이라 사용할 수 없다. ETF 는 NAV 괴리가 크지 않아
+    시가총액이 순자산의 실용적 대용이며, 어차피 쓰임새가 **비율의 시계열 변화**라
+    수준 자체의 정확도보다 일관성이 중요하다.
+
+    **휴장일은 조회 전에 스냅한다.** 이 엔드포인트는 휴장일에 빈 응답이 아니라 직전
+    영업일 데이터를 그대로 돌려준다(2026-08-01 토요일 요청에서 확인). 응답이 비기를
+    기다리는 소급 방식으로는 걸러지지 않아, 반환 `as_of` 가 실제 데이터 시점과 어긋난
+    거짓 라벨이 된다 — 시계열로 쌓으면 같은 값이 두 날짜에 중복 기록된다.
+    남은 한계: `is_business_day` 가 놓치는 공휴일에서는 여전히 어긋날 수 있다.
+
+    PIT 안전 — 스냅·소급 모두 과거로만 가고 미래일로는 가지 않는다.
+    """
+    sess = _session()
+    if sess is None:
+        logger.debug("KRX 미인증 — ETF 레버리지 잔고 조회 건너뜀")
+        return {}
+
+    # 주말·공휴일이면 직전 영업일로 스냅(조회 '전'에 — 위 docstring 참고).
+    snapped = as_of
+    for _ in range(10):
+        if is_business_day(snapped):
+            break
+        snapped -= timedelta(days=1)
+
+    rows: list[dict] = []
+    used = snapped
+    for back in range(7):
+        used = snapped - timedelta(days=back)
+        payload = {
+            "bld": _BLD_ETF_ALL, "locale": "ko_KR",
+            "trdDd": used.strftime("%Y%m%d"),
+            "share": "1", "money": "1", "csvxls_isNo": "false",
+        }
+        try:
+            resp = sess.post(_JSON_URL, data=payload, timeout=20)
+            rows = resp.json().get("output") or []
+        except Exception as e:  # noqa: BLE001
+            logger.warning("KRX ETF 조회 실패(%s): %s", used, e)
+            rows = []
+        if rows:
+            break
+
+    if not rows:
+        return {}
+
+    total = lev = single = 0.0
+    lev_n = single_n = 0
+    for r in rows:
+        name = str(r.get("ISU_ABBRV") or "")
+        cap = _krx_num(r.get("MKTCAP"))
+        total += cap
+        if not any(k in name for k in _LEV_KEYWORDS):
+            continue
+        lev += cap
+        lev_n += 1
+        if _SINGLE_STOCK_KEYWORD in name:
+            single += cap
+            single_n += 1
+
+    return {
+        "as_of": used,
+        "total_mktcap": total,
+        "leveraged_mktcap": lev,
+        "single_stock_mktcap": single,
+        "leveraged_ratio": (lev / total) if total else None,
+        "single_stock_ratio": (single / total) if total else None,
+        "leveraged_count": lev_n,
+        "single_stock_count": single_n,
+    }
