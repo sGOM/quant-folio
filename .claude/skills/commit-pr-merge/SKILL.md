@@ -52,12 +52,12 @@ git add path/a.py path/b.py
 git commit -m "refactor: 잔고 정규화를 Balance.positions_normalized로 통합" \
   -m "- reconcile._balance_map이 공유 메서드를 재사용하도록 변경
 - 미사용 InvalidOperation import 정리" \
-  -m "Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
+  -m "Co-Authored-By: Claude <모델명> <noreply@anthropic.com>"
 
 git add path/route.py
 git commit -m "feat: 실시간 포지션을 실계좌 잔고로 조회" \
   -m "- /positions가 브로커 잔고 우선, 실패 시 로컬 DB 폴백" \
-  -m "Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
+  -m "Co-Authored-By: Claude <모델명> <noreply@anthropic.com>"
 ```
 
 주의:
@@ -65,6 +65,7 @@ git commit -m "feat: 실시간 포지션을 실계좌 잔고로 조회" \
   분할은 파일 단위로 한다. 한 파일 안의 변경을 더 쪼개야 하면 사용자에게 알리고 파일 단위로 합친다.
 - Bash에서 여러 줄 메시지는 `-m`을 반복한다(PowerShell heredoc `@'...'@`를 Bash에 쓰지 말 것).
 - 제목: `feat|fix|refactor|docs|chore|test: <한국어 요약>` (50자 내외). 마지막 트레일러 필수.
+- 트레일러의 `<모델명>`은 **지금 실행 중인 모델 이름**을 쓴다(예: `Claude Sonnet 5`, `Claude Opus 5`). 버전을 하드코딩하지 말 것 — 모델이 바뀌면 이력이 거짓이 된다.
 - 무엇을 어느 커밋에 넣고 뺐는지 사용자에게 보고한다.
 
 ### 4. 푸시
