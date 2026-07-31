@@ -16,7 +16,14 @@ import httpx
 
 from app.core.config import settings
 from app.core.redis import redis_client
-from app.services.broker.base import Balance, BrokerError, Fill, OrderResult, Quote
+from app.services.broker.base import (
+    Balance,
+    BrokerError,
+    Fill,
+    OrderResult,
+    Quote,
+    is_halted_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +239,7 @@ class KisClient:
             volume = int(float(o.get("acml_vol") or 0))
         except (TypeError, ValueError):
             volume = 0
+        status_code = str(o.get("iscd_stat_cls_code") or "").strip()
         return Quote(
             symbol=symbol,
             price=self._dec(o, "stck_prpr"),
@@ -242,6 +250,10 @@ class KisClient:
             low=self._dec(o, "stck_lwpr"),
             open=self._dec(o, "stck_oprc"),
             currency="KRW",  # KIS 는 국내주식 전용
+            # 정지 상태는 여기서만 정규화한다 — 이전에는 inquire-price 응답에 실려
+            # 오는데도 Quote 로 옮기지 않아 엔진이 정지 종목에 주문을 냈다.
+            halted=is_halted_status(o.get("temp_stop_yn"), status_code),
+            status_code=status_code,
         )
 
     async def verify_connection(self) -> bool:

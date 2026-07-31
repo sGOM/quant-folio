@@ -38,6 +38,32 @@ class Quote:
     open: Decimal = Decimal("0")
     # 통화 코드(KRW/USD 등). 해외주식은 소수 가격이 흔해 표시 포맷에 사용한다.
     currency: str = "KRW"
+    # 거래정지·VI 등으로 지금 체결이 불가한 상태인지. 이 값을 제공하지 않는 브로커는
+    # False 로 남는다 — 정지를 '모름'이 아니라 '아님'으로 두는 낙관적 기본값이므로,
+    # 주문 차단을 이 필드에만 의존시키지 말 것(engine/halt.py 의 시장 CB 판정과 병행).
+    halted: bool = False
+    # 증권사 원본 종목상태 코드(KIS `iscd_stat_cls_code`: 58=거래정지 등). 감사·디버깅용.
+    status_code: str = ""
+
+
+# KIS `iscd_stat_cls_code` 중 체결 불가로 취급할 코드.
+# 51 관리종목·52 투자위험·53 투자경고·54 투자주의는 거래가 되므로 제외한다.
+# 주의: KIS 문서 기준값이며 실계좌 응답으로 교차 확인이 필요하다.
+HALT_STATUS_CODES = frozenset({"58"})
+
+
+def is_halted_status(temp_stop_yn: str | None, status_code: str | None) -> bool:
+    """증권사 원본 필드로 체결 불가 여부를 판정한다.
+
+    브로커 응답 → `Quote.halted` 정규화의 단일 출처. 엔진(`engine/halt.py`)이
+    이 결과를 받아 시장 CB 를 판정하므로 판정 기준을 두 곳에 두지 않는다.
+
+    :param temp_stop_yn: KIS 임시정지여부('Y'/'N'). VI 발동 중에도 Y 로 온다.
+    :param status_code: KIS 종목상태구분코드(`iscd_stat_cls_code`).
+    """
+    if str(temp_stop_yn or "").strip().upper() == "Y":
+        return True
+    return str(status_code or "").strip() in HALT_STATUS_CODES
 
 
 @dataclass
