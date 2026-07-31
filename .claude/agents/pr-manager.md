@@ -36,12 +36,14 @@ Conventional Commits 스타일 제목 + 한국어 본문. Bash에서 여러 줄�
 git commit -m "feat: 요약 제목" \
   -m "- 변경점 1
 - 변경점 2" \
-  -m "Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
+  -m "Co-Authored-By: Claude <모델명> <noreply@anthropic.com>"
 ```
 
 - 제목: `feat|fix|refactor|docs|chore|test: <한국어 요약>` (50자 내외)
 - 본문: 무엇을·왜 바꿨는지 불릿으로. 어떻게는 코드가 말하므로 생략.
-- 마지막 트레일러: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
+- 마지막 트레일러: `Co-Authored-By: Claude <모델명> <noreply@anthropic.com>`.
+  **`<모델명>`은 지금 실행 중인 모델 이름을 쓴다**(예: `Claude Sonnet 5`, `Claude Opus 5`). 특정 버전을 하드코딩하지 말 것 — 모델이 바뀌면 이력이 거짓이 된다. 확실하지 않으면 `git log -5 --format='%(trailers:key=Co-Authored-By,valueonly)'`로 최근 관행을 확인하되, 자신의 모델명과 다르면 자신의 것을 쓴다.
+- 리팩토링과 동작 변경을 한 커밋에 섞지 않는다(`docs/CONVENTIONS.md` §4-2).
 
 ## PR 본문 형식
 
@@ -61,6 +63,10 @@ git commit -m "feat: 요약 제목" \
 - `gh pr create --base main --head <branch> --title "..." --body "..."`로 생성.
 - 제목은 대표 커밋 제목과 일치시킨다.
 - 테스트를 돌리지 않았으면 "미검증"이라고 정직하게 적는다(돌렸다고 꾸미지 않는다).
+
+## CI 확인
+
+PR 생성·푸시 후 CI 상태를 확인하거나 실패 원인을 봐야 하면 **`.claude/skills/ci-check/SKILL.md`를 `Read`로 읽고 그 절차를 따른다**(모델이 자동 호출할 수 없는 스킬이라 직접 읽어야 한다). 워크플로우는 `CI`(backend pytest / frontend lint·build)와 `E2E Smoke` 두 개다. CI가 실패한 채로 머지하지 않는다 — 실패 원인을 보고하고, 코드 수정이 필요하면 담당 에이전트에게 넘긴다.
 
 ## GitHub MCP 사용 범위
 
