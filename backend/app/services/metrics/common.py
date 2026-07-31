@@ -86,3 +86,28 @@ def _mkts(market: str) -> list[str]:
     if market.upper() == "ALL":
         return ["KOSPI", "KOSDAQ"]
     return [market.upper()]
+
+
+def _ramp(x: float | None, warn: float, high: float) -> float | None:
+    """경계(warn)=0점, 임계(high)=100점으로 선형 보간 후 [0,100] 클램프.
+
+    방향과 무관하게 warn=0점·high=100점 관계만 지키면 동일 식이 성립한다
+    (하락 신호는 warn>high 둘 다 음수, 상승-악화 신호는 warn<high).
+
+    패닉 지표(panic.py)와 취약성 지표(vulnerability.py)가 공유한다 —
+    같은 스코어링 규약을 두 곳에 두지 않기 위해 여기로 승격했다.
+    """
+    if x is None or np.isnan(x) or high == warn:
+        return None
+    v = (x - warn) / (high - warn)
+    return float(max(0.0, min(1.0, v)) * 100.0)
+
+
+def _wavg(pairs: list[tuple[float, float | None]]) -> float | None:
+    """(가중, 서브스코어) 목록에서 유효한 서브스코어만으로 가중평균을 낸다.
+
+    일부 신호가 데이터 부족으로 None이면 그 항목을 빼고 남은 것으로 정규화한다.
+    """
+    num = sum(w * s for w, s in pairs if s is not None)
+    den = sum(w for w, s in pairs if s is not None)
+    return num / den if den > 0 else None

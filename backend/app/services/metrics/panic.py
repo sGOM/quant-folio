@@ -52,7 +52,9 @@ from app.services.metrics.common import (
     _approx_start,
     _mkts,
     _prev_business_day,
+    _ramp,
     _safe_float,
+    _wavg,
     _ymd,
 )
 from app.services.metrics.fetch import (
@@ -131,28 +133,6 @@ CAVEATS: list[str] = [
     "충분히 쌓이기 전(약 60거래일 미만)에는 판정에서 제외됩니다. 또한 이 신호의 "
     "경계·패닉 임계값은 역사적 사례로 검증된 것이 아니라 잠정값입니다.",
 ]
-
-
-def _ramp(x: float | None, warn: float, panic: float) -> float | None:
-    """경계(warn)=0점, 패닉(panic)=100점으로 선형 보간 후 [0,100] 클램프.
-
-    방향과 무관하게 warn=0점·panic=100점 관계만 지키면 동일 식이 성립한다
-    (하락 신호는 warn>panic 둘 다 음수, 상승-악화 신호는 warn<panic).
-    """
-    if x is None or np.isnan(x) or panic == warn:
-        return None
-    v = (x - warn) / (panic - warn)
-    return float(max(0.0, min(1.0, v)) * 100.0)
-
-
-def _wavg(pairs: list[tuple[float, float | None]]) -> float | None:
-    """(가중, 서브스코어) 목록에서 유효한 서브스코어만으로 가중평균을 낸다.
-
-    일부 신호가 데이터 부족으로 None이면 그 항목을 빼고 남은 것으로 정규화한다.
-    """
-    num = sum(w * s for w, s in pairs if s is not None)
-    den = sum(w for w, s in pairs if s is not None)
-    return num / den if den > 0 else None
 
 
 def compute_panic(market: str, as_of: date) -> PanicOut:
