@@ -22,7 +22,10 @@ FreeSIS 응답에는 **컬럼 라벨이 없다**(`dsmHeader`·`unit` 모두 빈 
 
 `TMPV2`(투자자예탁금 추정)·`TMPV3`·`TMPV4` 는 **미확정이라 이름을 붙이지 않고**
 `raw` 로만 통과시킨다. 확인되지 않은 의미를 필드명으로 박으면 그 자체가 오류의
-출처가 된다. 신용융자 잔고는 이 통계표에 없다(별도 OBJ_NM 미발견).
+출처가 된다.
+
+신용융자 잔고는 이 통계표가 아니라 별도 통계표(`_OBJ_CREDIT`)에 있다 —
+`fetch_credit_balance` 참고. 이쪽이 취약성 관측의 1순위 지표다.
 
 ## 해석 주의 — 단독 사용 금지
 반대매매 비중은 스트레스는 잡지만 **낙폭 규모는 구분하지 못한다.** 실측:
@@ -49,6 +52,8 @@ logger = logging.getLogger(__name__)
 _URL = "https://freesis.kofia.or.kr/meta/getMetaDataList.do"
 # 증시자금 추이(일별) 통계표.
 _OBJ_MARKET_FUNDS = "STATSCU0100000060BO"
+# 신용공여(신용융자) 잔고 추이(일별) 통계표.
+_OBJ_CREDIT = "STATSCU0100000070BO"
 _HEADERS = {
     "Content-Type": "application/json; charset=UTF-8",
     "User-Agent": "Mozilla/5.0",
@@ -75,6 +80,25 @@ class MarketFunds:
     raw: dict = field(default_factory=dict)
 
 
+@dataclass
+class CreditBalance:
+    """신용융자 잔고 일별 관측 1건.
+
+    :param as_of: 관측일
+    :param total: 신용융자 잔고 합계(원). **취약성 관측의 1순위 지표** — 이 잔고가
+        쌓이는 과정이 곧 강제청산 압력의 축적이며, 가격이 오르는 동안 관측된다
+    :param part_a: 합계의 구성요소 1(원). 개별 의미 미확정 — 아래 주석 참고
+    :param part_b: 합계의 구성요소 2(원). 개별 의미 미확정
+    :param raw: 원본 행(신용대주·담보융자로 보이는 잔여 컬럼 보존)
+    """
+
+    as_of: date
+    total: float | None
+    part_a: float | None
+    part_b: float | None
+    raw: dict = field(default_factory=dict)
+
+
 def _f(row: dict, key: str) -> float | None:
     """숫자 필드를 float 로. 값이 없거나 숫자가 아니면 None(0 으로 채우지 않는다)."""
     v = row.get(key)
@@ -96,34 +120,69 @@ def _parse_ymd(v: object) -> date | None:
         return None
 
 
-def fetch_market_funds(start: date, end: date) -> list[MarketFunds]:
-    """[start, end] 구간의 증시자금 일별 시계열을 날짜 오름차순으로 반환한다.
-
-    실패하면 경고만 남기고 빈 리스트를 반환한다 — 취약성 관측이 없다고 해서
-    매매나 백테스트가 멈추면 안 된다.
-    """
+def _rows(obj_nm: str, start: date, end: date, label: str) -> list[dict]:
+    """FreeSIS 통계표 1건을 조회해 원본 행 리스트를 반환한다(실패 시 빈 리스트)."""
     if start > end:
         raise ValueError(f"start 가 end 보다 늦다: {start} > {end}")
-
     payload = {
         "dmSearch": {
             "tmpV40": "1",
             "tmpV41": "1",
             "tmpV45": start.strftime("%Y%m%d"),
             "tmpV46": end.strftime("%Y%m%d"),
-            "OBJ_NM": _OBJ_MARKET_FUNDS,
+            "OBJ_NM": obj_nm,
         }
     }
     try:
         resp = httpx.post(_URL, json=payload, headers=_HEADERS, timeout=_TIMEOUT)
         resp.raise_for_status()
-        rows = resp.json().get("ds1") or []
+        return resp.json().get("ds1") or []
     except Exception as e:  # noqa: BLE001 - 외부 소스 장애를 상위로 전파하지 않는다
-        logger.warning("FreeSIS 증시자금 조회 실패(%s~%s): %s", start, end, e)
+        logger.warning("FreeSIS %s 조회 실패(%s~%s): %s", label, start, end, e)
         return []
 
+
+def fetch_credit_balance(start: date, end: date) -> list[CreditBalance]:
+    """[start, end] 구간의 신용융자 잔고 일별 시계열을 날짜 오름차순으로 반환한다.
+
+    ## 컬럼 식별
+    - `TMPV2` **신용융자 잔고 합계**. 2026-06-01 37.68조 → 07-30 32.15조(−14.7%)로
+      같은 구간 보도치(38조→32조, −15.4%)와 일치한다.
+    - `TMPV3`·`TMPV4` 는 합계의 구성요소다 — `TMPV2 == TMPV3 + TMPV4` 가 42/42
+      성립(상대오차 0.1% 미만). 다만 **각각이 무엇인지는 확정하지 못했다**(시장별
+      분해인지, 신용융자/담보융자 분해인지). 2026-06~07 에 TMPV3 −8.4% 대 TMPV4
+      −32.4% 로 감소폭이 크게 갈렸다는 사실만 관측됐다. 이름을 붙이지 않고
+      `part_a`/`part_b` 로 둔다.
+    - 나머지 컬럼(신용대주·예탁증권담보융자로 **추정**)은 `raw` 로만 보존한다.
+
+    실패 시 예외 대신 빈 리스트를 반환한다.
+    """
+    out: list[CreditBalance] = []
+    for r in _rows(_OBJ_CREDIT, start, end, "신용융자 잔고"):
+        as_of = _parse_ymd(r.get("TMPV1"))
+        if as_of is None:
+            continue
+        out.append(
+            CreditBalance(
+                as_of=as_of,
+                total=_f(r, "TMPV2"),
+                part_a=_f(r, "TMPV3"),
+                part_b=_f(r, "TMPV4"),
+                raw=dict(r),
+            )
+        )
+    out.sort(key=lambda c: c.as_of)
+    return out
+
+
+def fetch_market_funds(start: date, end: date) -> list[MarketFunds]:
+    """[start, end] 구간의 증시자금 일별 시계열을 날짜 오름차순으로 반환한다.
+
+    실패하면 경고만 남기고 빈 리스트를 반환한다 — 취약성 관측이 없다고 해서
+    매매나 백테스트가 멈추면 안 된다.
+    """
     out: list[MarketFunds] = []
-    for r in rows:
+    for r in _rows(_OBJ_MARKET_FUNDS, start, end, "증시자금"):
         as_of = _parse_ymd(r.get("TMPV1"))
         if as_of is None:
             continue
