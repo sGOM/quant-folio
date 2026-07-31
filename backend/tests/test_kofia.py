@@ -113,3 +113,53 @@ def test_요청에_조회구간과_통계표_코드가_실린다(monkeypatch):
     search = captured["json"]["dmSearch"]
     assert (search["tmpV45"], search["tmpV46"]) == ("20081001", "20081031")
     assert search["OBJ_NM"] == kofia._OBJ_MARKET_FUNDS
+
+
+class TestCreditBalance:
+    def test_신용융자_합계와_구성요소를_파싱한다(self, monkeypatch):
+        _patch(monkeypatch, {"ds1": [
+            {"TMPV1": "20260730", "TMPV2": 32_150_000_000_000,
+             "TMPV3": 25_510_000_000_000, "TMPV4": 6_640_000_000_000,
+             "TMPV9": 25_820_000_000_000},
+        ]})
+        c = kofia.fetch_credit_balance(date(2026, 7, 30), date(2026, 7, 30))[0]
+        assert c.as_of == date(2026, 7, 30)
+        assert c.total == pytest.approx(32_150_000_000_000)
+        assert c.part_a == pytest.approx(25_510_000_000_000)
+        assert c.part_b == pytest.approx(6_640_000_000_000)
+
+    def test_합계가_구성요소의_합이라는_관계가_유지된다(self, monkeypatch):
+        # 컬럼 식별의 근거(42/42 성립). 회귀 방지용으로 고정한다.
+        _patch(monkeypatch, {"ds1": [
+            {"TMPV1": "20260601", "TMPV2": 37_680_000_000_000,
+             "TMPV3": 27_850_000_000_000, "TMPV4": 9_840_000_000_000},
+        ]})
+        c = kofia.fetch_credit_balance(date(2026, 6, 1), date(2026, 6, 1))[0]
+        assert c.part_a + c.part_b == pytest.approx(c.total, rel=1e-3)
+
+    def test_의미가_확정되지_않은_잔여_컬럼은_raw_로_보존한다(self, monkeypatch):
+        _patch(monkeypatch, {"ds1": [
+            {"TMPV1": "20260730", "TMPV2": 1, "TMPV3": 1, "TMPV4": 0,
+             "TMPV9": 25_820_000_000_000},
+        ]})
+        c = kofia.fetch_credit_balance(date(2026, 7, 30), date(2026, 7, 30))[0]
+        assert c.raw["TMPV9"] == 25_820_000_000_000
+
+    def test_조회_실패는_예외가_아니라_빈_리스트다(self, monkeypatch):
+        def boom(*a, **kw):
+            raise RuntimeError("네트워크 장애")
+
+        monkeypatch.setattr(kofia.httpx, "post", boom)
+        assert kofia.fetch_credit_balance(date(2026, 7, 1), date(2026, 7, 31)) == []
+
+    def test_구간이_뒤집히면_거부한다(self, monkeypatch):
+        _patch(monkeypatch, {"ds1": []})
+        with pytest.raises(ValueError):
+            kofia.fetch_credit_balance(date(2026, 7, 31), date(2026, 7, 1))
+
+    def test_신용융자는_증시자금과_다른_통계표를_조회한다(self, monkeypatch):
+        captured: dict = {}
+        _patch(monkeypatch, {"ds1": []}, captured)
+        kofia.fetch_credit_balance(date(2026, 7, 1), date(2026, 7, 31))
+        assert captured["json"]["dmSearch"]["OBJ_NM"] == kofia._OBJ_CREDIT
+        assert kofia._OBJ_CREDIT != kofia._OBJ_MARKET_FUNDS

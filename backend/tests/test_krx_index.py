@@ -488,3 +488,69 @@ def test_no_factor_warnings_when_no_quality_growth_weight(monkeypatch):
     # quality/growth 가중치 0 → OpenDART 조회 자체를 안 함(경고 없음).
     cfg = {"selection": {"factor_weights": {"value": 0.5, "momentum": 0.5}}}
     assert bt._factor_coverage_warnings(cfg, ["005930"], date(2025, 6, 30)) == []
+
+
+# ─────────────────── 레버리지 ETF 잔고(취약성 관측) ───────────────────
+
+_ETF_ROWS = [
+    {"ISU_SRT_CD": "122630", "ISU_ABBRV": "KODEX 레버리지", "MKTCAP": "6,000,000,000,000"},
+    {"ISU_SRT_CD": "0193T0", "ISU_ABBRV": "KODEX SK하이닉스단일종목레버리지",
+     "MKTCAP": "3,000,000,000,000"},
+    {"ISU_SRT_CD": "252670", "ISU_ABBRV": "KODEX 200선물인버스2X",
+     "MKTCAP": "1,000,000,000,000"},
+    {"ISU_SRT_CD": "069500", "ISU_ABBRV": "KODEX 200", "MKTCAP": "10,000,000,000,000"},
+]
+
+
+class TestEtfLeverageExposure:
+    def test_레버리지와_단일종목_레버리지를_분리_집계한다(self, monkeypatch):
+        monkeypatch.setattr(krx_index, "_session", lambda: _FakeSession({"20260731": _ETF_ROWS}))
+        monkeypatch.setattr(krx_index, "is_business_day", lambda d: True)
+        r = krx_index.etf_leverage_exposure(date(2026, 7, 31))
+        assert r["total_mktcap"] == pytest.approx(20e12)
+        # 레버리지 = KODEX 레버리지 + 단일종목레버리지 (인버스2X 는 제외)
+        assert r["leveraged_mktcap"] == pytest.approx(9e12)
+        assert r["leveraged_count"] == 2
+        assert r["single_stock_mktcap"] == pytest.approx(3e12)
+        assert r["single_stock_count"] == 1
+        assert r["leveraged_ratio"] == pytest.approx(0.45)
+        assert r["single_stock_ratio"] == pytest.approx(0.15)
+
+    def test_인버스는_레버리지_집계에서_제외한다(self, monkeypatch):
+        # 인버스2X 도 배수 상품이지만 방향이 반대라 상승장 취약성 축적과 성격이 다르다.
+        rows = [{"ISU_SRT_CD": "252670", "ISU_ABBRV": "KODEX 200선물인버스2X",
+                 "MKTCAP": "1,000,000,000,000"}]
+        monkeypatch.setattr(krx_index, "_session", lambda: _FakeSession({"20260731": rows}))
+        monkeypatch.setattr(krx_index, "is_business_day", lambda d: True)
+        r = krx_index.etf_leverage_exposure(date(2026, 7, 31))
+        assert r["leveraged_mktcap"] == 0
+        assert r["leveraged_ratio"] == 0
+
+    def test_휴장일은_조회_전에_직전_영업일로_스냅한다(self, monkeypatch):
+        # 이 엔드포인트는 휴장일에 빈 응답이 아니라 직전 영업일 데이터를 그대로 준다.
+        # 스냅하지 않으면 반환 as_of 가 실제 데이터 시점과 어긋난 거짓 라벨이 된다.
+        sess = _FakeSession({"20260731": _ETF_ROWS, "20260801": _ETF_ROWS})
+        monkeypatch.setattr(krx_index, "_session", lambda: sess)
+        monkeypatch.setattr(krx_index, "is_business_day", lambda d: d.weekday() < 5)
+        r = krx_index.etf_leverage_exposure(date(2026, 8, 1))  # 토요일
+        assert r["as_of"] == date(2026, 7, 31)
+        assert "20260801" not in sess.calls  # 휴장일로는 조회 자체를 하지 않는다
+
+    def test_미인증이면_빈_dict(self, monkeypatch):
+        monkeypatch.setattr(krx_index, "_session", lambda: None)
+        assert krx_index.etf_leverage_exposure(date(2026, 7, 31)) == {}
+
+    def test_응답이_비면_빈_dict(self, monkeypatch):
+        monkeypatch.setattr(krx_index, "_session", lambda: _FakeSession({}))
+        monkeypatch.setattr(krx_index, "is_business_day", lambda d: True)
+        assert krx_index.etf_leverage_exposure(date(2026, 7, 31)) == {}
+
+    def test_시총_파싱_실패는_0_으로_처리하고_중단하지_않는다(self, monkeypatch):
+        rows = [{"ISU_SRT_CD": "1", "ISU_ABBRV": "KODEX 레버리지", "MKTCAP": "-"},
+                {"ISU_SRT_CD": "2", "ISU_ABBRV": "KODEX 200", "MKTCAP": "10,000,000,000,000"}]
+        monkeypatch.setattr(krx_index, "_session", lambda: _FakeSession({"20260731": rows}))
+        monkeypatch.setattr(krx_index, "is_business_day", lambda d: True)
+        r = krx_index.etf_leverage_exposure(date(2026, 7, 31))
+        assert r["leveraged_mktcap"] == 0
+        assert r["leveraged_count"] == 1
+        assert r["total_mktcap"] == pytest.approx(10e12)
