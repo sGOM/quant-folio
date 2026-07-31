@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import date, timedelta
 
 from app.core.database import AsyncSessionLocal
@@ -59,11 +60,26 @@ _MKTCAP_CACHE: dict[str, dict[str, int]] = {}
 _SECTOR_CACHE: dict[str, str] | None = None
 
 
+# 로그인 실패 후 재시도를 막는 쿨다운(초)과 그 만료 시각.
+#
+# 왜 필요한가: `_build_pit_pool` 은 조회 구간의 **월마다** `index_members` 를 부르고,
+# 세션이 유효하지 않으면 그때마다 로그인을 새로 시도한다. 장기 구간(예: 19개월)을
+# 백테스트하면 짧은 시간에 로그인이 수십 번 나가고, 실제로 이 때문에 KRX 가 로그인
+# 응답을 JSON 이 아닌 차단 페이지로 돌려주는 상태를 관측했다(그 뒤 모든 PIT 조회가
+# 조용히 0종목을 반환 → 빈 패널 위에서 백테스트가 '성공'하며 무의미한 수치를 낸다).
+# 한 번 실패하면 쿨다운 동안 재시도하지 않아 차단을 악화시키지 않는다.
+_SESSION_FAIL_COOLDOWN = 300.0
+_session_fail_until: float = 0.0
+
+
 def _session():
     """pykrx 인증 KRX 세션을 반환한다(미설정/실패 시 None).
 
     app.core.config 로드로 KRX_ID/KRX_PW 가 os.environ 에 주입돼 있어야 한다.
+    실패 직후에는 `_SESSION_FAIL_COOLDOWN` 초 동안 재로그인을 시도하지 않는다.
     """
+    global _session_fail_until
+
     try:
         from pykrx.website.comm import auth
     except Exception:  # noqa: BLE001
@@ -72,16 +88,29 @@ def _session():
     sess = getattr(auth, "_auth_session", None)
     if sess is not None and getattr(sess, "is_valid", lambda: False)():
         return sess
+
+    now = time.monotonic()
+    if now < _session_fail_until:
+        logger.debug("KRX 로그인 쿨다운 중 — 재시도 생략(%.0f초 남음)", _session_fail_until - now)
+        return None
     try:
         # build_krx_session() 은 로그인 로그(로그인 시도/완료 print) 이후에도 내부적으로
         # 추가 요청을 할 수 있는데, 그 경로엔 우리가 손댈 수 없는 timeout 미지정 호출이
         # 있을 수 있다(실제로 로그인 완료 로그 이후 응답 없이 멈추는 현상을 관측함).
         # 소켓 레벨로 강제 타임아웃을 걸어 무한 대기를 방지한다.
         with bounded_socket_timeout(20):
-            return auth.build_krx_session()
+            built = auth.build_krx_session()
     except Exception as e:  # noqa: BLE001
-        logger.warning("KRX 인증 세션 생성 실패: %s", e)
+        _session_fail_until = now + _SESSION_FAIL_COOLDOWN
+        logger.warning(
+            "KRX 인증 세션 생성 실패(%.0f초간 재시도 생략): %s", _SESSION_FAIL_COOLDOWN, e
+        )
         return None
+    if built is None:
+        _session_fail_until = now + _SESSION_FAIL_COOLDOWN
+        logger.warning("KRX 인증 세션 생성 실패(빈 세션) — %.0f초간 재시도 생략",
+                       _SESSION_FAIL_COOLDOWN)
+    return built
 
 
 def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:

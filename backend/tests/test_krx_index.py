@@ -9,6 +9,15 @@ import pytest
 from app.services.data import krx_index
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _noop_ctx(*a, **kw):
+    """bounded_socket_timeout 대역(소켓 타임아웃 조작 없이 통과)."""
+    yield
+
+
 class _FakeResp:
     def __init__(self, payload):
         self._payload = payload
@@ -554,3 +563,58 @@ class TestEtfLeverageExposure:
         assert r["leveraged_mktcap"] == 0
         assert r["leveraged_count"] == 1
         assert r["total_mktcap"] == pytest.approx(10e12)
+
+
+class TestSessionFailureCooldown:
+    """로그인 실패 후 쿨다운 — KRX 차단을 악화시키지 않기 위한 방어."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        krx_index._session_fail_until = 0.0
+        yield
+        krx_index._session_fail_until = 0.0
+
+    @staticmethod
+    def _install(monkeypatch, result):
+        """`from pykrx.website.comm import auth` 가 집어갈 대역 모듈을 심는다.
+
+        모듈이 아니라 그 안의 `auth` 속성을 가져가므로, 대역도 같은 모양이어야 한다.
+        """
+        import types
+
+        calls: list[int] = []
+
+        def build():
+            calls.append(1)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        auth_ns = types.SimpleNamespace(_auth_session=None, build_krx_session=build)
+        mod = types.ModuleType("pykrx.website.comm")
+        mod.auth = auth_ns  # type: ignore[attr-defined]
+        monkeypatch.setitem(__import__("sys").modules, "pykrx.website.comm", mod)
+        monkeypatch.setattr(krx_index, "bounded_socket_timeout", _noop_ctx)
+        return calls
+
+    def test_실패하면_쿨다운_동안_재로그인을_시도하지_않는다(self, monkeypatch):
+        # _build_pit_pool 은 조회 구간의 월마다 index_members 를 부르므로, 실패마다
+        # 재로그인하면 장기 백테스트 한 번에 로그인이 수십 번 나가 차단을 부른다.
+        calls = self._install(monkeypatch, RuntimeError("차단"))
+        for _ in range(5):
+            assert krx_index._session() is None
+        assert len(calls) == 1  # 첫 시도만, 나머지는 쿨다운으로 생략
+
+    def test_쿨다운이_지나면_다시_시도한다(self, monkeypatch):
+        calls = self._install(monkeypatch, RuntimeError("차단"))
+        assert krx_index._session() is None
+        krx_index._session_fail_until = 0.0  # 쿨다운 만료 흉내
+        assert krx_index._session() is None
+        assert len(calls) == 2
+
+    def test_빈_세션_반환도_실패로_보고_쿨다운을_건다(self, monkeypatch):
+        # 예외 없이 None 을 돌려주는 경로도 실패다 — 재시도 폭주를 막아야 한다.
+        calls = self._install(monkeypatch, None)
+        for _ in range(3):
+            assert krx_index._session() is None
+        assert len(calls) == 1
