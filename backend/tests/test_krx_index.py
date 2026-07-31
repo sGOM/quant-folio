@@ -41,7 +41,11 @@ class _FakeSession:
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache(monkeypatch):
+def _clear_cache(monkeypatch, tmp_path):
+    # 디스크 캐시는 반드시 임시 경로로 돌린다 — 기본 경로(backend/.cache/krx_pit)를 쓰면
+    # 테스트가 실제 캐시를 오염시키고, 남은 파일이 다음 테스트에 히트해 목 세션을
+    # 우회한다(테스트 간 오염).
+    monkeypatch.setattr(krx_index, "_DISK_CACHE_DIR", tmp_path / "krx_pit")
     krx_index._MEMBERS_CACHE.clear()
     krx_index._STOCKS_CACHE = None
     krx_index._MKTCAP_CACHE.clear()
@@ -618,3 +622,68 @@ class TestSessionFailureCooldown:
         for _ in range(3):
             assert krx_index._session() is None
         assert len(calls) == 1
+
+
+class TestPIT디스크캐시:
+    """과거일 구성종목·시총을 디스크에 캐시해 재실행 시 KRX 요청이 0회가 되는지 검증.
+
+    §44-1 의 인증 차단은 `_build_pit_pool` 이 월마다 KRX 를 부르는데 프로세스 캐시가
+    재실행마다 사라져 같은 요청을 반복한 데서 왔다. 디스크 캐시는 그 반복을 없앤다.
+    """
+
+    PAST = date(2025, 6, 2)
+
+    def test_과거일_구성종목은_디스크에_남아_재조회때_세션을_안_탄다(self, monkeypatch):
+        fake = _FakeSession({"20250602": _rows("005930", "000660")})
+        monkeypatch.setattr(krx_index, "_session", lambda: fake)
+        assert krx_index.index_members(self.PAST) == ["005930", "000660"]
+        assert len(fake.calls) == 1
+
+        # 프로세스 재시작 흉내 — 메모리 캐시만 비운다.
+        krx_index._MEMBERS_CACHE.clear()
+
+        def _boom():  # 디스크 히트면 로그인 자체가 일어나면 안 된다
+            raise AssertionError("디스크 캐시 히트인데 _session() 이 호출됐다")
+
+        monkeypatch.setattr(krx_index, "_session", _boom)
+        assert krx_index.index_members(self.PAST) == ["005930", "000660"]
+
+    def test_빈_결과는_디스크에_캐시하지_않는다(self, monkeypatch):
+        # 실패를 캐시하면 그 시점 구성이 []로 고착돼 조용히 고정 유니버스로 폴백한다
+        # (생존편향 재유입). 다음 호출에서 반드시 재조회해야 한다.
+        empty = _FakeSession({})
+        monkeypatch.setattr(krx_index, "_session", lambda: empty)
+        assert krx_index.index_members(self.PAST) == []
+        krx_index._MEMBERS_CACHE.clear()
+
+        ok = _FakeSession({"20250602": _rows("005930")})
+        monkeypatch.setattr(krx_index, "_session", lambda: ok)
+        assert krx_index.index_members(self.PAST) == ["005930"]
+
+    def test_오늘_이후_날짜는_캐시하지_않는다(self, monkeypatch):
+        # 당일 구성은 확정 전이라 캐시하면 거짓 사실이 고착된다.
+        today = date.today()
+        dd = today.strftime("%Y%m%d")
+        fake = _FakeSession({dd: _rows("005930")})
+        monkeypatch.setattr(krx_index, "_session", lambda: fake)
+        assert krx_index.index_members(today) == ["005930"]
+        assert krx_index._disk_get("members", f"KOSPI200_{dd}") is None
+
+    def test_지수가_다르면_캐시가_섞이지_않는다(self, monkeypatch):
+        fake = _FakeSession({"20250602": _rows("005930")})
+        monkeypatch.setattr(krx_index, "_session", lambda: fake)
+        krx_index.index_members(self.PAST, "KOSPI200")
+        krx_index._MEMBERS_CACHE.clear()
+
+        other = _FakeSession({"20250602": _rows("000660")})
+        monkeypatch.setattr(krx_index, "_session", lambda: other)
+        assert krx_index.index_members(self.PAST, "KOSPI100") == ["000660"]
+
+    def test_깨진_캐시파일은_무시하고_재조회한다(self, monkeypatch):
+        p = krx_index._DISK_CACHE_DIR / "members" / "KOSPI200_20250602.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{깨진 JSON", encoding="utf-8")
+
+        fake = _FakeSession({"20250602": _rows("005930")})
+        monkeypatch.setattr(krx_index, "_session", lambda: fake)
+        assert krx_index.index_members(self.PAST) == ["005930"]

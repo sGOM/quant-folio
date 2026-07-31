@@ -14,13 +14,18 @@
 - 블로킹(sync) 함수 — 호출부가 run_in_threadpool 로 실행.
 - 실패/미인증/무자료 시 예외 대신 빈 리스트 반환(호출부가 폴백하도록).
 - 시점별 결과를 모듈 캐시(_MEMBERS_CACHE)에 저장(같은 날짜 반복조회 방지).
+- **과거일 결과는 디스크에도 캐시**한다(_DISK_CACHE_DIR). 과거 시점의 구성종목·시총은
+  불변이므로, 재실행 때 같은 요청을 반복해 인증 차단을 부르지 않게 한다(§44-1).
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 from datetime import date, timedelta
+from pathlib import Path
 
 from app.core.database import AsyncSessionLocal
 from app.services.data.loader import bounded_socket_timeout
@@ -58,6 +63,58 @@ _MKTCAP_CACHE: dict[str, dict[str, int]] = {}
 # {code: 업종명}. 업종 분류는 (PIT 시총·구성종목과 달리) 사실상 정적이라 프로세스 내
 # 1회만 로드해 재사용한다(성공 시에만 채움 — 실패를 캐시하면 섹터 한도가 조용히 무력화됨).
 _SECTOR_CACHE: dict[str, str] | None = None
+
+
+# ── PIT 조회 디스크 캐시 ────────────────────────────────────────────────────
+#
+# 과거 시점의 지수 구성종목·시가총액은 **불변 데이터**다 — 그 날짜의 사실은 나중에
+# 바뀌지 않는다. 그런데 `_build_pit_pool` 은 조회 구간의 **월마다** index_members +
+# market_caps 를 부르므로 장기 백테스트 한 번에 수십 회의 KRX 요청이 나가고, 이것이
+# 실제로 인증 차단을 유발했다(로드맵 §44-1). 프로세스 메모리 캐시(_MEMBERS_CACHE 등)는
+# 재실행하면 사라져 매번 같은 요청을 처음부터 반복한다.
+#
+# → 성공 결과를 디스크에 남겨 **재실행 시 KRX 요청이 0회**가 되게 한다. 검증 스크립트를
+#   여러 번 돌리는 것이 정상 작업 흐름이므로 이득이 크다.
+#
+# 캐시 대상은 **과거일뿐**이다. 오늘 이후는 장중 변동·정정 여지가 있어 캐시하지 않는다.
+# 캐시 히트는 `_session()` 보다 **먼저** 확인한다 — 그래야 로그인 자체가 안 나간다.
+_DISK_CACHE_DIR = Path(
+    os.environ.get("KRX_PIT_CACHE_DIR")
+    or Path(__file__).resolve().parents[3] / ".cache" / "krx_pit"
+)
+
+
+def _disk_get(kind: str, key: str):
+    """디스크 캐시에서 읽는다. 없거나 깨졌으면 None(호출부가 정상 조회로 폴백)."""
+    p = _DISK_CACHE_DIR / kind / f"{key}.json"
+    try:
+        with p.open(encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:  # noqa: BLE001  깨진 캐시가 조회를 막지 않게 한다
+        logger.debug("PIT 디스크 캐시 읽기 실패(%s): %s", p, e)
+        return None
+
+
+def _disk_put(kind: str, key: str, as_of: date, value) -> None:
+    """성공 결과를 원자적으로 저장한다(빈 값·오늘 이후 날짜는 저장하지 않는다).
+
+    임시파일 → replace 로 교체해, 쓰다가 죽어도 반쪽짜리 캐시가 남지 않게 한다.
+    빈 값을 저장하지 않는 이유는 메모리 캐시와 같다 — 실패를 캐시하면 그 시점 구성이
+    []로 고착돼 조용히 고정 유니버스로 폴백하는 생존편향이 재유입된다.
+    """
+    if not value or as_of >= date.today():
+        return
+    p = _DISK_CACHE_DIR / kind / f"{key}.json"
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(f".{os.getpid()}.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(value, f)
+        tmp.replace(p)
+    except Exception as e:  # noqa: BLE001  캐시 쓰기 실패가 조회를 깨뜨리지 않게 한다
+        logger.debug("PIT 디스크 캐시 쓰기 실패(%s): %s", p, e)
 
 
 # 로그인 실패 후 재시도를 막는 쿨다운(초)과 그 만료 시각.
@@ -127,6 +184,13 @@ def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
     if key in _MEMBERS_CACHE:
         return _MEMBERS_CACHE[key]
 
+    # 디스크 캐시는 로그인보다 먼저 본다(히트하면 KRX 요청이 아예 나가지 않는다).
+    disk_key = f"{index}_{key[1]}"
+    cached = _disk_get("members", disk_key)
+    if cached:
+        _MEMBERS_CACHE[key] = list(cached)
+        return _MEMBERS_CACHE[key]
+
     sess = _session()
     if sess is None:
         logger.debug("KRX 미인증 — %s 구성종목 조회 건너뜀", index)
@@ -154,6 +218,7 @@ def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
     # 내내 해당 시점 구성이 []로 고착 → 조용히 고정 유니버스로 폴백하는 생존편향 재유입).
     if codes:
         _MEMBERS_CACHE[key] = codes
+        _disk_put("members", disk_key, as_of, codes)
     return codes
 
 
@@ -213,6 +278,11 @@ def market_caps(as_of: date) -> dict[str, int]:
     if key in _MKTCAP_CACHE:
         return _MKTCAP_CACHE[key]
 
+    cached = _disk_get("mktcap", key)
+    if cached:
+        _MKTCAP_CACHE[key] = {str(k): int(v) for k, v in cached.items()}
+        return _MKTCAP_CACHE[key]
+
     sess = _session()
     if sess is None:
         logger.debug("KRX 미인증 — 시가총액 조회 건너뜀")
@@ -242,6 +312,7 @@ def market_caps(as_of: date) -> dict[str, int]:
 
     if caps:
         _MKTCAP_CACHE[key] = caps
+        _disk_put("mktcap", key, as_of, caps)
     return caps
 
 
