@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from decimal import Decimal
 
 from redis.asyncio import Redis
@@ -33,6 +34,7 @@ from app.services.live_gate import evaluate_live_gate
 from app.services.market import now_kst
 from engine.alerts import publish_alert
 from engine.executor import execute_signal, make_idempotency_key
+from engine.halt import MarketState, get_monitor
 
 _POSITION_LOCK_TTL = 30  # 초
 # 러너 헬스 상태 TTL — 러너가 정지하면(틱 미갱신) 이 시간 뒤 자연 소멸해 stale 상태가
@@ -250,6 +252,13 @@ class BaseRunner:
                 )
                 return
 
+        # 거래정지·시장 CB 게이트 — 정지 구간에 주문이 들어가면 체결이 안 되거나
+        # (재개 직후) 붕괴된 호가에 시장가가 꽂힌다. live_gate 와 같은 자리에서 막는다.
+        # 주문당 시세 조회 1회가 추가되지만, 실제 자금이 나가기 직전 마지막 방어라
+        # 그 비용을 감수한다.
+        if not await self._halt_gate_passed(symbol, side, qty):
+            return
+
         await execute_signal(
             db, self.redis, self._broker,
             user_id=self._user_id, strategy_id=self.strategy_id,
@@ -257,3 +266,51 @@ class BaseRunner:
             idempotency_key=make_idempotency_key(self.strategy_id, symbol, side, bar_ts),
             reason=reason,
         )
+
+    async def _halt_gate_passed(self, symbol: str, side: str, qty: int) -> bool:
+        """거래정지·시장 CB 게이트. 주문을 내도 되면 True.
+
+        종목 정지는 그 종목 주문만 막고, 시장 CB 는 모든 주문을 막는다. 시세 조회가
+        실패하면 정지 여부를 **모르는** 것이므로 종목 게이트는 통과시키되(조회 장애로
+        매매가 전면 중단되는 것을 막는다), 이미 판정된 시장 상태는 그대로 적용한다.
+        """
+        monitor = get_monitor()
+        now = time.monotonic()
+
+        try:
+            quote = await self._broker.get_quote(symbol)
+        except Exception as e:  # noqa: BLE001 - 조회 실패를 주문 차단 사유로 삼지 않는다
+            self._logger.warning("%s 정지 여부 확인 실패(주문은 계속): %s", symbol, e)
+        else:
+            monitor.observe(symbol, quote.halted, now)
+            if quote.halted:
+                self._logger.warning(
+                    "%s 거래정지(상태코드 %s) — 주문 건너뜀 %s %d주",
+                    symbol, quote.status_code or "-", side, qty,
+                )
+                # 시장 상태도 갱신해 둔다(동시 정지 누적이 CB 판정 근거가 된다).
+                monitor.evaluate(now)
+                return False
+
+        state = monitor.evaluate(now)
+        if state is MarketState.NORMAL:
+            return True
+
+        ratio, n = monitor.halted_ratio(now)
+        self._logger.error(
+            "시장 %s — 주문 중단 %s %s %d주 (정지비율 %.0f%%, 표본 %d종목)",
+            state, symbol, side, qty, ratio * 100, n,
+        )
+        await publish_alert(
+            self.redis,
+            user_id=self._user_id,
+            strategy_id=self.strategy_id,
+            severity="critical",
+            code=f"market_{state}",
+            message=(
+                f"시장 {'서킷브레이커' if state is MarketState.HALTED else '재개 유예'} — "
+                f"{symbol} {side} {qty:,}주 주문 보류 "
+                f"(동시 정지 {ratio * 100:.0f}%, 표본 {n}종목)"
+            ),
+        )
+        return False
