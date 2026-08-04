@@ -93,9 +93,18 @@ def _session():
     **미설정과 실패를 가른다** — 둘 다 None 이던 것이 §44-1 재발 경로였다.
     자격증명이 없으면 애초에 물어보지 않은 것이므로 None(실패 아님). 로그인 실패·
     빈 세션·쿨다운 중은 SourceAuthError 를 던진다.
+
+    쿨다운 검사를 **"이미 유효한 세션이면 재사용" 분기보다 앞에서** 한다. 뒤에 두면
+    쿨다운 중에도 캐시된 유효 세션이 있으면 그걸 그대로 돌려줘, 그 세션으로 보내는
+    `_krx_rows` POST 가 쿨다운과 무관하게 계속 나간다 — §44-1 이 실제로 겪은 형태
+    (세션 쿠키는 살아 있는데 응답만 차단 페이지)를 쿨다운이 못 막는 결함이 된다.
     """
     if not (settings.KRX_ID and settings.KRX_PW):
         return None  # 미설정 — 실패가 아니다(용도별 preflight 가 필요한 곳에서 막는다)
+
+    remaining = cooldown_remaining("krx")
+    if remaining > 0:
+        raise SourceAuthError("krx", f"로그인 쿨다운 중 — 재시도 생략({remaining:.0f}초 남음)")
 
     try:
         from pykrx.website.comm import auth
@@ -105,10 +114,6 @@ def _session():
     sess = getattr(auth, "_auth_session", None)
     if sess is not None and getattr(sess, "is_valid", lambda: False)():
         return sess
-
-    remaining = cooldown_remaining("krx")
-    if remaining > 0:
-        raise SourceAuthError("krx", f"로그인 쿨다운 중 — 재시도 생략({remaining:.0f}초 남음)")
 
     try:
         built = _build_session()
@@ -144,9 +149,20 @@ def _krx_rows(sess, payload: dict, key: str, label: str, timeout: float = 20) ->
     정상 JSON 이면서 리스트가 비어 있는 것은 **실패가 아니다**(휴장일·미상장).
     호출자가 직전 영업일로 소급하도록 빈 리스트를 그대로 돌려준다.
 
-    쿨다운은 **여기서만** 건다 — 호출자(단일 조회/7일 루프)마다 거는 위치가 달라지면
-    어떤 경로는 쿨다운 없이 폭주한다.
+    쿨다운을 **거는 것**은 여기서만 한다 — 호출자(단일 조회/7일 루프)마다 거는 위치가
+    달라지면 어떤 경로는 쿨다운 없이 폭주한다. 반대로 쿨다운을 **검사**하는 것도 맨 앞에서
+    한다 — §44-1 의 실제 형태(세션 쿠키는 살아 있고 응답만 차단 페이지)에서는 `_session()`
+    의 검사만으로 부족하다. `_session()` 을 거치지 않고 이미 확보한 `sess` 로 반복 호출하는
+    7일/9일 소급 루프가 쿨다운 중에도 매번 POST 를 내보내기 때문이다. 여기서 막으면 그
+    루프의 나머지 반복도 함께 막힌다. 이미 걸린 쿨다운을 검사만 하고 갱신하지는 않는다
+    (여기서 매번 note_failure 하면 호출이 계속 들어오는 한 쿨다운이 끝없이 연장된다).
     """
+    remaining = cooldown_remaining("krx")
+    if remaining > 0:
+        raise SourceAuthError(
+            "krx", f"{label} 조회 생략 — 쿨다운 중({remaining:.0f}초 남음)"
+        )
+
     def _fail(exc: DataSourceError) -> DataSourceError:
         note_failure(exc)
         return exc
@@ -178,7 +194,12 @@ def _krx_rows(sess, payload: dict, key: str, label: str, timeout: float = 20) ->
 
 
 def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
-    """as_of 시점에 index 를 구성하던 종목코드(6자리) 목록. 실패 시 빈 리스트.
+    """as_of 시점에 index 를 구성하던 종목코드(6자리) 목록.
+
+    미인증(KRX_ID/PW 미설정)이면 빈 리스트. 7일 소급 루프 내 개별 POST 실패는 흡수해
+    빈 리스트로 폴백한다(집계 계층 개선은 별도 작업). 반면 `_session()` 자체가 던지는
+    `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 호출자에게 그대로 전파한다 —
+    호출자 정리는 별도 작업.
 
     :param as_of: 조회 기준일. 주말·휴장일이면 KRX 가 빈 응답을 주므로, 최대 6일 전까지
         직전 영업일로 스냅해 그 시점 구성을 반환한다(PIT 안전 — 미래일로는 가지 않음).
@@ -227,7 +248,11 @@ def all_listed_stocks() -> list[dict[str, str]]:
 
     지수 구성종목과 달리 **날짜에 의존하지 않는 종목 마스터**라, 시스템 시계가 미래여서
     pykrx 의 '오늘' 기반 조회가 빈 응답을 주는 환경에서도 동작한다. 종목명 매핑(체결/주문
-    로그 표기)의 신뢰 가능한 1차 소스. 미인증/실패 시 빈 리스트(호출부가 폴백).
+    로그 표기)의 신뢰 가능한 1차 소스.
+
+    미인증(KRX_ID/PW 미설정)이거나 POST 자체가 실패하면 빈 리스트(호출부가 폴백). 반면
+    `_session()` 이 던지는 `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 그대로
+    전파한다 — 호출자 정리는 별도 작업.
 
     성공 결과만 캐시한다(실패를 캐시하면 프로세스 수명 내내 이름이 비므로).
     """
@@ -266,12 +291,15 @@ def all_listed_stocks() -> list[dict[str, str]]:
 
 
 def market_caps(as_of: date) -> dict[str, int]:
-    """as_of 시점 전 종목 시가총액(원) {code: mktcap}. 실패/미인증 시 빈 dict.
+    """as_of 시점 전 종목 시가총액(원) {code: mktcap}.
 
     MDCSTAT01501 을 KOSPI(STK)·KOSDAQ(KSQ) 각각 조회해 합친다. 명시적 trdDd 를 쓰므로
     시스템 시계가 미래여도 과거일 시총을 정상 조회한다. 휴장일이면 최대 6일 소급 스냅.
     유동성 필터(universe_rule.min_market_cap)에서 소형주를 후보풀에서 걸러내는 용도.
-    성공 결과만 캐시한다(실패를 캐시하지 않음).
+
+    미인증이거나 POST 자체가 실패하면 빈 dict. 반면 `_session()` 이 던지는
+    `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 그대로 전파한다 — 호출자
+    정리는 별도 작업. 성공 결과만 캐시한다(실패를 캐시하지 않음).
     """
     key = as_of.strftime("%Y%m%d")
     if key in _MKTCAP_CACHE:
@@ -313,9 +341,10 @@ def sector_map(as_of: date | None = None) -> dict[str, str]:
 
     KOSPI(STK)·KOSDAQ(KSQ) 각 시장을 요청 1회씩(총 2회)만 호출해 전종목 업종을 얻는다
     — OpenDART 기업개황(종목당 1회 호출) 대비 압도적으로 효율적이라 이쪽을 채택했다.
-    업종 분류는 사실상 정적이므로 프로세스 내 1회 로드 후 캐시를 재사용한다. 미인증/실패/
-    무자료 시 빈 dict 를 반환한다(호출부가 섹터 한도를 미적용으로 폴백하도록). 성공 결과만
-    캐시한다.
+    업종 분류는 사실상 정적이므로 프로세스 내 1회 로드 후 캐시를 재사용한다. 미인증이거나
+    POST 자체가 실패·무자료면 빈 dict 를 반환한다(호출부가 섹터 한도를 미적용으로
+    폴백하도록). 반면 `_session()` 이 던지는 `SourceAuthError`(로그인 실패·쿨다운 중)는
+    잡지 않고 그대로 전파한다 — 호출자 정리는 별도 작업. 성공 결과만 캐시한다.
 
     :param as_of: PIT 조회 시점. 주어지면 먼저 ``sector_map_snapshots`` 테이블에서 as_of
         이전(포함) 가장 가까운 스냅샷(``snapshot_sector_map`` 이 분기 1회 적재, worker
@@ -522,7 +551,11 @@ def _krx_num(v: object) -> float:
 
 
 def etf_leverage_exposure(as_of: date) -> dict:
-    """as_of 시점 레버리지 ETF 잔고 집계. 미인증·실패 시 빈 dict.
+    """as_of 시점 레버리지 ETF 잔고 집계.
+
+    미인증이거나 POST 자체가 실패·무자료면 빈 dict. 반면 `_session()` 이 던지는
+    `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 그대로 전파한다 — 호출자
+    정리는 별도 작업.
 
     반환: `{as_of, total_mktcap, leveraged_mktcap, single_stock_mktcap,
     leveraged_ratio, single_stock_ratio, leveraged_count, single_stock_count}`

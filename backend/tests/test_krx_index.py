@@ -2,6 +2,8 @@
 
 실제 KRX 호출(인증 필요) 대신 세션을 목으로 주입해 순수 로직만 검증한다.
 """
+import sys
+import types
 from datetime import date
 
 import pytest
@@ -82,6 +84,18 @@ def test_index_members_snaps_back_over_holiday(monkeypatch):
 def test_index_members_empty_when_unauthenticated(monkeypatch):
     monkeypatch.setattr(krx_index, "_session", lambda: None)
     assert krx_index.index_members(date(2025, 6, 30)) == []
+
+
+def test_index_members_propagates_session_auth_error(monkeypatch):
+    """`_session()` 이 던지는 SourceAuthError(로그인 실패·쿨다운 중)는 흡수하지 않고
+    그대로 전파한다 — `sess = _session()` 이 try 밖에 있어 index_members 등 공개 함수가
+    잡지 않는다(호출자 정리는 별도 작업). 이 전파를 검증하는 테스트가 없었다."""
+    def _boom():
+        raise SourceAuthError("krx", "로그인 쿨다운 중")
+
+    monkeypatch.setattr(krx_index, "_session", _boom)
+    with pytest.raises(SourceAuthError):
+        krx_index.index_members(date(2025, 6, 30))
 
 
 def test_index_members_cached(monkeypatch):
@@ -567,19 +581,37 @@ class TestEtfLeverageExposure:
         assert r["total_mktcap"] == pytest.approx(10e12)
 
 
-def _reset_real_pykrx_session(monkeypatch) -> None:
-    """pykrx 의 진짜 전역 인증 세션을 무효화한다.
+def _fake_pykrx_auth_module(monkeypatch, *, build=None):
+    """`pykrx.website.comm` 을 `_auth_session=None` 인 가짜 모듈로 치환한다.
 
-    이 컨테이너 환경에서는 `pykrx.website.comm.webio` 모듈이 **임포트 시점에** 실제
-    KRX_ID/KRX_PW(컨테이너 시크릿)로 로그인해 `auth._auth_session` 을 채워 둔다(pykrx의
-    모듈 전역 부작용). 이 테스트 프로세스가 이미 그 모듈을 로드했다면 `_session()` 의
-    "이미 유효한 세션이면 재사용" 분기가 그 진짜 세션을 돌려줘 `_build_session` 목이
-    호출되지 않고 실패 시나리오를 재현할 수 없다. 매 테스트 전에 그 진짜 세션을 지워
-    `_session()` 이 실제로 (목으로 갈아끼운) `_build_session` 을 타도록 강제한다.
+    실제 `pykrx.website.comm.webio` 는 **임포트 시점에** 진짜 KRX_ID/KRX_PW(컨테이너
+    시크릿)로 로그인을 시도하는 부작용이 있다(pykrx 모듈 전역 부작용). 테스트가 이 모듈을
+    (직접이든 `from pykrx.website.comm import auth` 를 통해서든) 실제로 임포트하면:
+    (1) 계정 ID 가 테스트 출력에 찍히고, (2) KRX 가 느리면 테스트 수집 자체가 멈추며,
+    (3) 이 작업이 막으려는 §44-1 재시도 폭주 경로를 테스트 실행마다 재현하게 된다.
+    `sys.modules["pykrx.website.comm"]` 자체를 가짜 모듈로 바꿔치기해 `_session()`/
+    `_build_session()` 의 `from pykrx.website.comm import auth` 가 진짜 패키지를 **전혀
+    로드하지 않고** 이 가짜 namespace 를 가져가게 한다.
+
+    :param build: `auth.build_krx_session` 대역. 지정하지 않으면 호출 시 곧바로
+        AssertionError 를 던진다 — 이 헬퍼를 쓰는 테스트는 대개 `krx_index._build_session`
+        을 별도로 목 처리하므로(모듈 전역이 아닌 함수 자체 patch) 이 대역이 호출될 일이
+        없어야 정상이다. 호출된다면 격리가 깨진 신호다.
+    :return: 가짜 `auth` namespace(`_auth_session` 을 테스트에서 직접 조작하고 싶을 때 사용).
     """
-    from pykrx.website.comm import auth as real_auth
+    def _unexpected_call():
+        raise AssertionError(
+            "가짜 auth.build_krx_session 이 호출됐다 — 이 테스트가 _build_session 을 "
+            "직접 목 처리했다면 격리가 깨진 것이다."
+        )
 
-    monkeypatch.setattr(real_auth, "_auth_session", None)
+    auth_ns = types.SimpleNamespace(
+        _auth_session=None, build_krx_session=build or _unexpected_call,
+    )
+    fake_mod = types.ModuleType("pykrx.website.comm")
+    fake_mod.auth = auth_ns  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pykrx.website.comm", fake_mod)
+    return auth_ns
 
 
 class TestSessionFailureCooldown:
@@ -592,7 +624,7 @@ class TestSessionFailureCooldown:
 
     @pytest.fixture(autouse=True)
     def _reset(self, monkeypatch):
-        _reset_real_pykrx_session(monkeypatch)
+        _fake_pykrx_auth_module(monkeypatch)
         monkeypatch.setattr(krx_index.settings, "KRX_ID", "id")
         monkeypatch.setattr(krx_index.settings, "KRX_PW", "pw")
         clear_cooldown("krx")
@@ -714,16 +746,31 @@ class TestTransportErrors:
 
         assert krx_index._krx_rows(self._sess(lambda *a, **kw: _R()), {}, "output", "구성종목") == []
 
+    def test_쿨다운_중이면_POST_자체를_하지_않는다(self):
+        """§44-1 실사례: 세션 쿠키는 살아 있고 응답만 차단 페이지 — 쿨다운은 여기서도
+        검사해야 한다. `_session()` 뒤에서만 검사하면, 이미 확보한 세션으로 반복 호출하는
+        7일 소급 루프가 쿨다운 중에도 매번 POST 를 내보낸다."""
+        note_failure(SourceAuthError("krx", "차단"))
+        calls: list[int] = []
+
+        def _post(*a, **kw):
+            calls.append(1)
+            raise AssertionError("쿨다운 중에는 POST 를 보내면 안 된다")
+
+        with pytest.raises(SourceAuthError):
+            krx_index._krx_rows(self._sess(_post), {}, "output", "구성종목")
+        assert calls == []  # POST 자체가 나가지 않았다
+
 
 class TestSessionAuth:
     """미설정과 실패를 가른다 — 둘 다 None 이던 것이 §44-1 재발 경로였다."""
 
     @pytest.fixture(autouse=True)
     def _reset(self, monkeypatch):
-        # 이 컨테이너는 실제 KRX 시크릿을 갖고 있어 pykrx.website.comm.webio 가 임포트
-        # 시점에 이미 진짜 로그인 세션을 캐싱해 둔다. 매 테스트 전에 지워야 _build_session
-        # 목이 실제로 호출된다(_reset_real_pykrx_session 참고).
-        _reset_real_pykrx_session(monkeypatch)
+        # pykrx.website.comm 실제 임포트를 막는다(_fake_pykrx_auth_module 참고) —
+        # 이 컨테이너는 실제 KRX 시크릿을 갖고 있어, 막지 않으면 매 테스트가 실제 로그인을
+        # 시도한다.
+        _fake_pykrx_auth_module(monkeypatch)
 
     def test_자격증명_미설정이면_None(self, monkeypatch):
         monkeypatch.setattr(krx_index.settings, "KRX_ID", "")
@@ -767,6 +814,18 @@ class TestSessionAuth:
         with pytest.raises(SourceAuthError):
             krx_index._session()
         assert calls == []
+
+    def test_유효_세션이_있어도_쿨다운_중이면_예외(self, monkeypatch):
+        """쿨다운 검사는 "이미 유효한 세션이면 재사용" 분기보다 앞서야 한다 — 뒤에 두면
+        캐시된 유효 세션이 있는 한 쿨다운이 아무것도 막지 못한다(§44-1: 세션 쿠키는 살아
+        있고 응답만 차단 페이지로 오는 형태)."""
+        monkeypatch.setattr(krx_index.settings, "KRX_ID", "id")
+        monkeypatch.setattr(krx_index.settings, "KRX_PW", "pw")
+        auth_ns = _fake_pykrx_auth_module(monkeypatch)
+        auth_ns._auth_session = types.SimpleNamespace(is_valid=lambda: True)
+        note_failure(SourceAuthError("krx", "차단"))
+        with pytest.raises(SourceAuthError):
+            krx_index._session()
 
     def test_has_krx_auth_는_예외를_던지지_않는다(self, monkeypatch):
         monkeypatch.setattr(krx_index.settings, "KRX_ID", "")
