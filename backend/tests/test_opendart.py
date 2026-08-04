@@ -6,8 +6,11 @@
 전송 계층(`_get`)의 status 코드 원인 분류는 httpx.Client 를 목으로 갈아끼워
 검증한다 — **실제 OpenDART 를 호출하지 않는다**.
 """
+import io
+import zipfile
 from datetime import date
 
+import httpx
 import pytest
 
 from app.services.data import opendart
@@ -15,9 +18,11 @@ from app.services.data.errors import (
     SourceAuthError,
     SourceQuotaError,
     SourceRequestError,
+    SourceSchemaError,
     SourceUnavailableError,
     clear_cooldown,
     cooldown_remaining,
+    note_failure,
 )
 
 
@@ -457,8 +462,9 @@ class TestStatusClassification:
             opendart._get("fnlttSinglAcnt.json", {})
         assert 7100 < cooldown_remaining("dart") <= 7200  # 클래스 기본값(300s)이 아니다
 
-    @pytest.mark.parametrize("status", ["100", "101"])
+    @pytest.mark.parametrize("status", ["014", "100", "101"])
     def test_잘못된_요청은_Request(self, monkeypatch, status):
+        """014(파일 부재)·100(부적절한 값)·101(부적절한 접근) — 모두 우리 요청이 잘못된 것."""
         _mock_status(monkeypatch, status)
         with pytest.raises(SourceRequestError):
             opendart._get("fnlttSinglAcnt.json", {})
@@ -485,3 +491,133 @@ class TestStatusClassification:
     def test_미설정이면_예외가_아니라_None(self, monkeypatch):
         monkeypatch.setattr(opendart, "is_enabled", lambda: False)
         assert opendart._get("fnlttSinglAcnt.json", {}) is None
+
+    def test_쿨다운_중이면_요청_자체를_하지_않는다(self, monkeypatch):
+        """쿨다운 가드의 값어치는 예외를 던지는 것이 아니라 **전송을 막는 것**이다.
+
+        종목 루프는 _get 을 종목당 여러 번 부른다 — 일일 한도(020)를 소진한 뒤에도
+        막지 않으면 남은 전 종목이 확정 실패인 요청을 그대로 내보내 한도 차단을
+        스스로 연장한다. 그래서 '요청이 0건'을 직접 단언한다.
+        (선례: test_krx_index.py 의 test_쿨다운_중이면_POST_자체를_하지_않는다)
+        """
+        note_failure(SourceQuotaError("dart", "한도 소진"))
+        calls: list[int] = []
+
+        class _Client:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, *a, **kw):
+                calls.append(1)
+                raise AssertionError("쿨다운 중에는 요청을 보내면 안 된다")
+
+        monkeypatch.setattr(opendart.httpx, "Client", _Client)
+        with pytest.raises(SourceQuotaError):
+            opendart._get("fnlttSinglAcnt.json", {})
+        assert calls == []  # 요청 자체가 나가지 않았다
+
+
+class TestCorpCodeMap:
+    """corpCode 매핑의 실패 분기 — 빈 매핑을 조용히 돌려주지 않는지가 핵심.
+
+    corp_code 매핑이 비면 이후 모든 종목이 corp_code 를 못 찾아 전 종목이 조용히
+    '재무 정보 없음'이 된다. 이 스펙 전체가 없애려는 실패 형태가 바로 그것이다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+        clear_cooldown("dart")
+        yield
+        clear_cooldown("dart")
+
+    @staticmethod
+    def _mock_zip(monkeypatch, xml: bytes):
+        """corpCode.xml(zip) 을 돌려주는 httpx.Client 목(실제 네트워크를 타지 않는다)."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("CORPCODE.xml", xml)
+        payload = buf.getvalue()
+
+        class _Resp:
+            status_code = 200
+            content = payload
+
+            def raise_for_status(self):
+                return None
+
+        class _Client:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, *a, **kw):
+                return _Resp()
+
+        monkeypatch.setattr(opendart.httpx, "Client", _Client)
+
+    def test_다운로드_실패는_Unavailable(self, monkeypatch):
+        class _Client:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, *a, **kw):
+                raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(opendart.httpx, "Client", _Client)
+        with pytest.raises(SourceUnavailableError):
+            opendart.corp_code_map()
+
+    def test_XML_파싱_실패는_Schema(self, monkeypatch):
+        self._mock_zip(monkeypatch, b"<result><list>")  # 닫히지 않은 태그
+        with pytest.raises(SourceSchemaError):
+            opendart.corp_code_map()
+
+    def test_상장사_0개는_Schema(self, monkeypatch):
+        """다운로드·파싱은 됐는데 상장사가 0개 — 스키마 변경으로 보고 raise 한다.
+
+        빈 dict 를 그대로 돌려주면 호출부는 '정상적으로 조회했는데 매칭이 없다'로
+        읽어, 전 종목 재무 지표가 조용히 사라진다.
+        """
+        # stock_code 가 공백인 항목만(비상장·상폐) → 상장사 매핑이 0개가 된다.
+        self._mock_zip(monkeypatch, (
+            "<result>"
+            "<list><corp_code>00126380</corp_code>"
+            "<corp_name>비상장회사</corp_name><stock_code> </stock_code></list>"
+            "</result>"
+        ).encode("utf-8"))
+        with pytest.raises(SourceSchemaError):
+            opendart.corp_code_map()
+
+    def test_정상_매핑은_그대로_반환(self, monkeypatch):
+        """빈 매핑 가드가 무조건 raise 하는 것이 아님을 고정한다(상장사 0개 테스트의 대조군)."""
+        self._mock_zip(monkeypatch, (
+            "<result>"
+            "<list><corp_code>00126380</corp_code>"
+            "<corp_name>삼성전자</corp_name><stock_code>005930</stock_code></list>"
+            "<list><corp_code>00164779</corp_code>"
+            "<corp_name>비상장회사</corp_name><stock_code> </stock_code></list>"
+            "</result>"
+        ).encode("utf-8"))
+        assert opendart.corp_code_map() == {"005930": "00126380"}
+
+    def test_미설정이면_예외가_아니라_None(self, monkeypatch):
+        monkeypatch.setattr(opendart, "is_enabled", lambda: False)
+        assert opendart.corp_code_map() is None

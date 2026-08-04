@@ -142,9 +142,14 @@ def _get(path: str, params: dict) -> dict | None:
     except Exception as e:  # noqa: BLE001
         base = classify_httpx("dart", e)
         # 어느 엔드포인트였는지를 메시지에 넣는다(args 를 직접 건드리지 않고 재구성).
-        exc = type(base)("dart", f"{path} — {base.detail}", retry_after=base.retry_after)
+        # 마스킹은 **예외 메시지 자체**에 건다 — httpx 예외 텍스트에는 요청 URL 전체가
+        # 담길 수 있어 crtfc_key 가 섞인다. 로컬 로그 줄에만 걸면 이 예외를 다시 로깅하는
+        # 상위 호출자(집계·라우트)에서 키가 원문으로 새어나간다.
+        exc = type(base)(
+            "dart", _mask_key(f"{path} — {base.detail}"), retry_after=base.retry_after
+        )
         note_failure(exc)
-        logger.warning("OpenDART 호출 실패: %s", _mask_key(exc))
+        logger.warning("OpenDART 호출 실패: %s", exc)
         raise exc from e
 
     status = str(data.get("status"))
