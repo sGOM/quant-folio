@@ -16,7 +16,11 @@
 - 새 외부 의존성 없음 — httpx(기존 의존) + 표준 라이브러리(zipfile/xml)만 사용.
 - pykrx `_fetch_fundamentals` 와 같은 데이터 계층 규약: 블로킹(sync) 함수이므로
   호출자는 스레드풀(run_in_threadpool)에서 실행한다.
-- 실패/키부재/무자료 시 예외 대신 None 반환(호출부가 중립 처리하도록).
+- **미설정(키부재)·무자료(status 013)만 None**, 실제 실패는 `app.services.data.errors`
+  의 원인별 `DataSourceError` 로 raise 한다(전송 계층 `_get`/`corp_code_map`). 셋을 모두
+  None 으로 뭉개던 것이 위험했다 — 일일 20,000건 한도(status 020)를 소진하면 전 종목이
+  조용히 '재무 정보 없음'이 되어 백테스트가 빈 팩터 위에서 '성공'했다. "성공"은 예외
+  없이 응답을 받은 것이지 데이터를 얻은 것이 아니다(과거 구간 미제출 종목은 흔하다).
 
 PIT(룩어헤드 방지) 주의: 재무 지표를 백테스트에 쓸 때는 반드시 접수번호(rcept_no)
 의 공시일(접수일자) 이후 시점부터만 반영해야 한다. 이 클라이언트는 원자료(접수일자
@@ -34,6 +38,19 @@ from datetime import date
 import httpx
 
 from app.core.config import settings
+from app.services.data.errors import (
+    DataSourceError,
+    SourceAuthError,
+    SourceQuotaError,
+    SourceRequestError,
+    SourceSchemaError,
+    SourceUnavailableError,
+    classify_httpx,
+    cooldown_remaining,
+    note_failure,
+    representative,
+    seconds_until_midnight,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +67,24 @@ FS_SEPARATE = "OFS"
 # OpenDART 정상 응답 status. "013"=조회된 데이터 없음(정상적 무자료).
 _STATUS_OK = "000"
 _STATUS_NO_DATA = "013"
+
+#: OpenDART status 코드 → 실패 원인. 013(무자료)·000(정상)은 여기 없다(실패가 아니다).
+#: 목록에 없는 코드는 보수적으로 Unavailable 로 본다(재시도 가능 쪽).
+_STATUS_CAUSE: dict[str, type[DataSourceError]] = {
+    "010": SourceAuthError,          # 등록되지 않은 키
+    "011": SourceAuthError,          # 사용할 수 없는 키
+    "012": SourceAuthError,          # 접근할 수 없는 IP
+    "014": SourceRequestError,       # 파일이 존재하지 않음
+    "020": SourceQuotaError,         # 요청 제한 초과(일 20,000건)
+    "021": SourceQuotaError,         # 조회 가능한 회사 개수 초과
+    "100": SourceRequestError,       # 필드의 부적절한 값
+    "101": SourceRequestError,       # 부적절한 접근
+    "800": SourceUnavailableError,   # 시스템 점검
+    "900": SourceUnavailableError,   # 정의되지 않은 오류
+}
+
+#: 일일 호출 한도(20,000건) 초과 — 자정에 리셋되므로 쿨다운을 그때까지로 잡는다.
+_STATUS_DAILY_QUOTA = "020"
 
 _TIMEOUT = 15.0
 
@@ -73,15 +108,30 @@ def is_enabled() -> bool:
 
 
 def _get(path: str, params: dict) -> dict | None:
-    """OpenDART REST 호출 공통부. 키부재/에러/무자료 시 None 반환.
+    """OpenDART REST 호출 공통부.
+
+    **미설정과 무자료(013)만 None** 이다 — 둘 다 실패가 아니다(전자는 애초에 안 물어본
+    것, 후자는 소스가 '없다'고 정상 응답한 것). 그 외 실패는 원인별 예외를 던진다.
+    특히 일일 20,000건 한도 초과(020)가 무자료와 같은 None 이던 것이 위험했다 —
+    한도를 소진하면 전 종목이 조용히 '재무 정보 없음'이 됐다.
 
     :param path: 엔드포인트 경로(예: "fnlttSinglAcnt.json")
     :param params: crtfc_key 를 제외한 쿼리 파라미터
-    :return: status=="000" 인 응답 dict, 그 외에는 None
+    :return: status=="000" 인 응답 dict, 미설정·무자료(013)면 None
+    :raises DataSourceError: 전송 실패·인증/한도/요청 오류·시스템 점검
     """
     if not is_enabled():
         logger.debug("OpenDART 미활성(API 키 없음) — %s 조회 건너뜀", path)
         return None
+
+    # 쿨다운 검사는 호출 직전 한 곳(여기)에서만 한다 — 종목 루프는 _get 을 종목당
+    # 여러 번 부르므로, 한도 소진(020) 후에도 막지 않으면 남은 전 종목이 확정 실패인
+    # 요청을 계속 내보낸다. 이미 걸린 쿨다운을 검사만 하고 갱신하지는 않는다
+    # (여기서 note_failure 하면 호출이 들어오는 한 쿨다운이 끝없이 연장된다).
+    remaining = cooldown_remaining("dart")
+    if remaining > 0:
+        raise SourceQuotaError("dart", f"쿨다운 중 — 조회 생략({remaining:.0f}초 남음)")
+
     url = f"{settings.OPENDART_BASE_URL}/{path}"
     q = {"crtfc_key": settings.OPENDART_API_KEY, **params}
     try:
@@ -90,16 +140,26 @@ def _get(path: str, params: dict) -> dict | None:
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:  # noqa: BLE001
-        logger.warning("OpenDART 호출 실패(%s): %s", path, _mask_key(e))
-        return None
+        base = classify_httpx("dart", e)
+        # 어느 엔드포인트였는지를 메시지에 넣는다(args 를 직접 건드리지 않고 재구성).
+        exc = type(base)("dart", f"{path} — {base.detail}", retry_after=base.retry_after)
+        note_failure(exc)
+        logger.warning("OpenDART 호출 실패: %s", _mask_key(exc))
+        raise exc from e
 
     status = str(data.get("status"))
     if status == _STATUS_OK:
         return data
     if status == _STATUS_NO_DATA:
-        return None
-    logger.warning("OpenDART 응답 오류(%s): status=%s msg=%s", path, status, data.get("message"))
-    return None
+        return None  # 무자료 — 실패가 아니다
+
+    cls = _STATUS_CAUSE.get(status, SourceUnavailableError)
+    # 일일 한도는 자정에 리셋되므로 그때까지 재조회해봐야 확정적으로 실패한다.
+    retry_after = seconds_until_midnight() if status == _STATUS_DAILY_QUOTA else None
+    exc = cls("dart", f"{path} status={status} msg={data.get('message')}", retry_after=retry_after)
+    note_failure(exc)
+    logger.warning("%s", _mask_key(exc))
+    raise exc
 
 
 def corp_code_map() -> dict[str, str] | None:
@@ -107,7 +167,13 @@ def corp_code_map() -> dict[str, str] | None:
 
     모든 재무제표 API 는 종목코드가 아니라 corp_code 를 요구하므로 선행 조회가
     필요하다. corpCode.xml(zip) 을 내려받아 파싱한다(비교적 크므로 호출부가
-    결과를 캐시할 것). 키부재/실패 시 None.
+    결과를 캐시할 것).
+
+    **미설정만 None** 이다(실패가 아니다 — 애초에 안 물어본 것). 다운로드·파싱 실패와
+    '상장사 0개'는 원인별 예외로 올린다 — 빈 매핑을 그대로 돌려주면 이후 모든 종목이
+    corp_code 를 못 찾아 조용히 '재무 정보 없음'이 된다.
+
+    :raises DataSourceError: 다운로드 실패(전송) 또는 XML 파싱 실패·빈 매핑(스키마)
     """
     if not is_enabled():
         return None
@@ -119,8 +185,10 @@ def corp_code_map() -> dict[str, str] | None:
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
             xml_bytes = zf.read(zf.namelist()[0])
     except Exception as e:  # noqa: BLE001
-        logger.warning("OpenDART corpCode 다운로드 실패: %s", _mask_key(e))
-        return None
+        exc = classify_httpx("dart", e)
+        note_failure(exc)
+        logger.warning("OpenDART corpCode 다운로드 실패: %s", _mask_key(exc))
+        raise exc from e
 
     import xml.etree.ElementTree as ET
 
@@ -134,8 +202,11 @@ def corp_code_map() -> dict[str, str] | None:
             if stock and corp:
                 mapping[stock.zfill(6)] = corp
     except ET.ParseError as e:
-        logger.warning("OpenDART corpCode 파싱 실패: %s", e)
-        return None
+        raise SourceSchemaError("dart", f"corpCode XML 파싱 실패: {e}") from e
+    if not mapping:
+        # 다운로드·파싱은 됐는데 상장사가 0개면 스키마가 바뀐 것이다. 빈 매핑을
+        # 그대로 돌려주면 전 종목이 조용히 '재무 정보 없음'이 된다.
+        raise SourceSchemaError("dart", "corpCode 에 상장사가 0개 — 응답 스키마 변경 의심")
     logger.info("OpenDART corpCode 매핑 로드: %d개 상장사", len(mapping))
     return mapping
 

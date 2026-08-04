@@ -1,14 +1,24 @@
-"""OpenDART 클라이언트 — 파생지표 계산(derive_metrics) 및 graceful degradation 검증.
+"""OpenDART 클라이언트 — 파생지표 계산(derive_metrics)·status 원인 분류 검증.
 
 네트워크 없이 도는 단위테스트다. 실제 OpenDART 응답(fnlttSinglAcntAll)의 계정
 구조를 축약한 fixture 로 account_id 우선 매칭·CIS 폴백·부호·경계값을 확인한다.
 실측 교차검증(삼성전자·현대차·NAVER 실제 수치 일치)은 구현 시 수동으로 완료했다.
+전송 계층(`_get`)의 status 코드 원인 분류는 httpx.Client 를 목으로 갈아끼워
+검증한다 — **실제 OpenDART 를 호출하지 않는다**.
 """
 from datetime import date
 
 import pytest
 
 from app.services.data import opendart
+from app.services.data.errors import (
+    SourceAuthError,
+    SourceQuotaError,
+    SourceRequestError,
+    SourceUnavailableError,
+    clear_cooldown,
+    cooldown_remaining,
+)
 
 
 def _row(sj, aid, nm, amt):
@@ -380,3 +390,98 @@ def test_metrics_by_symbol_use_ttm_false_uses_annual_path(monkeypatch):
     out = opendart.metrics_by_symbol(["000000"], date(2025, 5, 20), use_ttm=False)
     assert "000000" in out
     assert set(calls) == {2024, 2023, 2022}  # announcement_lagged_year 기반 연간만
+
+
+# ─────────────────── 전송 계층 status 코드 원인 분류 ───────────────────
+
+
+def _mock_status(monkeypatch, status: str):
+    """지정 status 를 돌려주는 httpx.Client 목(실제 네트워크를 타지 않는다)."""
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"status": status, "message": "목"}
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, *a, **kw):
+            return _Resp()
+
+    monkeypatch.setattr(opendart.httpx, "Client", _Client)
+
+
+class TestStatusClassification:
+    """OpenDART 응답 본문 status 코드 → 원인별 예외 매핑.
+
+    autouse 픽스처를 클래스 안에 두는 이유: 모듈 전역으로 두면 `is_enabled` 를 True 로
+    고정해 미설정 동작을 검증하는 `test_disabled_without_key` 를 깨뜨린다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+        clear_cooldown("dart")
+        yield
+        clear_cooldown("dart")
+
+    @pytest.mark.parametrize("status", ["010", "011", "012"])
+    def test_키_문제는_Auth(self, monkeypatch, status):
+        _mock_status(monkeypatch, status)
+        with pytest.raises(SourceAuthError):
+            opendart._get("fnlttSinglAcnt.json", {})
+
+    @pytest.mark.parametrize("status", ["020", "021"])
+    def test_한도_초과는_Quota(self, monkeypatch, status):
+        _mock_status(monkeypatch, status)
+        with pytest.raises(SourceQuotaError):
+            opendart._get("fnlttSinglAcnt.json", {})
+
+    def test_일일한도는_다음_자정까지_쿨다운(self, monkeypatch):
+        """실제 자정까지의 초를 쓰면 자정 직전에 실행될 때 흔들리므로 고정한다."""
+        monkeypatch.setattr(opendart, "seconds_until_midnight", lambda: 7200.0)
+        _mock_status(monkeypatch, "020")
+        with pytest.raises(SourceQuotaError):
+            opendart._get("fnlttSinglAcnt.json", {})
+        assert 7100 < cooldown_remaining("dart") <= 7200  # 클래스 기본값(300s)이 아니다
+
+    @pytest.mark.parametrize("status", ["100", "101"])
+    def test_잘못된_요청은_Request(self, monkeypatch, status):
+        _mock_status(monkeypatch, status)
+        with pytest.raises(SourceRequestError):
+            opendart._get("fnlttSinglAcnt.json", {})
+
+    def test_시스템_점검은_Unavailable(self, monkeypatch):
+        _mock_status(monkeypatch, "800")
+        with pytest.raises(SourceUnavailableError):
+            opendart._get("fnlttSinglAcnt.json", {})
+
+    def test_미지_코드는_보수적으로_Unavailable(self, monkeypatch):
+        _mock_status(monkeypatch, "777")
+        with pytest.raises(SourceUnavailableError):
+            opendart._get("fnlttSinglAcnt.json", {})
+
+    def test_무자료_013은_예외가_아니라_None(self, monkeypatch):
+        """소스가 '없다'고 정상 응답한 것 — 과거 구간엔 이런 종목이 흔하다."""
+        _mock_status(monkeypatch, "013")
+        assert opendart._get("fnlttSinglAcnt.json", {}) is None
+
+    def test_정상_000은_데이터_반환(self, monkeypatch):
+        _mock_status(monkeypatch, "000")
+        assert opendart._get("fnlttSinglAcnt.json", {})["status"] == "000"
+
+    def test_미설정이면_예외가_아니라_None(self, monkeypatch):
+        monkeypatch.setattr(opendart, "is_enabled", lambda: False)
+        assert opendart._get("fnlttSinglAcnt.json", {}) is None
