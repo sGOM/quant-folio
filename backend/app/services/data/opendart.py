@@ -190,9 +190,12 @@ def corp_code_map() -> dict[str, str] | None:
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
             xml_bytes = zf.read(zf.namelist()[0])
     except Exception as e:  # noqa: BLE001
-        exc = classify_httpx("dart", e)
+        # 마스킹은 로그가 아니라 **예외 자체**에 건다 — 상위 호출자가 이 예외를 다시
+        # 로깅해도 키가 새지 않아야 한다(_get 과 같은 방침).
+        base = classify_httpx("dart", e)
+        exc = type(base)("dart", _mask_key(base.detail), retry_after=base.retry_after)
         note_failure(exc)
-        logger.warning("OpenDART corpCode 다운로드 실패: %s", _mask_key(exc))
+        logger.warning("OpenDART corpCode 다운로드 실패: %s", exc)
         raise exc from e
 
     import xml.etree.ElementTree as ET
