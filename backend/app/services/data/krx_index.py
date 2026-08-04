@@ -16,8 +16,10 @@
   폴백하도록). 반면 실제 로그인 실패·전송 실패는 `app.services.data.errors` 의 원인별
   `DataSourceError` 로 raise 한다(`_session`/`_krx_rows`) — 미설정과 실패를 조용히
   같은 값(None/[])으로 뭉개던 것이 KRX 차단 시 빈 패널 위 백테스트를 낳은 재발 경로였다.
-  단, 각 조회 함수의 7일 소급 루프는 아직 그 예외를 흡수해 실패 시 빈 리스트로
-  폴백한다(집계 계층 개선은 별도 작업).
+  각 조회 함수의 7일/10일 소급 루프도 **전량 실패**(정상 응답을 한 번도 못 받음)면 그
+  예외(대표)를 raise 한다. 정상 응답이 있었는데 전부 비었으면(휴장일·미상장) 빈
+  리스트/딕셔너리를 그대로 반환한다 — "성공"은 예외 없이 응답을 받은 것이지 데이터를
+  얻은 것이 아니다.
 - 시점별 결과를 모듈 캐시(_MEMBERS_CACHE)에 저장(같은 날짜 반복조회 방지).
 """
 from __future__ import annotations
@@ -196,8 +198,9 @@ def _krx_rows(sess, payload: dict, key: str, label: str, timeout: float = 20) ->
 def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
     """as_of 시점에 index 를 구성하던 종목코드(6자리) 목록.
 
-    미인증(KRX_ID/PW 미설정)이면 빈 리스트. 7일 소급 루프 내 개별 POST 실패는 흡수해
-    빈 리스트로 폴백한다(집계 계층 개선은 별도 작업). 반면 `_session()` 자체가 던지는
+    전량 실패 시 DataSourceError. 미인증 시 빈 값. 7일 소급 루프 중 정상 응답을 한 번도
+    받지 못했으면(전량 실패) 대표 예외를 raise 하고, 정상 응답이 있었는데 전부 빈
+    리스트였으면(휴장일·미상장) 빈 리스트를 그대로 반환한다. `_session()` 자체가 던지는
     `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 호출자에게 그대로 전파한다 —
     호출자 정리는 별도 작업.
 
@@ -218,23 +221,37 @@ def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
         return []
 
     codes: list[str] = []
+    errors: list[DataSourceError] = []
+    ok = False  # '성공' = 예외 없이 응답을 받음(데이터 획득이 아니다)
     # 휴장일 빈 응답 대비 최대 6일(주말+연휴) 직전 영업일까지 스냅.
     for back in range(7):
+        # 직전 반복이 쿨다운을 걸었으면 더 시도해도 _krx_rows 가 즉시 같은 차단을
+        # 재현할 뿐이다 — 계속 돌리면 대표 원인이 이 자기유발 차단(Auth)으로
+        # 오염된다(원래 원인이 Unavailable 이어도). 쿨다운 검사 자체는 _krx_rows 의
+        # 몫이므로 여기서는 "더 부르지 않는다"만 판단한다.
+        if errors and cooldown_remaining("krx") > 0:
+            break
         dd = (as_of - timedelta(days=back)).strftime("%Y%m%d")
         payload = {
             "bld": _BLD_INDEX_CONSTITUENTS, "locale": "ko_KR",
             "trdDd": dd, "money": "1", "csvxls_isNo": "false", **params,
         }
         try:
-            # 집계(7일 소급) 계층 개선은 Task 3 — 여기서는 파싱만 _krx_rows 로 위임하고
-            # 루프의 기존 소프트-폴백(로그 후 rows=[])은 그대로 유지한다.
             rows = _krx_rows(sess, payload, "output", f"{index} 구성종목", timeout=15)
         except DataSourceError as e:
             logger.warning("KRX %s 구성종목 조회 실패(%s): %s", index, dd, e)
-            rows = []
+            errors.append(e)
+            continue
+        ok = True
         codes = [str(r.get("ISU_SRT_CD")).zfill(6) for r in rows if r.get("ISU_SRT_CD")]
         if codes:
             break
+
+    # 정상 응답이 한 번도 없었으면 실패다. 정상 응답이 있었는데 전부 비었으면
+    # 진짜 휴장/미상장이므로 빈 값을 그대로 돌려준다.
+    # 쿨다운은 _krx_rows 가 이미 걸었다 — 여기서 또 걸지 않는다.
+    if not ok and errors:
+        raise representative(errors)
 
     # 성공 결과만 캐시한다(실패/미인증/일시 장애의 빈 응답을 캐시하면 프로세스 수명
     # 내내 해당 시점 구성이 []로 고착 → 조용히 고정 유니버스로 폴백하는 생존편향 재유입).
@@ -250,9 +267,9 @@ def all_listed_stocks() -> list[dict[str, str]]:
     pykrx 의 '오늘' 기반 조회가 빈 응답을 주는 환경에서도 동작한다. 종목명 매핑(체결/주문
     로그 표기)의 신뢰 가능한 1차 소스.
 
-    미인증(KRX_ID/PW 미설정)이거나 POST 자체가 실패하면 빈 리스트(호출부가 폴백). 반면
-    `_session()` 이 던지는 `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 그대로
-    전파한다 — 호출자 정리는 별도 작업.
+    전량 실패 시 DataSourceError. 미인증 시 빈 값. 루프 없는 단일 조회라 POST 실패는
+    그대로 전파한다. `_session()` 이 던지는 `SourceAuthError`(로그인 실패·쿨다운 중)도
+    잡지 않고 그대로 전파한다 — 호출자 정리는 별도 작업.
 
     성공 결과만 캐시한다(실패를 캐시하면 프로세스 수명 내내 이름이 비므로).
     """
@@ -269,11 +286,9 @@ def all_listed_stocks() -> list[dict[str, str]]:
         "bld": _BLD_STOCK_FINDER, "locale": "ko_KR",
         "mktsel": "ALL", "typeNo": "0", "searchText": "",
     }
-    try:
-        rows = _krx_rows(sess, payload, "block1", "전종목목록")
-    except DataSourceError as e:
-        logger.warning("KRX 전종목 목록 조회 실패: %s", e)
-        return []
+    # 루프가 없는 단일 조회다 — _krx_rows 의 예외를 그대로 전파한다(쿨다운은
+    # _krx_rows 가 이미 걸었다).
+    rows = _krx_rows(sess, payload, "block1", "전종목목록")
 
     out: list[dict[str, str]] = []
     for r in rows:
@@ -297,8 +312,9 @@ def market_caps(as_of: date) -> dict[str, int]:
     시스템 시계가 미래여도 과거일 시총을 정상 조회한다. 휴장일이면 최대 6일 소급 스냅.
     유동성 필터(universe_rule.min_market_cap)에서 소형주를 후보풀에서 걸러내는 용도.
 
-    미인증이거나 POST 자체가 실패하면 빈 dict. 반면 `_session()` 이 던지는
-    `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 그대로 전파한다 — 호출자
+    전량 실패 시 DataSourceError. 미인증 시 빈 값. 바깥 날짜 루프×안쪽 시장(STK/KSQ)
+    루프 중 정상 응답을 한 번도 받지 못했으면 대표 예외를 raise 한다. `_session()` 이
+    던지는 `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 그대로 전파한다 — 호출자
     정리는 별도 작업. 성공 결과만 캐시한다(실패를 캐시하지 않음).
     """
     key = as_of.strftime("%Y%m%d")
@@ -311,25 +327,39 @@ def market_caps(as_of: date) -> dict[str, int]:
         return {}
 
     caps: dict[str, int] = {}
+    errors: list[DataSourceError] = []
+    ok = False
     for back in range(7):  # 휴장일 빈 응답 대비 직전 영업일 소급
         dd = (as_of - timedelta(days=back)).strftime("%Y%m%d")
         for mkt in ("STK", "KSQ"):
+            # 직전 반복이 쿨다운을 걸었으면 더 시도해도 자기유발 차단(Auth)만
+            # 반복되며 대표 원인을 오염시킨다 — 더 부르지 않는다.
+            if errors and cooldown_remaining("krx") > 0:
+                break
             payload = {
                 "bld": _BLD_MARKET_CAP, "locale": "ko_KR",
                 "mktId": mkt, "trdDd": dd, "money": "1", "csvxls_isNo": "false",
             }
             try:
-                rows = _krx_rows(sess, payload, "OutBlock_1", "시가총액")
+                rows = _krx_rows(sess, payload, "OutBlock_1", f"시가총액({mkt})")
             except DataSourceError as e:
                 logger.warning("KRX 시가총액 조회 실패(%s %s): %s", mkt, dd, e)
-                rows = []
+                errors.append(e)
+                continue
+            ok = True
             for r in rows:
                 code = str(r.get("ISU_SRT_CD") or "").strip().zfill(6)
                 raw = str(r.get("MKTCAP") or "").replace(",", "").strip()
                 if code and raw.isdigit():
                     caps[code] = int(raw)
+        if errors and cooldown_remaining("krx") > 0:
+            break
         if caps:
             break
+
+    # 쿨다운은 _krx_rows 가 이미 걸었다 — 여기서 또 걸지 않는다.
+    if not ok and errors:
+        raise representative(errors)
 
     if caps:
         _MKTCAP_CACHE[key] = caps
@@ -341,10 +371,11 @@ def sector_map(as_of: date | None = None) -> dict[str, str]:
 
     KOSPI(STK)·KOSDAQ(KSQ) 각 시장을 요청 1회씩(총 2회)만 호출해 전종목 업종을 얻는다
     — OpenDART 기업개황(종목당 1회 호출) 대비 압도적으로 효율적이라 이쪽을 채택했다.
-    업종 분류는 사실상 정적이므로 프로세스 내 1회 로드 후 캐시를 재사용한다. 미인증이거나
-    POST 자체가 실패·무자료면 빈 dict 를 반환한다(호출부가 섹터 한도를 미적용으로
-    폴백하도록). 반면 `_session()` 이 던지는 `SourceAuthError`(로그인 실패·쿨다운 중)는
-    잡지 않고 그대로 전파한다 — 호출자 정리는 별도 작업. 성공 결과만 캐시한다.
+    업종 분류는 사실상 정적이므로 프로세스 내 1회 로드 후 캐시를 재사용한다. 전량 실패 시
+    DataSourceError. 미인증 시 빈 값(호출부가 섹터 한도를 미적용으로 폴백하도록). 무자료
+    (휴장일)면 빈 dict 를 그대로 반환한다. `_session()` 이 던지는 `SourceAuthError`(로그인
+    실패·쿨다운 중)는 잡지 않고 그대로 전파한다 — 호출자 정리는 별도 작업. 성공 결과만
+    캐시한다.
 
     :param as_of: PIT 조회 시점. 주어지면 먼저 ``sector_map_snapshots`` 테이블에서 as_of
         이전(포함) 가장 가까운 스냅샷(``snapshot_sector_map`` 이 분기 1회 적재, worker
@@ -382,25 +413,39 @@ def sector_map(as_of: date | None = None) -> dict[str, str]:
 
     base = as_of or date.today()
     mapping: dict[str, str] = {}
+    errors: list[DataSourceError] = []
+    ok = False
     for back in range(10):  # 휴장일·미래시계 대비 직전 영업일 소급
         dd = (base - timedelta(days=back)).strftime("%Y%m%d")
         for mkt in ("STK", "KSQ"):
+            # 직전 반복이 쿨다운을 걸었으면 더 시도해도 자기유발 차단(Auth)만
+            # 반복되며 대표 원인을 오염시킨다 — 더 부르지 않는다.
+            if errors and cooldown_remaining("krx") > 0:
+                break
             payload = {
                 "bld": _BLD_SECTOR, "locale": "ko_KR",
                 "mktId": mkt, "trdDd": dd, "money": "1", "csvxls_isNo": "false",
             }
             try:
-                rows = _krx_rows(sess, payload, "block1", "업종분류")
+                rows = _krx_rows(sess, payload, "block1", f"업종분류({mkt})")
             except DataSourceError as e:
                 logger.warning("KRX 업종분류 조회 실패(%s %s): %s", mkt, dd, e)
-                rows = []
+                errors.append(e)
+                continue
+            ok = True
             for r in rows:
                 code = str(r.get("ISU_SRT_CD") or "").strip().zfill(6)
                 ind = str(r.get("IDX_IND_NM") or "").strip()
                 if code != "000000" and ind:
                     mapping[code] = ind
+        if errors and cooldown_remaining("krx") > 0:
+            break
         if mapping:
             break
+
+    # 쿨다운은 _krx_rows 가 이미 걸었다 — 여기서 또 걸지 않는다.
+    if not ok and errors:
+        raise representative(errors)
 
     if mapping:
         _SECTOR_CACHE = mapping
@@ -553,9 +598,9 @@ def _krx_num(v: object) -> float:
 def etf_leverage_exposure(as_of: date) -> dict:
     """as_of 시점 레버리지 ETF 잔고 집계.
 
-    미인증이거나 POST 자체가 실패·무자료면 빈 dict. 반면 `_session()` 이 던지는
-    `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 그대로 전파한다 — 호출자
-    정리는 별도 작업.
+    전량 실패 시 DataSourceError. 미인증 시 빈 값. 무자료(휴장일)면 빈 dict 를 그대로
+    반환한다. `_session()` 이 던지는 `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지
+    않고 그대로 전파한다 — 호출자 정리는 별도 작업.
 
     반환: `{as_of, total_mktcap, leveraged_mktcap, single_stock_mktcap,
     leveraged_ratio, single_stock_ratio, leveraged_count, single_stock_count}`
@@ -587,8 +632,14 @@ def etf_leverage_exposure(as_of: date) -> dict:
         snapped -= timedelta(days=1)
 
     rows: list[dict] = []
+    errors: list[DataSourceError] = []
+    ok = False
     used = snapped
     for back in range(7):
+        # 직전 반복이 쿨다운을 걸었으면 더 시도해도 자기유발 차단(Auth)만
+        # 반복되며 대표 원인을 오염시킨다 — 더 부르지 않는다.
+        if errors and cooldown_remaining("krx") > 0:
+            break
         used = snapped - timedelta(days=back)
         payload = {
             "bld": _BLD_ETF_ALL, "locale": "ko_KR",
@@ -599,9 +650,15 @@ def etf_leverage_exposure(as_of: date) -> dict:
             rows = _krx_rows(sess, payload, "output", "ETF 잔고")
         except DataSourceError as e:
             logger.warning("KRX ETF 조회 실패(%s): %s", used, e)
-            rows = []
+            errors.append(e)
+            continue
+        ok = True
         if rows:
             break
+
+    # 쿨다운은 _krx_rows 가 이미 걸었다 — 여기서 또 걸지 않는다.
+    if not ok and errors:
+        raise representative(errors)
 
     if not rows:
         return {}
