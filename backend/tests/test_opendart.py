@@ -7,6 +7,7 @@
 검증한다 — **실제 OpenDART 를 호출하지 않는다**.
 """
 import io
+import logging
 import zipfile
 from datetime import date
 
@@ -560,6 +561,11 @@ class TestAggregateFailure:
             opendart.metrics_by_symbol(["005930", "000660"], date(2026, 8, 3))
 
     def test_일부만_실패하면_부분_결과(self, monkeypatch):
+        """`_half` 는 note_failure 를 부르지 않아 쿨다운이 안 걸린다 — 실패 종목 이후에도
+        루프가 끝까지 돈다. 실제 `_get` 은 실패 시 쿨다운을 걸므로 현실의 '부분 결과'는
+        항상 **첫 실패 지점까지**다(그 경로는 TestAggregateCooldownShortCircuit 이 덮는다).
+        여기서 고정하는 것은 '실패가 섞여도 raise 하지 않고 값을 돌려준다'는 계약뿐이다.
+        """
         def _half(corp, year):
             if corp == "00126380":
                 return {"roe": 0.12}
@@ -649,6 +655,23 @@ class TestAggregateCooldownShortCircuit:
         out = opendart.metrics_by_symbol(["005930", "000660", "035720"], date(2026, 8, 3))
         assert "005930" in out  # 쿨다운 전에 성공한 종목은 보존
         assert "00164742" not in calls  # 세 번째 종목은 시도조차 하지 않는다
+
+    def test_부분_실패_로그가_건너뛴_종목을_감추지_않는다(self, monkeypatch, caplog):
+        """단락이 걸리면 '실패 N / 전체 M' 만으로는 운영자가 나머지를 정상으로 오독한다.
+
+        200 종목 중 2번째에서 단락되면 실패는 1건뿐이지만 데이터를 얻은 것도 1종목이고
+        198 종목은 **시도조차 안 됐다**. ok(성공 수)가 예외도 반환값도 아닌 이 로그에만
+        드러나므로, 셋을 함께 찍지 않으면 이 스펙이 없애려는 조용한 실패를 로그가
+        정상으로 포장한다.
+        """
+        calls: list[str] = []
+        monkeypatch.setattr(
+            opendart, "annual_metrics", self._transport(calls, ok_corp="00126380")
+        )
+        with caplog.at_level(logging.ERROR, logger="app.services.data.opendart"):
+            opendart.metrics_by_symbol(["005930", "000660", "035720"], date(2026, 8, 3))
+        # 전체 3 중 성공 1 — 나머지 2 를 '정상'으로 읽을 수 없어야 한다.
+        assert "성공 1 / 실패 1 / 전체 3" in caplog.text
 
     def test_PEAD_도_같은_단락을_한다(self, monkeypatch):
         calls: list[str] = []

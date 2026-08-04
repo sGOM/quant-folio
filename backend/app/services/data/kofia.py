@@ -50,7 +50,13 @@ from datetime import date
 
 import httpx
 
-from app.services.data.errors import SourceSchemaError, classify_httpx, note_failure
+from app.services.data.errors import (
+    SourceQuotaError,
+    SourceSchemaError,
+    classify_httpx,
+    cooldown_remaining,
+    note_failure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,10 +137,19 @@ def _rows(obj_nm: str, start: date, end: date, label: str) -> list[dict]:
     실패는 원인별 DataSourceError 로 raise 한다. 정상 응답이면서 행이 비어 있는 것은
     실패가 아니다(조회 구간에 자료가 없는 정상 상황).
 
-    :raises DataSourceError: 전송 실패(원인별) 또는 응답에 'ds1' 키 부재(스키마)
+    :raises DataSourceError: 쿨다운 중, 전송 실패(원인별), 응답에 'ds1' 키 부재(스키마)
     """
     if start > end:
         raise ValueError(f"start 가 end 보다 늦다: {start} > {end}")
+
+    # 쿨다운 검사는 호출 직전 한 곳(여기)에서만 한다 — 걸어두기만 하고 아무도 읽지
+    # 않으면 죽은 코드이고, FreeSIS 장애 시 매 호출이 타임아웃(20초)을 새로 소진한다.
+    # 이미 걸린 쿨다운을 검사만 하고 갱신하지는 않는다(여기서 note_failure 하면
+    # 호출이 들어오는 한 쿨다운이 끝없이 연장된다). 선례: opendart._get
+    remaining = cooldown_remaining("kofia")
+    if remaining > 0:
+        raise SourceQuotaError("kofia", f"쿨다운 중 — 조회 생략({remaining:.0f}초 남음)")
+
     payload = {
         "dmSearch": {
             "tmpV40": "1",

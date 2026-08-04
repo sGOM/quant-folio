@@ -11,9 +11,11 @@ import pytest
 
 from app.services.data import kofia
 from app.services.data.errors import (
+    SourceQuotaError,
     SourceSchemaError,
     SourceUnavailableError,
     clear_cooldown,
+    note_failure,
 )
 
 
@@ -204,3 +206,25 @@ class TestTransportErrors:
         assert kofia._rows(
             kofia._OBJ_CREDIT, date(2026, 7, 1), date(2026, 7, 31), "신용융자"
         ) == []
+        # 공개 API 에서도 같은 강도로 고정한다(무자료는 여전히 빈 리스트).
+        assert kofia.fetch_market_funds(date(2026, 7, 1), date(2026, 7, 31)) == []
+
+    def test_쿨다운_중이면_POST_자체를_하지_않는다(self, monkeypatch):
+        """쿨다운 가드의 값어치는 예외를 던지는 것이 아니라 **전송을 막는 것**이다.
+
+        note_failure 로 쓰기만 하고 아무도 읽지 않으면 죽은 코드다 — FreeSIS 장애 시
+        매 호출이 10초 타임아웃을 새로 소진한다. 검사만 하고 갱신하지는 않는다
+        (여기서 note_failure 하면 호출이 들어오는 한 쿨다운이 끝없이 연장된다).
+        선례: test_opendart.py 의 test_쿨다운_중이면_요청_자체를_하지_않는다
+        """
+        note_failure(SourceUnavailableError("kofia", "장애"))
+        calls: list[int] = []
+
+        def _post(*a, **kw):
+            calls.append(1)
+            raise AssertionError("쿨다운 중에는 POST 를 보내면 안 된다")
+
+        monkeypatch.setattr(kofia.httpx, "post", _post)
+        with pytest.raises(SourceQuotaError):
+            kofia._rows(kofia._OBJ_CREDIT, date(2026, 7, 1), date(2026, 7, 31), "신용융자")
+        assert calls == []  # 요청 자체가 나가지 않았다

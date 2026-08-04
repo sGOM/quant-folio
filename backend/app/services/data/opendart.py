@@ -812,9 +812,13 @@ def metrics_by_symbol(
     if ok == 0 and errors:
         raise representative(errors)
     if errors:
+        # 성공·실패·전체를 모두 찍는다. 실패 건수만 찍으면 쿨다운 단락으로 **시도조차
+        # 안 된** 종목이 '정상'으로 읽힌다(200종목 중 2번째에서 단락되면 "1건 실패"지만
+        # 데이터를 얻은 것도 1종목뿐이다). ok 는 예외로도 반환값으로도 드러나지 않아
+        # 이 로그가 유일한 관측 신호다.
         logger.error(
-            "OpenDART 부분 실패 — %d/%d 종목 조회 실패(대표: %s)",
-            len(errors), len(codes), errors[0],
+            "OpenDART 부분 실패 — 성공 %d / 실패 %d / 전체 %d(대표: %s)",
+            ok, len(errors), len(codes), errors[0],
         )
     return out
 
@@ -1042,8 +1046,10 @@ def pead_sue_by_symbol(
     if ok == 0 and errors:
         raise representative(errors)
     if errors:
+        # metrics_by_symbol 과 같은 이유로 성공·실패·전체를 모두 찍는다(단락으로
+        # 건너뛴 종목이 로그에서 '정상'으로 보이면 안 된다).
         logger.error(
-            "OpenDART PEAD 부분 실패 — %d/%d 종목 조회 실패(대표: %s)",
-            len(errors), len(codes), errors[0],
+            "OpenDART PEAD 부분 실패 — 성공 %d / 실패 %d / 전체 %d(대표: %s)",
+            ok, len(errors), len(codes), errors[0],
         )
     return out
