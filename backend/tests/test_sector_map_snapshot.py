@@ -58,3 +58,50 @@ async def test_snapshot_failure_publishes_alert_and_reraises(monkeypatch, caplog
             await tasks._snapshot_sector_map_async()
 
     assert "sector_map_outage" in caplog.text
+
+
+class _FakeSnapshotDB:
+    """krx_index.snapshot_sector_map 이 sector_map() 을 부르기 전에 필요한 최소 대역.
+
+    이 count(*) 스칼라 조회 이후 바로 sector_map() 이 raise 하므로 그 뒤 메서드
+    (execute/add_all/flush)는 호출되지 않아야 한다 — 테스트가 그걸 확인한다.
+    """
+
+    def __init__(self):
+        self.touched_after_failure = False
+
+    async def scalar(self, stmt):
+        return 0  # existing=0 → 스킵 분기를 타지 않고 sector_map() 호출까지 진행
+
+    async def execute(self, stmt):
+        self.touched_after_failure = True
+        return None
+
+    def add_all(self, objs):
+        self.touched_after_failure = True
+
+    async def flush(self):
+        self.touched_after_failure = True
+
+
+async def test_snapshot_sector_map_propagates_data_source_error(monkeypatch):
+    """sector_map() 이 전량 실패로 DataSourceError 를 올리면 snapshot_sector_map 은
+
+    0 을 반환하며 삼키지 않고 그대로 전파해야 한다(Task 3 이후 계약 — §44-1 재발 방지).
+    분기 Celery beat 태스크가 이 예외를 받아 알림을 발행할 수 있으려면 여기서 삼키면 안 된다.
+    """
+    from datetime import date
+
+    from app.services.data import krx_index
+    from app.services.data.errors import SourceUnavailableError
+
+    def _boom():
+        raise SourceUnavailableError("krx", "연결 실패")
+
+    monkeypatch.setattr(krx_index, "sector_map", _boom)
+    db = _FakeSnapshotDB()
+
+    with pytest.raises(SourceUnavailableError):
+        await krx_index.snapshot_sector_map(db, as_of=date(2026, 7, 1))
+
+    assert not db.touched_after_failure  # 실패 이후 적재 시도로 넘어가지 않았다

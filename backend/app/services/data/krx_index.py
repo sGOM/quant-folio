@@ -517,7 +517,10 @@ async def snapshot_sector_map(
     :param as_of: 스냅샷 날짜(기본 오늘). 이미 이 날짜의 스냅샷이 있으면 force=True 가
         아닌 한 건너뛴다 — 같은 배치를 중복 실행해도 멱등이 되도록.
     :param force: True 면 기존 as_of 스냅샷을 삭제 후 재적재한다.
-    :return: 적재한 종목 수(스킵·조회 실패 시 0).
+    :return: 적재한 종목 수. 이미 적재됨(멱등 스킵) 또는 ``sector_map()`` 이 미인증·
+        휴장일 등으로 빈 매핑을 반환한 경우에만 0.
+    :raises DataSourceError: ``sector_map()`` 이 전량 실패로 raise 하면 그대로 전파한다
+        (Task 3 이후 ``sector_map()`` 은 부분 실패를 삼키지 않는다).
     """
     from sqlalchemy import delete, func as sa_func, select
 
@@ -538,8 +541,10 @@ async def snapshot_sector_map(
         return 0
 
     mapping = sector_map()  # 현재 KRX 분류(모듈 캐시 재사용, 없으면 신규 조회)
+    # 전량 실패는 sector_map() 이 DataSourceError 로 raise 해 여기까지 오지 않는다.
+    # 도달하는 빈 매핑은 미인증(preflight 미통과) 또는 휴장일 빈 응답뿐이다.
     if not mapping:
-        logger.warning("업종분류 조회 실패/미인증 — 스냅샷(%s) 적재 건너뜀", snap_date)
+        logger.warning("업종분류 미인증/빈 응답 — 스냅샷(%s) 적재 건너뜀", snap_date)
         return 0
 
     if existing:
@@ -562,6 +567,9 @@ def membership_union(dates: list[date], index: str = "KOSPI200") -> dict[str, li
     """여러 시점의 구성종목을 한 번에 조회해 {YYYYMMDD: [codes]} 로 반환한다.
 
     백테스트 전처리용 — 편입 종목의 합집합으로 가격을 선적재할 때 쓴다.
+
+    :raises DataSourceError: 내부에서 호출하는 ``index_members()`` 가 특정 날짜에
+        전량 실패하면 그대로 전파한다(부분 실패를 삼키지 않는다).
     """
     out: dict[str, list[str]] = {}
     for d in dates:
