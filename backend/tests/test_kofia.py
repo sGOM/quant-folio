@@ -6,9 +6,23 @@ from __future__ import annotations
 
 from datetime import date
 
+import httpx
 import pytest
 
 from app.services.data import kofia
+from app.services.data.errors import (
+    SourceSchemaError,
+    SourceUnavailableError,
+    clear_cooldown,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_cooldown():
+    """전송 실패 테스트가 건 kofia 쿨다운이 다른 테스트로 새지 않게 한다."""
+    clear_cooldown("kofia")
+    yield
+    clear_cooldown("kofia")
 
 
 class _Resp:
@@ -69,18 +83,20 @@ def test_반대매매_비중은_전일_미수금_기준이라는_관계가_유�
     assert calc == pytest.approx(cur.forced_sale_ratio, abs=0.1)
 
 
-def test_조회_실패는_예외가_아니라_빈_리스트다(monkeypatch):
-    # 취약성 관측이 없다고 매매·백테스트가 멈추면 안 된다.
+def test_조회_실패는_빈_리스트가_아니라_예외다(monkeypatch):
+    # 빈 리스트로 뭉개면 호출부가 '취약성 없음'과 '관측 실패'를 구분할 수 없다.
     def boom(*a, **kw):
         raise RuntimeError("네트워크 장애")
 
     monkeypatch.setattr(kofia.httpx, "post", boom)
-    assert kofia.fetch_market_funds(date(2026, 7, 1), date(2026, 7, 31)) == []
+    with pytest.raises(SourceUnavailableError):
+        kofia.fetch_market_funds(date(2026, 7, 1), date(2026, 7, 31))
 
 
-def test_응답에_ds1_이_없어도_빈_리스트다(monkeypatch):
+def test_응답에_ds1_이_없으면_Schema_예외다(monkeypatch):
     _patch(monkeypatch, {})
-    assert kofia.fetch_market_funds(date(2026, 7, 1), date(2026, 7, 31)) == []
+    with pytest.raises(SourceSchemaError):
+        kofia.fetch_market_funds(date(2026, 7, 1), date(2026, 7, 31))
 
 
 def test_날짜가_깨진_행은_건너뛴다(monkeypatch):
@@ -145,12 +161,13 @@ class TestCreditBalance:
         c = kofia.fetch_credit_balance(date(2026, 7, 30), date(2026, 7, 30))[0]
         assert c.raw["TMPV9"] == 25_820_000_000_000
 
-    def test_조회_실패는_예외가_아니라_빈_리스트다(self, monkeypatch):
+    def test_조회_실패는_빈_리스트가_아니라_예외다(self, monkeypatch):
         def boom(*a, **kw):
             raise RuntimeError("네트워크 장애")
 
         monkeypatch.setattr(kofia.httpx, "post", boom)
-        assert kofia.fetch_credit_balance(date(2026, 7, 1), date(2026, 7, 31)) == []
+        with pytest.raises(SourceUnavailableError):
+            kofia.fetch_credit_balance(date(2026, 7, 1), date(2026, 7, 31))
 
     def test_구간이_뒤집히면_거부한다(self, monkeypatch):
         _patch(monkeypatch, {"ds1": []})
@@ -163,3 +180,27 @@ class TestCreditBalance:
         kofia.fetch_credit_balance(date(2026, 7, 1), date(2026, 7, 31))
         assert captured["json"]["dmSearch"]["OBJ_NM"] == kofia._OBJ_CREDIT
         assert kofia._OBJ_CREDIT != kofia._OBJ_MARKET_FUNDS
+
+
+class TestTransportErrors:
+    """전송 계층 `_rows` — 실패는 원인별 예외, 무자료는 예외가 아니다."""
+
+    def test_연결_실패는_Unavailable(self, monkeypatch):
+        def _boom(*a, **kw):
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(kofia.httpx, "post", _boom)
+        with pytest.raises(SourceUnavailableError):
+            kofia._rows(kofia._OBJ_CREDIT, date(2026, 7, 1), date(2026, 7, 31), "신용융자")
+
+    def test_ds1_키_부재는_Schema(self, monkeypatch):
+        _patch(monkeypatch, {"unexpected": []})
+        with pytest.raises(SourceSchemaError):
+            kofia._rows(kofia._OBJ_CREDIT, date(2026, 7, 1), date(2026, 7, 31), "신용융자")
+
+    def test_ds1_빈_리스트는_예외가_아니다(self, monkeypatch):
+        """조회 구간에 자료가 없는 정상 상황 — 실패로 뭉개면 안 된다."""
+        _patch(monkeypatch, {"ds1": []})
+        assert kofia._rows(
+            kofia._OBJ_CREDIT, date(2026, 7, 1), date(2026, 7, 31), "신용융자"
+        ) == []

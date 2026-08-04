@@ -580,7 +580,12 @@ _PERIOD_METRICS_CACHE: dict[tuple, dict[str, float | None]] = {}
 
 
 def cached_corp_code_map() -> dict[str, str] | None:
-    """corp_code_map 을 프로세스 내 1회만 로드해 재사용한다(대용량 zip 반복 다운로드 방지)."""
+    """corp_code_map 을 프로세스 내 1회만 로드해 재사용한다(대용량 zip 반복 다운로드 방지).
+
+    실패 시 corp_code_map 의 예외를 **그대로 전파한다** — 여기서 잡지 않는다.
+    예외가 나면 _CORP_MAP_CACHE 는 None 으로 남으므로 다음 호출에서 자연히
+    재시도된다(실패를 캐시하지 않는다).
+    """
     global _CORP_MAP_CACHE
     if _CORP_MAP_CACHE is None:
         _CORP_MAP_CACHE = corp_code_map()
@@ -738,8 +743,15 @@ def metrics_by_symbol(
     공시된 가장 최신 분기/연간 보고서를 정하고, 분기면 ttm_metrics 로 텔레스코핑한다.
     어느 경로든 미래참조는 없다 — as_of 시점에 이미
     공시가 끝난 보고서만 사용한다(latest_report_period/announcement_lagged_year).
-    키 미승인/조회 실패 종목은 결과에서 제외된다(호출부가 중립 처리). 블로킹
-    함수이므로 호출자는 스레드풀에서 실행한다.
+
+    실패 처리: 종목별 조회가 **한 번도 성공하지 못했을 때만** 대표 예외를 올린다.
+    여기서 '성공'은 예외 없이 응답을 받은 것이지 데이터를 얻은 것이 아니다 —
+    과거 구간에는 미제출(무자료) 종목이 흔해서, 무자료를 실패로 세면 정상
+    백테스트가 전량 실패로 죽는다. 부분 실패는 ERROR 로그로 드러내고 부분 결과를
+    돌려준다(무자료·미매핑 종목은 그냥 결과에서 빠진다). 키 미승인이면 빈 dict.
+    블로킹 함수이므로 호출자는 스레드풀에서 실행한다.
+
+    :raises DataSourceError: corp_code 매핑 실패, 또는 전 종목 조회 실패
     """
     if not is_enabled() or not codes:
         return {}
@@ -753,22 +765,29 @@ def metrics_by_symbol(
         year, reprt_code = announcement_lagged_year(as_of), REPORT_ANNUAL
 
     out: dict[str, dict[str, float | None]] = {}
+    errors: list[DataSourceError] = []
+    ok = 0  # '성공' = 예외 없이 응답을 받은 종목 수(무자료 포함)
     for raw in codes:
         code = str(raw).strip().zfill(6)
         corp = corp_map.get(code)
         if not corp:
             continue
-        if use_ttm:
-            m = dict(ttm_metrics(corp, year, reprt_code))
-            # 전년(동일 reprt_code 기준 TTM)·전전년으로 YoY 성장·흑자전환·F-Score·
-            # 만성적자 판정을 파생한다. 모두 이미 공시된 과거 구간이라 PIT 안전.
-            prev = ttm_metrics(corp, year - 1, reprt_code)
-            prev2 = ttm_metrics(corp, year - 2, reprt_code)
-        else:
-            m = dict(annual_metrics(corp, year))
-            # 전년 실적으로 YoY 성장·흑자전환(실적상향/턴어라운드 팩터)·F-Score를 파생한다.
-            prev = annual_metrics(corp, year - 1)
-            prev2 = annual_metrics(corp, year - 2)
+        try:
+            if use_ttm:
+                m = dict(ttm_metrics(corp, year, reprt_code))
+                # 전년(동일 reprt_code 기준 TTM)·전전년으로 YoY 성장·흑자전환·F-Score·
+                # 만성적자 판정을 파생한다. 모두 이미 공시된 과거 구간이라 PIT 안전.
+                prev = ttm_metrics(corp, year - 1, reprt_code)
+                prev2 = ttm_metrics(corp, year - 2, reprt_code)
+            else:
+                m = dict(annual_metrics(corp, year))
+                # 전년 실적으로 YoY 성장·흑자전환(실적상향/턴어라운드 팩터)·F-Score를 파생한다.
+                prev = annual_metrics(corp, year - 1)
+                prev2 = annual_metrics(corp, year - 2)
+        except DataSourceError as e:
+            errors.append(e)
+            continue
+        ok += 1
         m["op_growth"] = _yoy_growth(m.get("op_income"), prev.get("op_income"))
         m["net_growth"] = _yoy_growth(m.get("net_income"), prev.get("net_income"))
         m["turnaround"] = _turnaround_flag(m.get("net_income"), prev.get("net_income"))
@@ -780,6 +799,16 @@ def metrics_by_symbol(
         )
         if any(v is not None for v in m.values()):
             out[code] = m
+
+    # 전 종목이 '무자료'라 out 이 비는 것은 실패가 아니다(과거 구간엔 흔하다).
+    # 응답을 한 번도 못 받은 경우에만 실패로 본다. 쿨다운은 _get 이 이미 걸었다.
+    if ok == 0 and errors:
+        raise representative(errors)
+    if errors:
+        logger.error(
+            "OpenDART 부분 실패 — %d/%d 종목 조회 실패(대표: %s)",
+            len(errors), len(codes), errors[0],
+        )
     return out
 
 
@@ -966,11 +995,15 @@ def pead_sue_by_symbol(
 
     미래참조 없음: 각 종목의 실제 접수일(rcept_dt) 기준으로 as_of 시점에 이미 공시된
     정기공시만 사용한다(disclosure_calendar 가 접수일을 공급, _pead_sue_one 이 컷).
-    키 미승인/조회 실패/서프라이즈 표본 부족 종목은 결과에서 제외된다(호출부가 중립
-    처리). 블로킹 함수이므로 호출자는 스레드풀에서 실행한다.
+
+    실패 처리는 metrics_by_symbol 과 동일하다 — 종목별 조회가 한 번도 성공하지
+    못했을 때만 대표 예외를 올린다. 서프라이즈 표본 부족(None)은 실패가 아니라
+    정상적인 '산출 불가'이며 결과에서 빠질 뿐이다. 블로킹 함수이므로 호출자는
+    스레드풀에서 실행한다.
 
     :param lookback_q: SUE 표준화 분모에 쓸 최근 서프라이즈 시계열 길이(분기 수).
     :param min_obs: SUE 산출에 필요한 최소 유효 서프라이즈 개수(신뢰도 하한).
+    :raises DataSourceError: corp_code 매핑 실패, 또는 전 종목 조회 실패
     """
     if not is_enabled() or not codes:
         return {}
@@ -978,12 +1011,28 @@ def pead_sue_by_symbol(
     if not corp_map:
         return {}
     out: dict[str, float] = {}
+    errors: list[DataSourceError] = []
+    ok = 0  # '성공' = 예외 없이 응답을 받은 종목 수(표본 부족 포함)
     for raw in codes:
         code = str(raw).strip().zfill(6)
         corp = corp_map.get(code)
         if not corp:
             continue
-        sue = _pead_sue_one(corp, as_of, lookback_q, min_obs)
+        try:
+            sue = _pead_sue_one(corp, as_of, lookback_q, min_obs)
+        except DataSourceError as e:
+            errors.append(e)
+            continue
+        ok += 1
         if sue is not None:
             out[code] = sue
+
+    # 표본 부족으로 out 이 비는 것은 실패가 아니다. 쿨다운은 _get 이 이미 걸었다.
+    if ok == 0 and errors:
+        raise representative(errors)
+    if errors:
+        logger.error(
+            "OpenDART PEAD 부분 실패 — %d/%d 종목 조회 실패(대표: %s)",
+            len(errors), len(codes), errors[0],
+        )
     return out

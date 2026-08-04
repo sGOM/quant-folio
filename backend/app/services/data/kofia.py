@@ -37,7 +37,10 @@ FreeSIS 응답에는 **컬럼 라벨이 없다**(`dsmHeader`·`unit` 모두 빈 
 ## 규약
 - 새 외부 의존성 없음(httpx 는 기존 의존).
 - 데이터 계층 공통 규약대로 **블로킹(sync)** 함수다. 호출자가 스레드풀에서 실행한다.
-- 실패·무자료 시 예외 대신 빈 리스트를 반환한다(호출부가 중립 처리).
+- **실패와 무자료를 가른다**: 전송·스키마 실패는 `app.services.data.errors` 의 원인별
+  `DataSourceError` 로 전파하고, 정상 응답이면서 행이 없는 것(조회 구간에 자료 없음)만
+  빈 리스트다. 둘을 모두 빈 리스트로 뭉개면 호출부가 '취약성 없음'과 '관측 실패'를
+  구분할 수 없어, 레버리지가 쌓이는 국면을 조용히 놓친다.
 """
 from __future__ import annotations
 
@@ -46,6 +49,8 @@ from dataclasses import dataclass, field
 from datetime import date
 
 import httpx
+
+from app.services.data.errors import SourceSchemaError, classify_httpx, note_failure
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +126,13 @@ def _parse_ymd(v: object) -> date | None:
 
 
 def _rows(obj_nm: str, start: date, end: date, label: str) -> list[dict]:
-    """FreeSIS 통계표 1건을 조회해 원본 행 리스트를 반환한다(실패 시 빈 리스트)."""
+    """FreeSIS 통계표 1건을 조회해 원본 행 리스트를 반환한다.
+
+    실패는 원인별 DataSourceError 로 raise 한다. 정상 응답이면서 행이 비어 있는 것은
+    실패가 아니다(조회 구간에 자료가 없는 정상 상황).
+
+    :raises DataSourceError: 전송 실패(원인별) 또는 응답에 'ds1' 키 부재(스키마)
+    """
     if start > end:
         raise ValueError(f"start 가 end 보다 늦다: {start} > {end}")
     payload = {
@@ -136,10 +147,18 @@ def _rows(obj_nm: str, start: date, end: date, label: str) -> list[dict]:
     try:
         resp = httpx.post(_URL, json=payload, headers=_HEADERS, timeout=_TIMEOUT)
         resp.raise_for_status()
-        return resp.json().get("ds1") or []
-    except Exception as e:  # noqa: BLE001 - 외부 소스 장애를 상위로 전파하지 않는다
-        logger.warning("FreeSIS %s 조회 실패(%s~%s): %s", label, start, end, e)
-        return []
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        exc = classify_httpx("kofia", e)
+        note_failure(exc)
+        logger.warning("FreeSIS %s 조회 실패(%s~%s): %s", label, start, end, exc)
+        raise exc from e
+
+    # 'ds1' 키 자체가 없으면 응답 구조가 우리 파서의 계약과 다르다 — 쿨다운으로
+    # 은폐하지 않고 코드 수정을 요구한다(SourceSchemaError 는 쿨다운을 걸지 않는다).
+    if not isinstance(data, dict) or "ds1" not in data:
+        raise SourceSchemaError("kofia", f"{label} 응답에 'ds1' 키가 없다: {str(data)[:120]}")
+    return data.get("ds1") or []
 
 
 def fetch_credit_balance(start: date, end: date) -> list[CreditBalance]:
@@ -155,7 +174,10 @@ def fetch_credit_balance(start: date, end: date) -> list[CreditBalance]:
       `part_a`/`part_b` 로 둔다.
     - 나머지 컬럼(신용대주·예탁증권담보융자로 **추정**)은 `raw` 로만 보존한다.
 
-    실패 시 예외 대신 빈 리스트를 반환한다.
+    전송 실패는 DataSourceError 로 전파된다. 빈 리스트는 '조회 구간에 자료가 없음'
+    뿐이다(정상 응답).
+
+    :raises DataSourceError: 조회 실패(_rows 참고)
     """
     out: list[CreditBalance] = []
     for r in _rows(_OBJ_CREDIT, start, end, "신용융자 잔고"):
@@ -178,8 +200,10 @@ def fetch_credit_balance(start: date, end: date) -> list[CreditBalance]:
 def fetch_market_funds(start: date, end: date) -> list[MarketFunds]:
     """[start, end] 구간의 증시자금 일별 시계열을 날짜 오름차순으로 반환한다.
 
-    실패하면 경고만 남기고 빈 리스트를 반환한다 — 취약성 관측이 없다고 해서
-    매매나 백테스트가 멈추면 안 된다.
+    전송 실패는 DataSourceError 로 전파된다 — 관측이 '없는' 것과 관측에 '실패한'
+    것은 다르다. 후자를 빈 리스트로 뭉개면 호출부가 취약성 0 으로 오독한다.
+
+    :raises DataSourceError: 조회 실패(_rows 참고)
     """
     out: list[MarketFunds] = []
     for r in _rows(_OBJ_MARKET_FUNDS, start, end, "증시자금"):

@@ -523,6 +523,76 @@ class TestStatusClassification:
         assert calls == []  # 요청 자체가 나가지 않았다
 
 
+class TestAggregateFailure:
+    """집계 계층 — '성공'은 응답 수신이지 데이터 획득이 아니다.
+
+    과거 백테스트 구간에는 재무제표 미제출 종목이 흔하다. 무자료(013→None)를
+    실패로 세면 정상 백테스트가 '전량 실패'로 죽는다. 그래서 전량 실패
+    (성공 0 & 실패 ≥1)일 때만 raise 하고, 부분 실패는 부분 결과를 돌려준다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        # is_enabled 를 고정하지 않으면 컨테이너의 키 주입 여부에 따라 결과가 갈리고,
+        # 키가 있으면 실제 OpenDART 를 호출하게 된다. corp_map 도 함께 대역으로 건다.
+        monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            opendart,
+            "cached_corp_code_map",
+            lambda: {"005930": "00126380", "000660": "00164779"},
+        )
+        clear_cooldown("dart")
+        yield
+        clear_cooldown("dart")
+
+    def test_전_종목_무자료면_빈_dict(self, monkeypatch):
+        """실패가 아니다 — 정상 백테스트가 죽으면 안 된다."""
+        monkeypatch.setattr(opendart, "annual_metrics", lambda c, y: {"roe": None})
+        out = opendart.metrics_by_symbol(["005930", "000660"], date(2026, 8, 3))
+        assert out == {}
+
+    def test_전_종목_실패면_raise(self, monkeypatch):
+        def _boom(corp, year):
+            raise SourceUnavailableError("dart", "타임아웃")
+
+        monkeypatch.setattr(opendart, "annual_metrics", _boom)
+        with pytest.raises(SourceUnavailableError):
+            opendart.metrics_by_symbol(["005930", "000660"], date(2026, 8, 3))
+
+    def test_일부만_실패하면_부분_결과(self, monkeypatch):
+        def _half(corp, year):
+            if corp == "00126380":
+                return {"roe": 0.12}
+            raise SourceUnavailableError("dart", "타임아웃")
+
+        monkeypatch.setattr(opendart, "annual_metrics", _half)
+        out = opendart.metrics_by_symbol(["005930", "000660"], date(2026, 8, 3))
+        assert "005930" in out and "000660" not in out
+
+    def test_PEAD_전_종목_표본부족은_빈_dict(self, monkeypatch):
+        """SUE 표본 부족(None)은 실패가 아니라 정상적인 '산출 불가'다."""
+        monkeypatch.setattr(opendart, "_pead_sue_one", lambda *a: None)
+        assert opendart.pead_sue_by_symbol(["005930", "000660"], date(2026, 8, 3)) == {}
+
+    def test_PEAD_전_종목_실패면_raise(self, monkeypatch):
+        def _boom(*a):
+            raise SourceUnavailableError("dart", "타임아웃")
+
+        monkeypatch.setattr(opendart, "_pead_sue_one", _boom)
+        with pytest.raises(SourceUnavailableError):
+            opendart.pead_sue_by_symbol(["005930", "000660"], date(2026, 8, 3))
+
+    def test_PEAD_일부만_실패하면_부분_결과(self, monkeypatch):
+        def _half(corp, as_of, lookback_q, min_obs):
+            if corp == "00126380":
+                return 1.5
+            raise SourceUnavailableError("dart", "타임아웃")
+
+        monkeypatch.setattr(opendart, "_pead_sue_one", _half)
+        out = opendart.pead_sue_by_symbol(["005930", "000660"], date(2026, 8, 3))
+        assert out == {"005930": 1.5}
+
+
 class TestCorpCodeMap:
     """corpCode 매핑의 실패 분기 — 빈 매핑을 조용히 돌려주지 않는지가 핵심.
 
