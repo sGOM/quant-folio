@@ -539,7 +539,7 @@ class TestAggregateFailure:
         monkeypatch.setattr(
             opendart,
             "cached_corp_code_map",
-            lambda: {"005930": "00126380", "000660": "00164779"},
+            lambda: {"005930": "00126380", "000660": "00164779", "035720": "00164742"},
         )
         clear_cooldown("dart")
         yield
@@ -591,6 +591,71 @@ class TestAggregateFailure:
         monkeypatch.setattr(opendart, "_pead_sue_one", _half)
         out = opendart.pead_sue_by_symbol(["005930", "000660"], date(2026, 8, 3))
         assert out == {"005930": 1.5}
+
+
+class TestAggregateCooldownShortCircuit:
+    """쿨다운이 걸린 뒤에는 남은 종목을 더 부르지 않는다.
+
+    첫 실패가 쿨다운을 걸면 이후 종목의 `_get` 은 네트워크 전에 차단돼
+    `SourceQuotaError("쿨다운 중 …")` 를 던진다. 계속 돌리면 이 **자기유발** 예외가
+    쌓여 `representative` 의 우선순위(Quota > Unavailable)를 타고 대표 원인이 되고,
+    운영자는 네트워크 장애를 '한도 초과'로 오독한다. 선례: krx_index.py 의 집계들.
+
+    대역은 전송 계층(`_get`)의 두 가지 행동을 그대로 흉내낸다 —
+    실패 시 `note_failure`, 쿨다운 중이면 Quota 로 즉시 거절.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            opendart,
+            "cached_corp_code_map",
+            lambda: {"005930": "00126380", "000660": "00164779", "035720": "00164742"},
+        )
+        clear_cooldown("dart")
+        yield
+        clear_cooldown("dart")
+
+    @staticmethod
+    def _transport(calls: list[str], ok_corp: str | None = None):
+        """`_get` 의 쿨다운 가드·note_failure 를 흉내내는 종목 단위 대역."""
+
+        def _fake(corp, *_a):
+            calls.append(corp)
+            if cooldown_remaining("dart") > 0:
+                raise SourceQuotaError("dart", "쿨다운 중 — 조회 생략")
+            if corp == ok_corp:
+                return {"roe": 0.12}
+            exc = SourceUnavailableError("dart", "타임아웃")
+            note_failure(exc)
+            raise exc
+
+        return _fake
+
+    def test_대표_원인이_자기유발_Quota_로_오염되지_않는다(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(opendart, "annual_metrics", self._transport(calls))
+        with pytest.raises(SourceUnavailableError):  # Quota 가 아니다
+            opendart.metrics_by_symbol(["005930", "000660", "035720"], date(2026, 8, 3))
+        assert calls == ["00126380"]  # 첫 실패 이후 아무도 더 부르지 않았다
+
+    def test_단락해도_이미_성공한_종목의_결과는_살아남는다(self, monkeypatch):
+        """조기 break 가 '부분 실패는 값을 반환한다' 계약을 깨면 안 된다."""
+        calls: list[str] = []
+        monkeypatch.setattr(
+            opendart, "annual_metrics", self._transport(calls, ok_corp="00126380")
+        )
+        out = opendart.metrics_by_symbol(["005930", "000660", "035720"], date(2026, 8, 3))
+        assert "005930" in out  # 쿨다운 전에 성공한 종목은 보존
+        assert "00164742" not in calls  # 세 번째 종목은 시도조차 하지 않는다
+
+    def test_PEAD_도_같은_단락을_한다(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(opendart, "_pead_sue_one", self._transport(calls))
+        with pytest.raises(SourceUnavailableError):
+            opendart.pead_sue_by_symbol(["005930", "000660", "035720"], date(2026, 8, 3))
+        assert calls == ["00126380"]
 
 
 class TestCorpCodeMap:

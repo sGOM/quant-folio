@@ -768,6 +768,13 @@ def metrics_by_symbol(
     errors: list[DataSourceError] = []
     ok = 0  # '성공' = 예외 없이 응답을 받은 종목 수(무자료 포함)
     for raw in codes:
+        # 직전 종목이 쿨다운을 걸었으면 더 시도해도 _get 이 즉시 같은 차단을 재현할
+        # 뿐이다 — 계속 돌리면 대표 원인이 이 자기유발 차단(Quota)으로 오염된다
+        # (원래 원인이 Unavailable 이어도). 쿨다운 검사 자체는 _get 의 몫이므로
+        # 여기서는 "더 부르지 않는다"만 판단한다. 이미 성공한 종목의 결과는 out 에
+        # 남아 그대로 반환된다(부분 실패는 값을 돌려준다는 계약 유지).
+        if errors and cooldown_remaining("dart") > 0:
+            break
         code = str(raw).strip().zfill(6)
         corp = corp_map.get(code)
         if not corp:
@@ -1014,6 +1021,10 @@ def pead_sue_by_symbol(
     errors: list[DataSourceError] = []
     ok = 0  # '성공' = 예외 없이 응답을 받은 종목 수(표본 부족 포함)
     for raw in codes:
+        # metrics_by_symbol 과 같은 이유의 단락 — 자기유발 차단(Quota)이 대표 원인을
+        # 오염시키지 않게 한다. 이미 성공한 종목의 SUE 는 out 에 남는다.
+        if errors and cooldown_remaining("dart") > 0:
+            break
         code = str(raw).strip().zfill(6)
         corp = corp_map.get(code)
         if not corp:
