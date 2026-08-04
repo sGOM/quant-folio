@@ -86,8 +86,8 @@ class _FakeSnapshotDB:
 
 async def test_snapshot_sector_map_propagates_data_source_error(monkeypatch):
     """sector_map() 이 전량 실패로 DataSourceError 를 올리면 snapshot_sector_map 은
+    이를 삼키지 않고 그대로 전파해야 한다(Task 3 이후 계약 — §44-1 재발 방지).
 
-    0 을 반환하며 삼키지 않고 그대로 전파해야 한다(Task 3 이후 계약 — §44-1 재발 방지).
     분기 Celery beat 태스크가 이 예외를 받아 알림을 발행할 수 있으려면 여기서 삼키면 안 된다.
     """
     from datetime import date
