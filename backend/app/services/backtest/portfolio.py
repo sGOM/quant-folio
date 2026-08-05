@@ -803,11 +803,14 @@ def run_rebalance_backtest(
             # 매핑 부재가 원래도 설계된 저하이기 때문이다(§20).
             logger.error("섹터 집중 한도용 업종 매핑 조회 실패 — 섹터 캡 미적용: %s", e)
             smap = {}
+        else:
+            # 조회는 성공했는데 매핑이 빈 경우에만 '미확보'다. 실패는 위에서 이미 ERROR 로
+            # 남겼으므로 여기서 다시 WARNING 을 찍지 않는다(두 줄이 겹치면 구분이 흐려진다).
+            if not smap:
+                logger.warning("섹터 한도 설정됨(max_sector_pct)이나 업종 매핑 미확보 — 섹터 캡 미적용.")
         if smap:
             config = {**config, "_sector_map": smap}
             logger.info("섹터 집중 한도용 업종 매핑 로드: %d종목", len(smap))
-        else:
-            logger.warning("섹터 한도 설정됨(max_sector_pct)이나 업종 매핑 미확보 — 섹터 캡 미적용.")
 
     # 현금화 오버레이(레짐 필터) 준비
     rf = config.get("regime_filter") or {}

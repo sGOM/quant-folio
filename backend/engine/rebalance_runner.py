@@ -509,12 +509,26 @@ class RebalanceRunner(BaseRunner):
         블로킹 KRX 조회이므로 스레드풀에서 실행한다. 미확보(빈 dict) 시 섹터 캡은
         _apply_risk_caps 에서 조용히 미적용된다. 실패는 캐시하지 않아(빈 dict 는 조회
         시도로 간주) 다음 리밸런싱에 재시도한다.
+
+        조회 **실패**도 같은 저하(빈 매핑 → 섹터 캡 미적용)로 수렴시킨다. 예외를 그대로
+        올리면 _compute_plan → _rebalance_once 를 타고 틱 전체가 죽어 **리밸런싱 자체가
+        무산된다** — 선택적 리스크 한도 하나 때문에 주문을 못 내는 것은 과하고, 백테스트
+        (portfolio.py)가 같은 상황에서 저하하는 것과도 어긋난다. 다만 '자료 없음'과는
+        다른 사건이므로 ERROR 로 구분해 남긴다.
         """
         if self._sector_map:
             return self._sector_map
+        from app.services.data.errors import DataSourceError
         from app.services.data.krx_index import sector_map as _sector_map_fn
 
-        smap = await asyncio.to_thread(_sector_map_fn)
+        try:
+            smap = await asyncio.to_thread(_sector_map_fn)
+        except DataSourceError as e:
+            logger.error(
+                "전략 %d 섹터 한도용 업종 매핑 조회 실패 — 섹터 캡 미적용: %s",
+                self.strategy_id, e,
+            )
+            return {}  # 실패는 캐시하지 않는다(다음 리밸런싱에 재시도)
         if smap:
             self._sector_map = smap
             logger.info("전략 %d 섹터 한도용 업종 매핑 로드: %d종목", self.strategy_id, len(smap))

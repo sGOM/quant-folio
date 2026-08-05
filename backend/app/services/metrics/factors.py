@@ -659,10 +659,14 @@ def compute_universe_scores(
     # 중립 처리된다. factor_weights.quality>0 인 전략에서만 실제로 점수에 반영된다.
     try:
         from app.services.data import opendart
+        from app.services.data.errors import DataSourceError
 
         qmetrics = opendart.metrics_by_symbol(codes, as_of, use_ttm=financial_period == "ttm")
-    except Exception as e:  # noqa: BLE001
-        logger.warning("OpenDART 퀄리티 팩터 조회 실패 — 중립 처리: %s", e)
+    except DataSourceError as e:
+        # 퀄리티 중립 처리는 설계된 저하다(키 부재 시와 같은 결과). 다만 라이브 엔진이
+        # 매 리밸런싱마다 타는 경로라 조용히 넘어가면 '중립 처리'와 구분되지 않으므로
+        # ERROR 로 남긴다. 우리 쪽 버그(TypeError 등)는 여기서 삼키지 않고 전파한다.
+        logger.error("OpenDART 퀄리티 팩터 조회 실패 — 중립 처리: %s", e)
         qmetrics = {}
     if qmetrics:
         qdf = pd.DataFrame.from_dict(qmetrics, orient="index")

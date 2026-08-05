@@ -19,6 +19,7 @@ from app.services import symbols
 from app.services.backtest import portfolio
 from app.services.data import ingest
 from app.services.data import krx_index
+from app.services.data import opendart
 from app.services.data.errors import SourceUnavailableError
 from app.services.metrics import factors as factors_mod
 
@@ -279,3 +280,85 @@ class TestPortfolioSectorMapDegradation:
         monkeypatch.setattr(krx_index, "sector_map", _bug)
         with pytest.raises(TypeError):
             portfolio.run_rebalance_backtest(panel, _sector_risk_cfg(), dates[0], dates[-1])
+
+
+# ───── factors.py: 퀄리티 팩터(opendart.metrics_by_symbol) — Task 7 리뷰 H-2 ─────
+
+
+class TestFactorsQualityDegradation:
+    """`compute_universe_scores` 의 퀄리티 팩터 조회.
+
+    같은 함수 안 6줄 아래 중립화 블록은 좁혀졌는데 이 블록만 bare `except Exception` 으로
+    남아 있었다(Task 7 리뷰 H-2). 라이브 엔진이 매 리밸런싱마다 부르는 경로라, 여기만
+    조용하면 우리 쪽 버그가 '중립 처리'로 위장된 채 리밸런싱이 '성공'으로 기록된다.
+    """
+
+    def test_외부_장애는_삼키고_중립_처리로_계속한다(self, monkeypatch, caplog):
+        _minimal_universe_scores_stubs(monkeypatch)
+
+        def _boom(codes, as_of, use_ttm=False):
+            raise SourceUnavailableError("dart", "연결 실패")
+
+        monkeypatch.setattr(opendart, "metrics_by_symbol", _boom)
+        with caplog.at_level("ERROR"):
+            out = factors_mod.compute_universe_scores(
+                ["005930"], date(2024, 4, 1),
+                factor_weights={"momentum": 0.0, "value": 0.0, "lowvol": 0.0,
+                                "quality": 0.0, "growth": 0.0, "flow": 0.0},
+            )
+        assert isinstance(out, dict)  # 예외 없이 완료
+        assert "퀄리티 팩터" in caplog.text
+
+    def test_우리_쪽_버그는_전파된다(self, monkeypatch):
+        _minimal_universe_scores_stubs(monkeypatch)
+
+        def _bug(codes, as_of, use_ttm=False):
+            raise TypeError("잘못된 인자")
+
+        monkeypatch.setattr(opendart, "metrics_by_symbol", _bug)
+        with pytest.raises(TypeError):
+            factors_mod.compute_universe_scores(
+                ["005930"], date(2024, 4, 1),
+                factor_weights={"momentum": 0.0, "value": 0.0, "lowvol": 0.0,
+                                "quality": 0.0, "growth": 0.0, "flow": 0.0},
+            )
+
+
+# ───── engine/rebalance_runner.py: 라이브 섹터맵 — Task 7 리뷰 H-1 ─────
+
+
+class TestLiveSectorMapDegradation:
+    """`_get_sector_map` 의 저하 계약(라이브 매매 엔진).
+
+    docstring 이 "미확보(빈 dict) 시 섹터 캡은 조용히 미적용" 이라고 계약을 적어뒀는데,
+    Task 3 에서 `sector_map()` 이 빈 dict 대신 raise 로 바뀌면서 그 계약이 깨져 있었다.
+    백테스트(portfolio.py)는 정정 A 로 고쳤지만 **라이브 거울상은 그대로였다** — 같은
+    리스크 레이어 기능인데 백테스트는 우아하게 저하되고 라이브는 리밸런싱 자체가 무산된다.
+    """
+
+    @staticmethod
+    def _runner():
+        from engine.rebalance_runner import RebalanceRunner
+
+        from tests.conftest import FakeRedis
+
+        return RebalanceRunner(strategy_id=1, redis=FakeRedis())
+
+    async def test_외부_장애는_삼키고_섹터_캡_없이_계속_진행한다(self, monkeypatch, caplog):
+        def _boom(as_of=None):
+            raise SourceUnavailableError("krx", "타임아웃")
+
+        monkeypatch.setattr(krx_index, "sector_map", _boom)
+        with caplog.at_level("ERROR"):
+            smap = await self._runner()._get_sector_map()
+
+        assert smap == {}  # 캡 미적용으로 저하 — 리밸런싱은 계속된다
+        assert "업종 매핑" in caplog.text
+
+    async def test_우리_쪽_버그는_전파된다(self, monkeypatch):
+        def _bug(as_of=None):
+            raise TypeError("잘못된 인자")
+
+        monkeypatch.setattr(krx_index, "sector_map", _bug)
+        with pytest.raises(TypeError):
+            await self._runner()._get_sector_map()
