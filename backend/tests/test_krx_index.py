@@ -201,6 +201,9 @@ def test_build_pit_pool_index_source_union_and_provider(monkeypatch):
         (2023, 3): ["005930", "035420"],
     }
     import app.services.data.krx_index as ki
+    # _build_pit_pool 은 진입점에서 require_krx_auth() preflight 를 탄다. 여기서 검증하는
+    # 것은 풀 구성 로직이므로 인증은 통과시킨다(대역화하지 않으면 실제 로그인을 시도한다).
+    monkeypatch.setattr(ki, "has_krx_auth", lambda: True)
     monkeypatch.setattr(
         ki, "index_members",
         lambda as_of, index="KOSPI200": per_month.get((as_of.year, as_of.month), []),
@@ -251,6 +254,7 @@ def test_build_pit_pool_applies_min_market_cap(monkeypatch):
     from app.api.routes import backtests as bt
     import app.services.data.krx_index as ki
 
+    monkeypatch.setattr(ki, "has_krx_auth", lambda: True)  # preflight 통과(실 로그인 방지)
     monkeypatch.setattr(ki, "index_members", lambda as_of, index="KOSPI200": ["005930", "000660", "007340"])
     # 007340 만 5000억 미만 → 필터로 제외되어야 한다.
     caps = {"005930": 350_000_000_000_000, "000660": 200_000_000_000_000, "007340": 100_000_000_000}
@@ -266,6 +270,7 @@ def test_build_pit_pool_min_cap_keeps_all_when_cap_lookup_fails(monkeypatch):
     from app.api.routes import backtests as bt
     import app.services.data.krx_index as ki
 
+    monkeypatch.setattr(ki, "has_krx_auth", lambda: True)  # preflight 통과(실 로그인 방지)
     monkeypatch.setattr(ki, "index_members", lambda as_of, index="KOSPI200": ["005930", "000660"])
     monkeypatch.setattr(ki, "market_caps", lambda as_of: {})  # 조회 실패
 
