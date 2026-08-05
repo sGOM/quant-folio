@@ -12,6 +12,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from app.services.data.errors import DataSourceError
 from app.services.data.loader import bounded_socket_timeout
 from app.services.metrics.common import _approx_start, _is_nan, _ymd
 from app.services.metrics.fetch import (
@@ -661,8 +662,11 @@ def compute_universe_scores(
         from app.services.data import opendart
 
         qmetrics = opendart.metrics_by_symbol(codes, as_of, use_ttm=financial_period == "ttm")
-    except Exception as e:  # noqa: BLE001
-        logger.warning("OpenDART 퀄리티 팩터 조회 실패 — 중립 처리: %s", e)
+    except DataSourceError as e:
+        # 퀄리티 중립 처리는 설계된 저하다(키 부재 시와 같은 결과). 다만 라이브 엔진이
+        # 매 리밸런싱마다 타는 경로라 조용히 넘어가면 '중립 처리'와 구분되지 않으므로
+        # ERROR 로 남긴다. 우리 쪽 버그(TypeError 등)는 여기서 삼키지 않고 전파한다.
+        logger.error("OpenDART 퀄리티 팩터 조회 실패 — 중립 처리: %s", e)
         qmetrics = {}
     if qmetrics:
         qdf = pd.DataFrame.from_dict(qmetrics, orient="index")
@@ -675,10 +679,10 @@ def compute_universe_scores(
     if neutralize in ("size", "size_sector"):
         try:
             from app.services.data import krx_index
-
+    
             caps = krx_index.market_caps(as_of)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("사이즈 중립화용 시가총액 조회 실패 — 중립화 생략: %s", e)
+        except DataSourceError as e:
+            logger.error("사이즈 중립화용 시가총액 조회 실패 — 중립화 생략: %s", e)
             caps = {}
         if caps:
             df["market_cap"] = pd.Series(
@@ -689,10 +693,10 @@ def compute_universe_scores(
     if neutralize in ("sector", "size_sector"):
         try:
             from app.services.data import krx_index
-
+    
             smap = krx_index.sector_map(as_of)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("섹터 중립화용 업종분류 조회 실패 — 중립화 생략: %s", e)
+        except DataSourceError as e:
+            logger.error("섹터 중립화용 업종분류 조회 실패 — 중립화 생략: %s", e)
             smap = {}
         if smap:
             df["sector"] = pd.Series(

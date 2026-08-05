@@ -41,4 +41,9 @@ class TurnaroundScreenOut(BaseModel):
     scanned: int                # 스캔한 소형주 후보 수(재무조회 대상)
     count: int
     opendart_enabled: bool      # OpenDART 키 유무(없으면 재무 필터 미적용)
+    # 이번 응답에 재무 하드 필터(부채비율·만성적자)가 실제로 적용됐는지. 키가 있어도
+    # (opendart_enabled=True) 조회가 실패하면 필터가 후보 전원에 대해 건너뛰어져,
+    # 걸러졌어야 할 종목이 결과에 남는다. 그 사실이 응답에 드러나지 않으면 사용자는
+    # 정상 결과와 구분할 수 없다 — 로그에만 남기면 §44-1 과 같은 형태가 된다.
+    financial_filter_applied: bool = True
     items: list[TurnaroundCandidate]

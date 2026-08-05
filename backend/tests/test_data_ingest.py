@@ -176,10 +176,12 @@ async def test_build_universe_unions_index_members_and_strategy_symbols(monkeypa
 
 
 async def test_build_universe_survives_index_lookup_failure(monkeypatch):
+    """DataSourceError(외부 장애)는 삼키고 전략 유니버스로 계속한다(Task 7 — except DataSourceError)."""
     import app.services.data.krx_index as krx_index
+    from app.services.data.errors import SourceAuthError
 
     def boom(as_of, index="KOSPI200"):
-        raise RuntimeError("KRX 인증 실패")
+        raise SourceAuthError("krx", "KRX 인증 실패")
 
     monkeypatch.setattr(krx_index, "index_members", boom)
     db = _FakeStrategyDb([{"type": "sma", "symbol": "005930"}])
@@ -187,3 +189,5 @@ async def test_build_universe_survives_index_lookup_failure(monkeypatch):
     universe = await ingest_mod.build_universe(db)
 
     assert universe == ["005930"]  # 지수 조회 실패해도 전략 유니버스는 반영
+    # 우리 쪽 버그(TypeError) 전파 계약은 tests/test_caller_degradation.py
+    # ::TestBuildUniverseDegradation 에서 검증한다(중복 회피).

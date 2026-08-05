@@ -164,6 +164,7 @@ def _fundamentals_provider_with_neutralize_cols(
         생략한다(순수 팩터 그대로, §20).
     """
     from app.services.data import krx_index
+    from app.services.data.errors import DataSourceError
 
     fdf = _fundamentals_provider(as_of_date, codes, use_ttm=use_ttm)
     norm_codes = [str(c).zfill(6) for c in codes]
@@ -172,7 +173,10 @@ def _fundamentals_provider_with_neutralize_cols(
     if neutralize in ("size", "size_sector"):
         try:
             caps = krx_index.market_caps(as_of_date)
-        except Exception:  # noqa: BLE001
+        except DataSourceError as e:
+            # 사이즈 중립화 생략은 §20 에 설계된 저하다(순수 팩터 그대로). 다만 조용히
+            # 넘어가면 요청한 중립화가 적용됐는지 알 수 없으므로 ERROR 로 남긴다.
+            logger.error("사이즈 중립화 생략 — 시가총액 조회 실패: %s", e)
             caps = {}
         if caps:
             cols["market_cap"] = pd.Series(
@@ -182,7 +186,8 @@ def _fundamentals_provider_with_neutralize_cols(
     if neutralize in ("sector", "size_sector"):
         try:
             smap = krx_index.sector_map(as_of_date)
-        except Exception:  # noqa: BLE001
+        except DataSourceError as e:
+            logger.error("섹터 중립화 생략 — 업종분류 조회 실패: %s", e)
             smap = {}
         if smap:
             cols["sector"] = pd.Series(
@@ -300,6 +305,10 @@ def _build_pit_pool(config: dict, start, end):
     백테스트 루프 밖으로 빼기 위해 월별 멤버십을 미리 조회해 dict 로 캐시한다.
     source="fixed" 이면 (None, None) 을 반환해 기존 고정 universe 경로를 쓴다.
     (블로킹 — 호출부가 run_in_threadpool 로 감쌀 것.)
+
+    :raises SourceAuthError: 지수 소스인데 KRX 인증이 없거나 로그인에 실패한 경우
+        (preflight — 월별 조회를 시작하기 전에 막는다). 스크립트에서 직접 호출할 때도
+        동일하게 던지므로, 인증 없이 돌려 빈 결과를 얻는 일이 생기지 않는다.
     """
     rule = (config.get("selection") or {}).get("universe_rule") or {}
     source = rule.get("source", "fixed")
@@ -307,6 +316,10 @@ def _build_pit_pool(config: dict, start, end):
         return None, None
 
     from app.services.data import krx_index
+
+    # 인증 없이 돌면 월별 조회가 전부 빈 값을 주고 백테스트가 빈 패널 위에서
+    # '성공'한다(§44-1). 19개월치를 다 돌기 전에 막는다.
+    krx_index.require_krx_auth()
 
     # 유동성 필터: 시가총액(억 원) 하한. 각 월 시점 시총 기준으로 소형주를 후보풀에서 제외.
     min_cap = rule.get("min_market_cap")

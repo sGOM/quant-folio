@@ -16,6 +16,19 @@ os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://quant:quant@localhos
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 os.environ.setdefault("KIS_ENV", "vts")
 
+# ── KRX 자격증명은 테스트에서 반드시 비운다 ──────────────────────────────────
+# pykrx 는 `pykrx.website.comm` 을 **임포트하는 시점에** KRX_ID/KRX_PW 로 실제 로그인을
+# 시도하는 모듈 전역 부작용이 있다. 개발 컨테이너에는 secrets/krx_id.txt 가
+# KRX_ID_FILE 로 마운트돼 있어(docker-compose.yml), 여기서 비우지 않으면 테스트가 매
+# 실행마다 진짜 KRX 에 로그인하고 **계정 ID 를 테스트 출력에 남긴다**(과거 실제 유출).
+# CI 는 자격증명을 주입하지 않으므로, 비워야 로컬 스위트가 CI 와 같은 조건에서 검증된다
+# — 자격증명 유무로 통과/실패가 갈리는 테스트를 로컬에서 놓치지 않기 위함.
+# KRX 인증이 성립한 상태를 검증해야 하는 테스트는 `krx_index.has_krx_auth`(또는
+# `_session`)를 개별적으로 목 처리한다.
+for _krx_field in ("KRX_ID", "KRX_PW"):
+    os.environ.pop(f"{_krx_field}_FILE", None)
+    os.environ[_krx_field] = ""
+
 # ── 앱 모듈 import 는 반드시 위 환경변수 주입 이후에 한다 ──────────────────────
 import json  # noqa: E402
 import operator as _pyop  # noqa: E402

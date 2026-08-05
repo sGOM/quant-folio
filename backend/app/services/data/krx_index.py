@@ -10,19 +10,37 @@
 로그인 세션을 관리한다(app.core.config 가 시크릿에서 주입). 여기서는 그 인증
 세션을 재사용해 구성종목 JSON(MDCSTAT00601)을 직접 조회한다.
 
-설계 원칙(opendart.py 와 동일):
+설계 원칙(opendart.py 와 동일, 단 인증 실패 처리는 §44-1 이후 아래처럼 갈린다):
 - 블로킹(sync) 함수 — 호출부가 run_in_threadpool 로 실행.
-- 실패/미인증/무자료 시 예외 대신 빈 리스트 반환(호출부가 폴백하도록).
+- 미설정(KRX_ID/PW 없음)·무자료(휴장일)는 예외 대신 빈 리스트/딕셔너리 반환(호출부가
+  폴백하도록). 반면 실제 로그인 실패·전송 실패는 `app.services.data.errors` 의 원인별
+  `DataSourceError` 로 raise 한다(`_session`/`_krx_rows`) — 미설정과 실패를 조용히
+  같은 값(None/[])으로 뭉개던 것이 KRX 차단 시 빈 패널 위 백테스트를 낳은 재발 경로였다.
+  각 조회 함수의 7일/10일 소급 루프도 **전량 실패**(정상 응답을 한 번도 못 받음)면 그
+  예외(대표)를 raise 한다. 정상 응답이 있었는데 전부 비었으면(휴장일·미상장) 빈
+  리스트/딕셔너리를 그대로 반환한다 — "성공"은 예외 없이 응답을 받은 것이지 데이터를
+  얻은 것이 아니다.
 - 시점별 결과를 모듈 캐시(_MEMBERS_CACHE)에 저장(같은 날짜 반복조회 방지).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from datetime import date, timedelta
 
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal
+from app.services.data.errors import (
+    DataSourceError,
+    SourceAuthError,
+    SourceRequestError,
+    SourceSchemaError,
+    SourceUnavailableError,
+    clear_cooldown,
+    cooldown_remaining,
+    note_failure,
+    representative,
+)
 from app.services.data.loader import bounded_socket_timeout
 from app.services.market import is_business_day
 
@@ -60,61 +78,157 @@ _MKTCAP_CACHE: dict[str, dict[str, int]] = {}
 _SECTOR_CACHE: dict[str, str] | None = None
 
 
-# 로그인 실패 후 재시도를 막는 쿨다운(초)과 그 만료 시각.
-#
-# 왜 필요한가: `_build_pit_pool` 은 조회 구간의 **월마다** `index_members` 를 부르고,
-# 세션이 유효하지 않으면 그때마다 로그인을 새로 시도한다. 장기 구간(예: 19개월)을
-# 백테스트하면 짧은 시간에 로그인이 수십 번 나가고, 실제로 이 때문에 KRX 가 로그인
-# 응답을 JSON 이 아닌 차단 페이지로 돌려주는 상태를 관측했다(그 뒤 모든 PIT 조회가
-# 조용히 0종목을 반환 → 빈 패널 위에서 백테스트가 '성공'하며 무의미한 수치를 낸다).
-# 한 번 실패하면 쿨다운 동안 재시도하지 않아 차단을 악화시키지 않는다.
-_SESSION_FAIL_COOLDOWN = 300.0
-_session_fail_until: float = 0.0
+def _build_session():
+    """pykrx 로그인 1회. 테스트에서 목으로 갈아끼우기 위해 분리한다."""
+    from pykrx.website.comm import auth
+
+    # build_krx_session() 은 로그인 로그 이후에도 내부적으로 추가 요청을 할 수 있는데,
+    # 그 경로엔 우리가 손댈 수 없는 timeout 미지정 호출이 있을 수 있다(실제로 로그인
+    # 완료 로그 이후 응답 없이 멈추는 현상을 관측함). 소켓 레벨로 강제 타임아웃을 건다.
+    with bounded_socket_timeout(20):
+        return auth.build_krx_session()
 
 
 def _session():
-    """pykrx 인증 KRX 세션을 반환한다(미설정/실패 시 None).
+    """pykrx 인증 KRX 세션을 반환한다.
 
-    app.core.config 로드로 KRX_ID/KRX_PW 가 os.environ 에 주입돼 있어야 한다.
-    실패 직후에는 `_SESSION_FAIL_COOLDOWN` 초 동안 재로그인을 시도하지 않는다.
+    **미설정과 실패를 가른다** — 둘 다 None 이던 것이 §44-1 재발 경로였다.
+    자격증명이 없으면 애초에 물어보지 않은 것이므로 None(실패 아님). 로그인 실패·
+    빈 세션·쿨다운 중은 SourceAuthError 를 던진다.
+
+    쿨다운 검사를 **"이미 유효한 세션이면 재사용" 분기보다 앞에서** 한다. 뒤에 두면
+    쿨다운 중에도 캐시된 유효 세션이 있으면 그걸 그대로 돌려줘, 그 세션으로 보내는
+    `_krx_rows` POST 가 쿨다운과 무관하게 계속 나간다 — §44-1 이 실제로 겪은 형태
+    (세션 쿠키는 살아 있는데 응답만 차단 페이지)를 쿨다운이 못 막는 결함이 된다.
     """
-    global _session_fail_until
+    if not (settings.KRX_ID and settings.KRX_PW):
+        return None  # 미설정 — 실패가 아니다(용도별 preflight 가 필요한 곳에서 막는다)
+
+    remaining = cooldown_remaining("krx")
+    if remaining > 0:
+        raise SourceAuthError("krx", f"로그인 쿨다운 중 — 재시도 생략({remaining:.0f}초 남음)")
 
     try:
         from pykrx.website.comm import auth
-    except Exception:  # noqa: BLE001
-        return None
-    # 이미 전역 세션이 유효하면 재사용, 아니면 신규 로그인
+    except Exception as e:  # noqa: BLE001
+        raise SourceUnavailableError("krx", f"pykrx 로드 실패: {e}") from e
+
     sess = getattr(auth, "_auth_session", None)
     if sess is not None and getattr(sess, "is_valid", lambda: False)():
         return sess
 
-    now = time.monotonic()
-    if now < _session_fail_until:
-        logger.debug("KRX 로그인 쿨다운 중 — 재시도 생략(%.0f초 남음)", _session_fail_until - now)
-        return None
     try:
-        # build_krx_session() 은 로그인 로그(로그인 시도/완료 print) 이후에도 내부적으로
-        # 추가 요청을 할 수 있는데, 그 경로엔 우리가 손댈 수 없는 timeout 미지정 호출이
-        # 있을 수 있다(실제로 로그인 완료 로그 이후 응답 없이 멈추는 현상을 관측함).
-        # 소켓 레벨로 강제 타임아웃을 걸어 무한 대기를 방지한다.
-        with bounded_socket_timeout(20):
-            built = auth.build_krx_session()
+        built = _build_session()
     except Exception as e:  # noqa: BLE001
-        _session_fail_until = now + _SESSION_FAIL_COOLDOWN
-        logger.warning(
-            "KRX 인증 세션 생성 실패(%.0f초간 재시도 생략): %s", _SESSION_FAIL_COOLDOWN, e
-        )
-        return None
+        exc = SourceAuthError("krx", f"인증 세션 생성 실패: {e}")
+        note_failure(exc)
+        logger.warning("%s", exc)
+        raise exc from e
     if built is None:
-        _session_fail_until = now + _SESSION_FAIL_COOLDOWN
-        logger.warning("KRX 인증 세션 생성 실패(빈 세션) — %.0f초간 재시도 생략",
-                       _SESSION_FAIL_COOLDOWN)
+        exc = SourceAuthError("krx", "인증 세션 생성 실패(빈 세션)")
+        note_failure(exc)
+        logger.warning("%s", exc)
+        raise exc
+    clear_cooldown("krx")
     return built
 
 
+def has_krx_auth() -> bool:
+    """KRX 인증 세션을 확보할 수 있는지. preflight 용 — 예외를 던지지 않는다."""
+    try:
+        return _session() is not None
+    except DataSourceError:
+        return False
+
+
+def require_krx_auth() -> None:
+    """KRX 인증이 **필수** 인 실행의 진입점에서 호출한다(PIT 유니버스 백테스트 등).
+
+    미설정 자체는 실패가 아니지만(개발환경에서 앱은 떠야 한다), PIT 유니버스처럼
+    없으면 결과가 무의미해지는 필수 입력에는 다르다. 인증 없이 돌리면 모든 조회가
+    빈 값을 주고 백테스트가 **빈 패널 위에서 '성공'** 한다(§44-1 과 동일한 결과).
+    필수/선택을 소스가 아니라 용도로 가르기 위한 사전 검사.
+    """
+    if not has_krx_auth():
+        raise SourceAuthError(
+            "krx", "KRX 인증이 필요한 실행인데 KRX_ID/KRX_PW 가 없거나 로그인에 실패했다"
+        )
+
+
+def _krx_rows(sess, payload: dict, key: str, label: str, timeout: float = 20) -> list[dict]:
+    """KRX MDC POST 1회. 실패는 원인별 DataSourceError 로 raise 한다.
+
+    KRX 는 에러 코드 체계가 없다. §44-1 에서 관측한 차단 동작(**HTTP 200 인데 본문이
+    JSON 이 아닌 HTML 안내 페이지**)을 인증 실패로 판별한다. 이 휴리스틱이 빗나가면
+    Unavailable 로 분류돼 60초 쿨다운이 걸린다 — 오분류여도 재시도 폭주는 막힌다.
+
+    정상 JSON 이면서 리스트가 비어 있는 것은 **실패가 아니다**(휴장일·미상장).
+    호출자가 직전 영업일로 소급하도록 빈 리스트를 그대로 돌려준다.
+
+    쿨다운을 **거는 것**은 여기서만 한다 — 호출자(단일 조회/7일 루프)마다 거는 위치가
+    달라지면 어떤 경로는 쿨다운 없이 폭주한다. 반대로 쿨다운을 **검사**하는 것도 맨 앞에서
+    한다 — §44-1 의 실제 형태(세션 쿠키는 살아 있고 응답만 차단 페이지)에서는 `_session()`
+    의 검사만으로 부족하다. `_session()` 을 거치지 않고 이미 확보한 `sess` 로 반복 호출하는
+    7일/9일 소급 루프가 쿨다운 중에도 매번 POST 를 내보내기 때문이다. 여기서 막으면 그
+    루프의 나머지 반복도 함께 막힌다. 이미 걸린 쿨다운을 검사만 하고 갱신하지는 않는다
+    (여기서 매번 note_failure 하면 호출이 계속 들어오는 한 쿨다운이 끝없이 연장된다).
+    """
+    remaining = cooldown_remaining("krx")
+    if remaining > 0:
+        raise SourceAuthError(
+            "krx", f"{label} 조회 생략 — 쿨다운 중({remaining:.0f}초 남음)"
+        )
+
+    def _fail(exc: DataSourceError) -> DataSourceError:
+        note_failure(exc)
+        return exc
+
+    try:
+        resp = sess.post(_JSON_URL, data=payload, timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        raise _fail(SourceUnavailableError("krx", f"{label} 연결 실패: {e}")) from e
+
+    status = getattr(resp, "status_code", 200)
+    if status >= 500:
+        raise _fail(SourceUnavailableError("krx", f"{label} 서버 오류: HTTP {status}"))
+    if status >= 400:
+        raise _fail(SourceRequestError("krx", f"{label} 요청 오류: HTTP {status}"))
+
+    try:
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        raise _fail(
+            SourceAuthError("krx", f"{label} 응답이 JSON 이 아니다(차단 추정): {e}")
+        ) from e
+
+    if not isinstance(data, dict) or key not in data:
+        # Schema 는 cooldown=None 이라 _fail 을 거쳐도 쿨다운이 걸리지 않는다(의도).
+        raise _fail(
+            SourceSchemaError("krx", f"{label} 응답에 '{key}' 키가 없다: {str(data)[:120]}")
+        )
+    rows = data.get(key) or []
+    # 키가 있어도 값의 **형태**까지 맞는지 여기서 확정한다. 호출자들은 반환 직후
+    # `r.get(...)` 으로 파싱하는데 그 구간은 이 try 밖이라, 원소가 dict 가 아니면
+    # AttributeError 가 DataSourceError 계약을 뚫고 그대로 샌다. 호출자는 좁힌
+    # `except DataSourceError` 로 저하하므로, 그런 응답은 저하되지 못하고 곧장
+    # 크래시한다(웹은 500, 라이브 엔진은 틱 실패). 상류 형식 문제는 Schema 로 귀속한다.
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+        raise _fail(
+            SourceSchemaError(
+                "krx", f"{label} 응답의 '{key}' 가 dict 리스트가 아니다: {str(rows)[:120]}"
+            )
+        )
+    return rows
+
+
 def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
-    """as_of 시점에 index 를 구성하던 종목코드(6자리) 목록. 실패 시 빈 리스트.
+    """as_of 시점에 index 를 구성하던 종목코드(6자리) 목록.
+
+    전량 실패 시 DataSourceError. 미인증 시 빈 값. 7일 소급 루프 중 정상 응답을 한 번도
+    받지 못했으면(전량 실패) 대표 예외를 raise 하고, 정상 응답이 있었는데 전부 빈
+    리스트였으면(휴장일·미상장) 빈 리스트를 그대로 반환한다. `_session()` 자체가 던지는
+    `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 호출자에게 그대로 전파한다 —
+    호출자 정리는 별도 작업.
 
     :param as_of: 조회 기준일. 주말·휴장일이면 KRX 가 빈 응답을 주므로, 최대 6일 전까지
         직전 영업일로 스냅해 그 시점 구성을 반환한다(PIT 안전 — 미래일로는 가지 않음).
@@ -133,22 +247,37 @@ def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
         return []
 
     codes: list[str] = []
+    errors: list[DataSourceError] = []
+    ok = False  # '성공' = 예외 없이 응답을 받음(데이터 획득이 아니다)
     # 휴장일 빈 응답 대비 최대 6일(주말+연휴) 직전 영업일까지 스냅.
     for back in range(7):
+        # 직전 반복이 쿨다운을 걸었으면 더 시도해도 _krx_rows 가 즉시 같은 차단을
+        # 재현할 뿐이다 — 계속 돌리면 대표 원인이 이 자기유발 차단(Auth)으로
+        # 오염된다(원래 원인이 Unavailable 이어도). 쿨다운 검사 자체는 _krx_rows 의
+        # 몫이므로 여기서는 "더 부르지 않는다"만 판단한다.
+        if errors and cooldown_remaining("krx") > 0:
+            break
         dd = (as_of - timedelta(days=back)).strftime("%Y%m%d")
         payload = {
             "bld": _BLD_INDEX_CONSTITUENTS, "locale": "ko_KR",
             "trdDd": dd, "money": "1", "csvxls_isNo": "false", **params,
         }
         try:
-            resp = sess.post(_JSON_URL, data=payload, timeout=15)
-            rows = resp.json().get("output") or []
-        except Exception as e:  # noqa: BLE001
+            rows = _krx_rows(sess, payload, "output", f"{index} 구성종목", timeout=15)
+        except DataSourceError as e:
             logger.warning("KRX %s 구성종목 조회 실패(%s): %s", index, dd, e)
-            rows = []
+            errors.append(e)
+            continue
+        ok = True
         codes = [str(r.get("ISU_SRT_CD")).zfill(6) for r in rows if r.get("ISU_SRT_CD")]
         if codes:
             break
+
+    # 정상 응답이 한 번도 없었으면 실패다. 정상 응답이 있었는데 전부 비었으면
+    # 진짜 휴장/미상장이므로 빈 값을 그대로 돌려준다.
+    # 쿨다운은 _krx_rows 가 이미 걸었다 — 여기서 또 걸지 않는다.
+    if not ok and errors:
+        raise representative(errors)
 
     # 성공 결과만 캐시한다(실패/미인증/일시 장애의 빈 응답을 캐시하면 프로세스 수명
     # 내내 해당 시점 구성이 []로 고착 → 조용히 고정 유니버스로 폴백하는 생존편향 재유입).
@@ -162,7 +291,11 @@ def all_listed_stocks() -> list[dict[str, str]]:
 
     지수 구성종목과 달리 **날짜에 의존하지 않는 종목 마스터**라, 시스템 시계가 미래여서
     pykrx 의 '오늘' 기반 조회가 빈 응답을 주는 환경에서도 동작한다. 종목명 매핑(체결/주문
-    로그 표기)의 신뢰 가능한 1차 소스. 미인증/실패 시 빈 리스트(호출부가 폴백).
+    로그 표기)의 신뢰 가능한 1차 소스.
+
+    전량 실패 시 DataSourceError. 미인증 시 빈 값. 루프 없는 단일 조회라 POST 실패는
+    그대로 전파한다. `_session()` 이 던지는 `SourceAuthError`(로그인 실패·쿨다운 중)도
+    잡지 않고 그대로 전파한다 — 호출자 정리는 별도 작업.
 
     성공 결과만 캐시한다(실패를 캐시하면 프로세스 수명 내내 이름이 비므로).
     """
@@ -179,12 +312,9 @@ def all_listed_stocks() -> list[dict[str, str]]:
         "bld": _BLD_STOCK_FINDER, "locale": "ko_KR",
         "mktsel": "ALL", "typeNo": "0", "searchText": "",
     }
-    try:
-        resp = sess.post(_JSON_URL, data=payload, timeout=20)
-        rows = resp.json().get("block1") or []
-    except Exception as e:  # noqa: BLE001
-        logger.warning("KRX 전종목 목록 조회 실패: %s", e)
-        return []
+    # 루프가 없는 단일 조회다 — _krx_rows 의 예외를 그대로 전파한다(쿨다운은
+    # _krx_rows 가 이미 걸었다).
+    rows = _krx_rows(sess, payload, "block1", "전종목목록")
 
     out: list[dict[str, str]] = []
     for r in rows:
@@ -202,12 +332,16 @@ def all_listed_stocks() -> list[dict[str, str]]:
 
 
 def market_caps(as_of: date) -> dict[str, int]:
-    """as_of 시점 전 종목 시가총액(원) {code: mktcap}. 실패/미인증 시 빈 dict.
+    """as_of 시점 전 종목 시가총액(원) {code: mktcap}.
 
     MDCSTAT01501 을 KOSPI(STK)·KOSDAQ(KSQ) 각각 조회해 합친다. 명시적 trdDd 를 쓰므로
     시스템 시계가 미래여도 과거일 시총을 정상 조회한다. 휴장일이면 최대 6일 소급 스냅.
     유동성 필터(universe_rule.min_market_cap)에서 소형주를 후보풀에서 걸러내는 용도.
-    성공 결과만 캐시한다(실패를 캐시하지 않음).
+
+    전량 실패 시 DataSourceError. 미인증 시 빈 값. 바깥 날짜 루프×안쪽 시장(STK/KSQ)
+    루프 중 정상 응답을 한 번도 받지 못했으면 대표 예외를 raise 한다. `_session()` 이
+    던지는 `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 그대로 전파한다 — 호출자
+    정리는 별도 작업. 성공 결과만 캐시한다(실패를 캐시하지 않음).
     """
     key = as_of.strftime("%Y%m%d")
     if key in _MKTCAP_CACHE:
@@ -219,26 +353,39 @@ def market_caps(as_of: date) -> dict[str, int]:
         return {}
 
     caps: dict[str, int] = {}
+    errors: list[DataSourceError] = []
+    ok = False
     for back in range(7):  # 휴장일 빈 응답 대비 직전 영업일 소급
         dd = (as_of - timedelta(days=back)).strftime("%Y%m%d")
         for mkt in ("STK", "KSQ"):
+            # 직전 반복이 쿨다운을 걸었으면 더 시도해도 자기유발 차단(Auth)만
+            # 반복되며 대표 원인을 오염시킨다 — 더 부르지 않는다.
+            if errors and cooldown_remaining("krx") > 0:
+                break
             payload = {
                 "bld": _BLD_MARKET_CAP, "locale": "ko_KR",
                 "mktId": mkt, "trdDd": dd, "money": "1", "csvxls_isNo": "false",
             }
             try:
-                resp = sess.post(_JSON_URL, data=payload, timeout=20)
-                rows = resp.json().get("OutBlock_1") or []
-            except Exception as e:  # noqa: BLE001
+                rows = _krx_rows(sess, payload, "OutBlock_1", f"시가총액({mkt})")
+            except DataSourceError as e:
                 logger.warning("KRX 시가총액 조회 실패(%s %s): %s", mkt, dd, e)
-                rows = []
+                errors.append(e)
+                continue
+            ok = True
             for r in rows:
                 code = str(r.get("ISU_SRT_CD") or "").strip().zfill(6)
                 raw = str(r.get("MKTCAP") or "").replace(",", "").strip()
                 if code and raw.isdigit():
                     caps[code] = int(raw)
+        if errors and cooldown_remaining("krx") > 0:
+            break
         if caps:
             break
+
+    # 쿨다운은 _krx_rows 가 이미 걸었다 — 여기서 또 걸지 않는다.
+    if not ok and errors:
+        raise representative(errors)
 
     if caps:
         _MKTCAP_CACHE[key] = caps
@@ -250,8 +397,10 @@ def sector_map(as_of: date | None = None) -> dict[str, str]:
 
     KOSPI(STK)·KOSDAQ(KSQ) 각 시장을 요청 1회씩(총 2회)만 호출해 전종목 업종을 얻는다
     — OpenDART 기업개황(종목당 1회 호출) 대비 압도적으로 효율적이라 이쪽을 채택했다.
-    업종 분류는 사실상 정적이므로 프로세스 내 1회 로드 후 캐시를 재사용한다. 미인증/실패/
-    무자료 시 빈 dict 를 반환한다(호출부가 섹터 한도를 미적용으로 폴백하도록). 성공 결과만
+    업종 분류는 사실상 정적이므로 프로세스 내 1회 로드 후 캐시를 재사용한다. 전량 실패 시
+    DataSourceError. 미인증 시 빈 값(호출부가 섹터 한도를 미적용으로 폴백하도록). 무자료
+    (휴장일)면 빈 dict 를 그대로 반환한다. `_session()` 이 던지는 `SourceAuthError`(로그인
+    실패·쿨다운 중)는 잡지 않고 그대로 전파한다 — 호출자 정리는 별도 작업. 성공 결과만
     캐시한다.
 
     :param as_of: PIT 조회 시점. 주어지면 먼저 ``sector_map_snapshots`` 테이블에서 as_of
@@ -290,26 +439,39 @@ def sector_map(as_of: date | None = None) -> dict[str, str]:
 
     base = as_of or date.today()
     mapping: dict[str, str] = {}
+    errors: list[DataSourceError] = []
+    ok = False
     for back in range(10):  # 휴장일·미래시계 대비 직전 영업일 소급
         dd = (base - timedelta(days=back)).strftime("%Y%m%d")
         for mkt in ("STK", "KSQ"):
+            # 직전 반복이 쿨다운을 걸었으면 더 시도해도 자기유발 차단(Auth)만
+            # 반복되며 대표 원인을 오염시킨다 — 더 부르지 않는다.
+            if errors and cooldown_remaining("krx") > 0:
+                break
             payload = {
                 "bld": _BLD_SECTOR, "locale": "ko_KR",
                 "mktId": mkt, "trdDd": dd, "money": "1", "csvxls_isNo": "false",
             }
             try:
-                resp = sess.post(_JSON_URL, data=payload, timeout=20)
-                rows = resp.json().get("block1") or []
-            except Exception as e:  # noqa: BLE001
+                rows = _krx_rows(sess, payload, "block1", f"업종분류({mkt})")
+            except DataSourceError as e:
                 logger.warning("KRX 업종분류 조회 실패(%s %s): %s", mkt, dd, e)
-                rows = []
+                errors.append(e)
+                continue
+            ok = True
             for r in rows:
                 code = str(r.get("ISU_SRT_CD") or "").strip().zfill(6)
                 ind = str(r.get("IDX_IND_NM") or "").strip()
                 if code != "000000" and ind:
                     mapping[code] = ind
+        if errors and cooldown_remaining("krx") > 0:
+            break
         if mapping:
             break
+
+    # 쿨다운은 _krx_rows 가 이미 걸었다 — 여기서 또 걸지 않는다.
+    if not ok and errors:
+        raise representative(errors)
 
     if mapping:
         _SECTOR_CACHE = mapping
@@ -381,7 +543,10 @@ async def snapshot_sector_map(
     :param as_of: 스냅샷 날짜(기본 오늘). 이미 이 날짜의 스냅샷이 있으면 force=True 가
         아닌 한 건너뛴다 — 같은 배치를 중복 실행해도 멱등이 되도록.
     :param force: True 면 기존 as_of 스냅샷을 삭제 후 재적재한다.
-    :return: 적재한 종목 수(스킵·조회 실패 시 0).
+    :return: 적재한 종목 수. 이미 적재됨(멱등 스킵) 또는 ``sector_map()`` 이 미인증·
+        휴장일 등으로 빈 매핑을 반환한 경우에만 0.
+    :raises DataSourceError: ``sector_map()`` 이 전량 실패로 raise 하면 그대로 전파한다
+        (Task 3 이후 ``sector_map()`` 은 부분 실패를 삼키지 않는다).
     """
     from sqlalchemy import delete, func as sa_func, select
 
@@ -402,8 +567,10 @@ async def snapshot_sector_map(
         return 0
 
     mapping = sector_map()  # 현재 KRX 분류(모듈 캐시 재사용, 없으면 신규 조회)
+    # 전량 실패는 sector_map() 이 DataSourceError 로 raise 해 여기까지 오지 않는다.
+    # 도달하는 빈 매핑은 미인증(preflight 미통과) 또는 휴장일 빈 응답뿐이다.
     if not mapping:
-        logger.warning("업종분류 조회 실패/미인증 — 스냅샷(%s) 적재 건너뜀", snap_date)
+        logger.warning("업종분류 미인증/빈 응답 — 스냅샷(%s) 적재 건너뜀", snap_date)
         return 0
 
     if existing:
@@ -426,6 +593,9 @@ def membership_union(dates: list[date], index: str = "KOSPI200") -> dict[str, li
     """여러 시점의 구성종목을 한 번에 조회해 {YYYYMMDD: [codes]} 로 반환한다.
 
     백테스트 전처리용 — 편입 종목의 합집합으로 가격을 선적재할 때 쓴다.
+
+    :raises DataSourceError: 내부에서 호출하는 ``index_members()`` 가 특정 날짜에
+        전량 실패하면 그대로 전파한다(부분 실패를 삼키지 않는다).
     """
     out: dict[str, list[str]] = {}
     for d in dates:
@@ -460,7 +630,11 @@ def _krx_num(v: object) -> float:
 
 
 def etf_leverage_exposure(as_of: date) -> dict:
-    """as_of 시점 레버리지 ETF 잔고 집계. 미인증·실패 시 빈 dict.
+    """as_of 시점 레버리지 ETF 잔고 집계.
+
+    전량 실패 시 DataSourceError. 미인증 시 빈 값. 무자료(휴장일)면 빈 dict 를 그대로
+    반환한다. `_session()` 이 던지는 `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지
+    않고 그대로 전파한다 — 호출자 정리는 별도 작업.
 
     반환: `{as_of, total_mktcap, leveraged_mktcap, single_stock_mktcap,
     leveraged_ratio, single_stock_ratio, leveraged_count, single_stock_count}`
@@ -492,8 +666,14 @@ def etf_leverage_exposure(as_of: date) -> dict:
         snapped -= timedelta(days=1)
 
     rows: list[dict] = []
+    errors: list[DataSourceError] = []
+    ok = False
     used = snapped
     for back in range(7):
+        # 직전 반복이 쿨다운을 걸었으면 더 시도해도 자기유발 차단(Auth)만
+        # 반복되며 대표 원인을 오염시킨다 — 더 부르지 않는다.
+        if errors and cooldown_remaining("krx") > 0:
+            break
         used = snapped - timedelta(days=back)
         payload = {
             "bld": _BLD_ETF_ALL, "locale": "ko_KR",
@@ -501,13 +681,18 @@ def etf_leverage_exposure(as_of: date) -> dict:
             "share": "1", "money": "1", "csvxls_isNo": "false",
         }
         try:
-            resp = sess.post(_JSON_URL, data=payload, timeout=20)
-            rows = resp.json().get("output") or []
-        except Exception as e:  # noqa: BLE001
+            rows = _krx_rows(sess, payload, "output", "ETF 잔고")
+        except DataSourceError as e:
             logger.warning("KRX ETF 조회 실패(%s): %s", used, e)
-            rows = []
+            errors.append(e)
+            continue
+        ok = True
         if rows:
             break
+
+    # 쿨다운은 _krx_rows 가 이미 걸었다 — 여기서 또 걸지 않는다.
+    if not ok and errors:
+        raise representative(errors)
 
     if not rows:
         return {}

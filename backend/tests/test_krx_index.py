@@ -2,20 +2,22 @@
 
 실제 KRX 호출(인증 필요) 대신 세션을 목으로 주입해 순수 로직만 검증한다.
 """
+import sys
+import types
 from datetime import date
 
 import pytest
 
 from app.services.data import krx_index
-
-
-import contextlib
-
-
-@contextlib.contextmanager
-def _noop_ctx(*a, **kw):
-    """bounded_socket_timeout 대역(소켓 타임아웃 조작 없이 통과)."""
-    yield
+from app.services.data.errors import (
+    SourceAuthError,
+    SourceRequestError,
+    SourceSchemaError,
+    SourceUnavailableError,
+    clear_cooldown,
+    cooldown_remaining,
+    note_failure,
+)
 
 
 class _FakeResp:
@@ -50,11 +52,13 @@ def _clear_cache(monkeypatch):
     # "스냅샷 없음"(빈 dict)으로 목 처리해 실제 DB 접속을 타지 않게 한다. 스냅샷 동작
     # 자체를 검증하는 테스트는 개별적으로 이 목을 덮어쓴다.
     monkeypatch.setattr(krx_index, "_lookup_pit_snapshot_sync", lambda as_of: {})
+    clear_cooldown("krx")
     yield
     krx_index._MEMBERS_CACHE.clear()
     krx_index._STOCKS_CACHE = None
     krx_index._MKTCAP_CACHE.clear()
     krx_index._SECTOR_CACHE = None
+    clear_cooldown("krx")
 
 
 def _rows(*codes):
@@ -80,6 +84,18 @@ def test_index_members_snaps_back_over_holiday(monkeypatch):
 def test_index_members_empty_when_unauthenticated(monkeypatch):
     monkeypatch.setattr(krx_index, "_session", lambda: None)
     assert krx_index.index_members(date(2025, 6, 30)) == []
+
+
+def test_index_members_propagates_session_auth_error(monkeypatch):
+    """`_session()` 이 던지는 SourceAuthError(로그인 실패·쿨다운 중)는 흡수하지 않고
+    그대로 전파한다 — `sess = _session()` 이 try 밖에 있어 index_members 등 공개 함수가
+    잡지 않는다(호출자 정리는 별도 작업). 이 전파를 검증하는 테스트가 없었다."""
+    def _boom():
+        raise SourceAuthError("krx", "로그인 쿨다운 중")
+
+    monkeypatch.setattr(krx_index, "_session", _boom)
+    with pytest.raises(SourceAuthError):
+        krx_index.index_members(date(2025, 6, 30))
 
 
 def test_index_members_cached(monkeypatch):
@@ -149,10 +165,16 @@ def test_all_listed_stocks_unauthenticated_returns_empty(monkeypatch):
     assert krx_index._STOCKS_CACHE is None  # 실패는 캐시하지 않음(자가복구)
 
 
-def test_all_listed_stocks_failure_not_cached(monkeypatch):
+def test_all_listed_stocks_failure_raises_and_not_cached(monkeypatch):
+    """단일 조회라 POST 실패는 흡수하지 않고 그대로 raise 한다(Task 3).
+
+    이전에는 실패를 흡수해 빈 리스트로 폴백했으나, "전량 실패면 raise" 계약으로
+    바뀌면서 루프 없는 단일 조회는 유일한 시도가 곧 전량이라 예외가 그대로 전파된다.
+    """
     fake = _FakeFinderSession([], raise_exc=True)
     monkeypatch.setattr(krx_index, "_session", lambda: fake)
-    assert krx_index.all_listed_stocks() == []
+    with pytest.raises(SourceUnavailableError):
+        krx_index.all_listed_stocks()
     assert krx_index._STOCKS_CACHE is None  # 예외도 캐시 안 함
 
 
@@ -179,6 +201,9 @@ def test_build_pit_pool_index_source_union_and_provider(monkeypatch):
         (2023, 3): ["005930", "035420"],
     }
     import app.services.data.krx_index as ki
+    # _build_pit_pool 은 진입점에서 require_krx_auth() preflight 를 탄다. 여기서 검증하는
+    # 것은 풀 구성 로직이므로 인증은 통과시킨다(대역화하지 않으면 실제 로그인을 시도한다).
+    monkeypatch.setattr(ki, "has_krx_auth", lambda: True)
     monkeypatch.setattr(
         ki, "index_members",
         lambda as_of, index="KOSPI200": per_month.get((as_of.year, as_of.month), []),
@@ -229,6 +254,7 @@ def test_build_pit_pool_applies_min_market_cap(monkeypatch):
     from app.api.routes import backtests as bt
     import app.services.data.krx_index as ki
 
+    monkeypatch.setattr(ki, "has_krx_auth", lambda: True)  # preflight 통과(실 로그인 방지)
     monkeypatch.setattr(ki, "index_members", lambda as_of, index="KOSPI200": ["005930", "000660", "007340"])
     # 007340 만 5000억 미만 → 필터로 제외되어야 한다.
     caps = {"005930": 350_000_000_000_000, "000660": 200_000_000_000_000, "007340": 100_000_000_000}
@@ -244,6 +270,7 @@ def test_build_pit_pool_min_cap_keeps_all_when_cap_lookup_fails(monkeypatch):
     from app.api.routes import backtests as bt
     import app.services.data.krx_index as ki
 
+    monkeypatch.setattr(ki, "has_krx_auth", lambda: True)  # preflight 통과(실 로그인 방지)
     monkeypatch.setattr(ki, "index_members", lambda as_of, index="KOSPI200": ["005930", "000660"])
     monkeypatch.setattr(ki, "market_caps", lambda as_of: {})  # 조회 실패
 
@@ -318,10 +345,17 @@ def test_sector_map_caches_on_success(monkeypatch):
     assert fake.calls == n
 
 
-def test_sector_map_failure_not_cached(monkeypatch):
+def test_sector_map_failure_raises_and_not_cached(monkeypatch):
+    """전량 실패면 raise 하고(Task 3), 캐시도 남기지 않는다.
+
+    이전에는 실패를 흡수해 빈 dict 로 폴백했으나, "전량 실패면 raise" 계약으로
+    바뀌면서 (여기서는 스냅샷 없음으로 목 처리된) as_of 경로도 전량 실패 시 예외가
+    그대로 전파된다.
+    """
     fake = _FakeSectorSession({}, raise_exc=True)
     monkeypatch.setattr(krx_index, "_session", lambda: fake)
-    assert krx_index.sector_map(date(2025, 6, 30)) == {}
+    with pytest.raises(SourceUnavailableError):
+        krx_index.sector_map(date(2025, 6, 30))
     assert krx_index._SECTOR_CACHE is None  # 실패는 캐시 안 함(자가복구)
 
 
@@ -565,56 +599,382 @@ class TestEtfLeverageExposure:
         assert r["total_mktcap"] == pytest.approx(10e12)
 
 
+def _fake_pykrx_auth_module(monkeypatch, *, build=None):
+    """`pykrx.website.comm` 을 `_auth_session=None` 인 가짜 모듈로 치환한다.
+
+    실제 `pykrx.website.comm.webio` 는 **임포트 시점에** 진짜 KRX_ID/KRX_PW(컨테이너
+    시크릿)로 로그인을 시도하는 부작용이 있다(pykrx 모듈 전역 부작용). 테스트가 이 모듈을
+    (직접이든 `from pykrx.website.comm import auth` 를 통해서든) 실제로 임포트하면:
+    (1) 계정 ID 가 테스트 출력에 찍히고, (2) KRX 가 느리면 테스트 수집 자체가 멈추며,
+    (3) 이 작업이 막으려는 §44-1 재시도 폭주 경로를 테스트 실행마다 재현하게 된다.
+    `sys.modules["pykrx.website.comm"]` 자체를 가짜 모듈로 바꿔치기해 `_session()`/
+    `_build_session()` 의 `from pykrx.website.comm import auth` 가 진짜 패키지를 **전혀
+    로드하지 않고** 이 가짜 namespace 를 가져가게 한다.
+
+    :param build: `auth.build_krx_session` 대역. 지정하지 않으면 호출 시 곧바로
+        AssertionError 를 던진다 — 이 헬퍼를 쓰는 테스트는 대개 `krx_index._build_session`
+        을 별도로 목 처리하므로(모듈 전역이 아닌 함수 자체 patch) 이 대역이 호출될 일이
+        없어야 정상이다. 호출된다면 격리가 깨진 신호다.
+    :return: 가짜 `auth` namespace(`_auth_session` 을 테스트에서 직접 조작하고 싶을 때 사용).
+    """
+    def _unexpected_call():
+        raise AssertionError(
+            "가짜 auth.build_krx_session 이 호출됐다 — 이 테스트가 _build_session 을 "
+            "직접 목 처리했다면 격리가 깨진 것이다."
+        )
+
+    auth_ns = types.SimpleNamespace(
+        _auth_session=None, build_krx_session=build or _unexpected_call,
+    )
+    fake_mod = types.ModuleType("pykrx.website.comm")
+    fake_mod.auth = auth_ns  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pykrx.website.comm", fake_mod)
+    return auth_ns
+
+
 class TestSessionFailureCooldown:
-    """로그인 실패 후 쿨다운 — KRX 차단을 악화시키지 않기 위한 방어."""
+    """로그인 실패 후 쿨다운 — KRX 차단을 악화시키지 않기 위한 방어.
+
+    모듈 전역 `_session_fail_until` 대신 Task 1 의 원인별 쿨다운 레지스트리
+    (`errors.cooldown_remaining`/`note_failure`)를 쓰도록 이관됐다. "None 반환"이던
+    실패 신호도 `SourceAuthError` 로 바뀌었다 — 미설정과 실패를 더 이상 혼동하지 않는다.
+    """
 
     @pytest.fixture(autouse=True)
-    def _reset(self):
-        krx_index._session_fail_until = 0.0
+    def _reset(self, monkeypatch):
+        _fake_pykrx_auth_module(monkeypatch)
+        monkeypatch.setattr(krx_index.settings, "KRX_ID", "id")
+        monkeypatch.setattr(krx_index.settings, "KRX_PW", "pw")
+        clear_cooldown("krx")
         yield
-        krx_index._session_fail_until = 0.0
-
-    @staticmethod
-    def _install(monkeypatch, result):
-        """`from pykrx.website.comm import auth` 가 집어갈 대역 모듈을 심는다.
-
-        모듈이 아니라 그 안의 `auth` 속성을 가져가므로, 대역도 같은 모양이어야 한다.
-        """
-        import types
-
-        calls: list[int] = []
-
-        def build():
-            calls.append(1)
-            if isinstance(result, Exception):
-                raise result
-            return result
-
-        auth_ns = types.SimpleNamespace(_auth_session=None, build_krx_session=build)
-        mod = types.ModuleType("pykrx.website.comm")
-        mod.auth = auth_ns  # type: ignore[attr-defined]
-        monkeypatch.setitem(__import__("sys").modules, "pykrx.website.comm", mod)
-        monkeypatch.setattr(krx_index, "bounded_socket_timeout", _noop_ctx)
-        return calls
+        clear_cooldown("krx")
 
     def test_실패하면_쿨다운_동안_재로그인을_시도하지_않는다(self, monkeypatch):
         # _build_pit_pool 은 조회 구간의 월마다 index_members 를 부르므로, 실패마다
         # 재로그인하면 장기 백테스트 한 번에 로그인이 수십 번 나가 차단을 부른다.
-        calls = self._install(monkeypatch, RuntimeError("차단"))
+        calls: list[int] = []
+
+        def _boom():
+            calls.append(1)
+            raise RuntimeError("차단")
+
+        monkeypatch.setattr(krx_index, "_build_session", _boom)
         for _ in range(5):
-            assert krx_index._session() is None
+            with pytest.raises(SourceAuthError):
+                krx_index._session()
         assert len(calls) == 1  # 첫 시도만, 나머지는 쿨다운으로 생략
 
     def test_쿨다운이_지나면_다시_시도한다(self, monkeypatch):
-        calls = self._install(monkeypatch, RuntimeError("차단"))
-        assert krx_index._session() is None
-        krx_index._session_fail_until = 0.0  # 쿨다운 만료 흉내
-        assert krx_index._session() is None
+        calls: list[int] = []
+
+        def _boom():
+            calls.append(1)
+            raise RuntimeError("차단")
+
+        monkeypatch.setattr(krx_index, "_build_session", _boom)
+        with pytest.raises(SourceAuthError):
+            krx_index._session()
+        clear_cooldown("krx")  # 쿨다운 만료 흉내
+        with pytest.raises(SourceAuthError):
+            krx_index._session()
         assert len(calls) == 2
 
     def test_빈_세션_반환도_실패로_보고_쿨다운을_건다(self, monkeypatch):
         # 예외 없이 None 을 돌려주는 경로도 실패다 — 재시도 폭주를 막아야 한다.
-        calls = self._install(monkeypatch, None)
+        calls: list[int] = []
+
+        def _empty():
+            calls.append(1)
+            return None
+
+        monkeypatch.setattr(krx_index, "_build_session", _empty)
         for _ in range(3):
-            assert krx_index._session() is None
+            with pytest.raises(SourceAuthError):
+                krx_index._session()
         assert len(calls) == 1
+
+
+class TestTransportErrors:
+    """전송 계층 — KRX 는 에러 코드가 없어 응답 형태로 원인을 가른다."""
+
+    @staticmethod
+    def _sess(post):
+        class _S:
+            pass
+        s = _S()
+        s.post = post
+        return s
+
+    def test_HTTP200_비JSON은_차단으로_보고_Auth(self, monkeypatch):
+        """§44-1 에서 실제 관측한 동작 — 차단 시 JSON 이 아닌 HTML 안내 페이지가 온다."""
+        class _Html:
+            status_code = 200
+
+            def json(self):
+                raise ValueError("Expecting value: line 1 column 1")
+
+        sess = self._sess(lambda *a, **kw: _Html())
+        with pytest.raises(SourceAuthError):
+            krx_index._krx_rows(sess, {"trdDd": "20260801"}, "output", "구성종목")
+
+    def test_연결실패는_Unavailable(self):
+        def _boom(*a, **kw):
+            raise OSError("connection reset")
+
+        with pytest.raises(SourceUnavailableError):
+            krx_index._krx_rows(self._sess(_boom), {}, "output", "구성종목")
+
+    def test_5xx는_Unavailable(self):
+        class _R:
+            status_code = 503
+
+            def json(self):
+                return {}
+
+        with pytest.raises(SourceUnavailableError):
+            krx_index._krx_rows(self._sess(lambda *a, **kw: _R()), {}, "output", "구성종목")
+
+    def test_4xx는_Request(self):
+        class _R:
+            status_code = 400
+
+            def json(self):
+                return {}
+
+        with pytest.raises(SourceRequestError):
+            krx_index._krx_rows(self._sess(lambda *a, **kw: _R()), {}, "output", "구성종목")
+
+    def test_기대_키_부재는_Schema(self):
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {"unexpected": []}
+
+        with pytest.raises(SourceSchemaError):
+            krx_index._krx_rows(self._sess(lambda *a, **kw: _R()), {}, "output", "구성종목")
+
+    def test_정상JSON_빈리스트는_예외가_아니다(self):
+        """휴장일 — 소스가 '없다'고 정상 응답한 것이라 실패가 아니다."""
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {"output": []}
+
+        assert krx_index._krx_rows(self._sess(lambda *a, **kw: _R()), {}, "output", "구성종목") == []
+
+    def test_쿨다운_중이면_POST_자체를_하지_않는다(self):
+        """§44-1 실사례: 세션 쿠키는 살아 있고 응답만 차단 페이지 — 쿨다운은 여기서도
+        검사해야 한다. `_session()` 뒤에서만 검사하면, 이미 확보한 세션으로 반복 호출하는
+        7일 소급 루프가 쿨다운 중에도 매번 POST 를 내보낸다."""
+        note_failure(SourceAuthError("krx", "차단"))
+        calls: list[int] = []
+
+        def _post(*a, **kw):
+            calls.append(1)
+            raise AssertionError("쿨다운 중에는 POST 를 보내면 안 된다")
+
+        with pytest.raises(SourceAuthError):
+            krx_index._krx_rows(self._sess(_post), {}, "output", "구성종목")
+        assert calls == []  # POST 자체가 나가지 않았다
+
+
+class TestSessionAuth:
+    """미설정과 실패를 가른다 — 둘 다 None 이던 것이 §44-1 재발 경로였다."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self, monkeypatch):
+        # pykrx.website.comm 실제 임포트를 막는다(_fake_pykrx_auth_module 참고) —
+        # 이 컨테이너는 실제 KRX 시크릿을 갖고 있어, 막지 않으면 매 테스트가 실제 로그인을
+        # 시도한다.
+        _fake_pykrx_auth_module(monkeypatch)
+
+    def test_자격증명_미설정이면_None(self, monkeypatch):
+        monkeypatch.setattr(krx_index.settings, "KRX_ID", "")
+        monkeypatch.setattr(krx_index.settings, "KRX_PW", "")
+        assert krx_index._session() is None
+
+    def test_로그인_실패는_Auth_예외(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("로그인 실패")
+
+        monkeypatch.setattr(krx_index.settings, "KRX_ID", "id")
+        monkeypatch.setattr(krx_index.settings, "KRX_PW", "pw")
+        monkeypatch.setattr(krx_index, "_build_session", _boom)
+        with pytest.raises(SourceAuthError):
+            krx_index._session()
+
+    def test_빈_세션도_실패로_본다(self, monkeypatch):
+        monkeypatch.setattr(krx_index.settings, "KRX_ID", "id")
+        monkeypatch.setattr(krx_index.settings, "KRX_PW", "pw")
+        monkeypatch.setattr(krx_index, "_build_session", lambda: None)
+        with pytest.raises(SourceAuthError):
+            krx_index._session()
+
+    def test_실패_후_쿨다운이_걸린다(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("로그인 실패")
+
+        monkeypatch.setattr(krx_index.settings, "KRX_ID", "id")
+        monkeypatch.setattr(krx_index.settings, "KRX_PW", "pw")
+        monkeypatch.setattr(krx_index, "_build_session", _boom)
+        with pytest.raises(SourceAuthError):
+            krx_index._session()
+        assert cooldown_remaining("krx") > 0
+
+    def test_쿨다운_중에는_로그인을_시도하지_않는다(self, monkeypatch):
+        monkeypatch.setattr(krx_index.settings, "KRX_ID", "id")
+        monkeypatch.setattr(krx_index.settings, "KRX_PW", "pw")
+        note_failure(SourceAuthError("krx", "차단"))
+        calls = []
+        monkeypatch.setattr(krx_index, "_build_session", lambda: calls.append(1))
+        with pytest.raises(SourceAuthError):
+            krx_index._session()
+        assert calls == []
+
+    def test_유효_세션이_있어도_쿨다운_중이면_예외(self, monkeypatch):
+        """쿨다운 검사는 "이미 유효한 세션이면 재사용" 분기보다 앞서야 한다 — 뒤에 두면
+        캐시된 유효 세션이 있는 한 쿨다운이 아무것도 막지 못한다(§44-1: 세션 쿠키는 살아
+        있고 응답만 차단 페이지로 오는 형태)."""
+        monkeypatch.setattr(krx_index.settings, "KRX_ID", "id")
+        monkeypatch.setattr(krx_index.settings, "KRX_PW", "pw")
+        auth_ns = _fake_pykrx_auth_module(monkeypatch)
+        auth_ns._auth_session = types.SimpleNamespace(is_valid=lambda: True)
+        note_failure(SourceAuthError("krx", "차단"))
+        with pytest.raises(SourceAuthError):
+            krx_index._session()
+
+    def test_has_krx_auth_는_예외를_던지지_않는다(self, monkeypatch):
+        monkeypatch.setattr(krx_index.settings, "KRX_ID", "")
+        monkeypatch.setattr(krx_index.settings, "KRX_PW", "")
+        assert krx_index.has_krx_auth() is False
+
+
+class TestAggregateFailure:
+    """집계 계층 — '성공'은 응답 수신이지 데이터 획득이 아니다."""
+
+    @staticmethod
+    def _always_fail_session():
+        class _S:
+            def post(self, *a, **kw):
+                raise OSError("connection reset")
+        return _S()
+
+    @staticmethod
+    def _empty_ok_session(key):
+        """정상 JSON + 빈 리스트만 돌려주는 세션(휴장일 상황)."""
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {key: []}
+
+        class _S:
+            def post(self, *a, **kw):
+                return _R()
+        return _S()
+
+    def test_전량_실패면_index_members가_raise(self, monkeypatch):
+        monkeypatch.setattr(krx_index, "_session", lambda: self._always_fail_session())
+        with pytest.raises(SourceUnavailableError):
+            krx_index.index_members(date(2026, 8, 3))
+
+    def test_정상응답인데_전부_빈값이면_빈_리스트(self, monkeypatch):
+        """핵심 회귀 방지 — 휴장일 전량 빈 응답을 실패로 오인하면 안 된다."""
+        monkeypatch.setattr(krx_index, "_session", lambda: self._empty_ok_session("output"))
+        assert krx_index.index_members(date(2026, 8, 3)) == []
+
+    def test_중간_실패_후_성공하면_예외_없이_반환(self, monkeypatch):
+        """쿨다운 없는 원인(Schema)으로 실패한 뒤 성공하면 예외 없이 반환한다.
+
+        브리프 원안은 첫 실패를 OSError(→ SourceUnavailableError, 쿨다운 60초)로
+        시뮬레이션했지만, `_krx_rows` 는 쿨다운을 **거는 것도 검사하는 것도** 그
+        안에서 하므로(§44-1 재발 방지 설계 — Task 2, 이 태스크에서 손대지 않음)
+        쿨다운이 걸리는 원인으로 실패하면 같은 호출의 남은 소급 시도 전부가 실제
+        네트워크를 타기도 전에 즉시 같은 차단으로 막힌다 — "두 번째 시도가 실제로
+        성공한다"는 이 테스트의 전제 자체가 성립할 수 없다(직접 검증: OSError 로
+        재현하면 대표 예외가 SourceAuthError 로 raise 되고 두 번째 POST 는 아예
+        나가지 않는다). 쿨다운이 없는 원인(SourceSchemaError — 기대 키 누락)으로
+        바꿔야 이 테스트가 실제로 검증하려는 "일부 실패해도 소급 루프가 이어져
+        결국 성공하면 예외 없이 반환" 을 재현할 수 있다."""
+        calls = {"n": 0}
+
+        class _Bad:
+            status_code = 200
+
+            def json(self):
+                return {"unexpected": []}  # 기대 키(output) 없음 → SourceSchemaError(쿨다운 없음)
+
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {"output": [{"ISU_SRT_CD": "005930"}]}
+
+        class _S:
+            def post(self, *a, **kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return _Bad()
+                return _R()
+
+        monkeypatch.setattr(krx_index, "_session", lambda: _S())
+        assert krx_index.index_members(date(2026, 8, 3)) == ["005930"]
+
+    def test_미인증이면_예외가_아니라_빈_리스트(self, monkeypatch):
+        """미설정은 실패가 아니다 — preflight 가 필요한 곳에서 따로 막는다."""
+        monkeypatch.setattr(krx_index, "_session", lambda: None)
+        assert krx_index.index_members(date(2026, 8, 3)) == []
+
+    def test_market_caps_전량_실패면_raise(self, monkeypatch):
+        monkeypatch.setattr(krx_index, "_session", lambda: self._always_fail_session())
+        with pytest.raises(SourceUnavailableError):
+            krx_index.market_caps(date(2026, 8, 3))
+
+    def test_sector_map_전량_실패면_raise(self, monkeypatch):
+        monkeypatch.setattr(krx_index, "_session", lambda: self._always_fail_session())
+        with pytest.raises(SourceUnavailableError):
+            krx_index.sector_map(date(2026, 8, 3))
+
+    def test_all_listed_stocks_실패면_raise(self, monkeypatch):
+        monkeypatch.setattr(krx_index, "_session", lambda: self._always_fail_session())
+        with pytest.raises(SourceUnavailableError):
+            krx_index.all_listed_stocks()
+
+    def test_원인_혼재시_Auth가_대표(self, monkeypatch):
+        """원인이 섞이면 representative() 우선순위대로 Auth 가 대표가 된다.
+
+        브리프 원안은 첫 실패를 OSError(→ SourceUnavailableError, 쿨다운 60초)로
+        시뮬레이션했지만, 그러면 그 쿨다운 때문에 두 번째 시도 자체가 `_krx_rows`
+        안에서 즉시 차단돼(§44-1 재발 방지 — Task 2) 실제 HTML 응답에 절대 도달하지
+        못한다 — "혼재"가 아니라 첫 원인의 쿨다운 부작용만 관측하게 된다(대표 예외는
+        여전히 SourceAuthError 로 나오지만, 그건 "두 원인이 섞여서"가 아니라 그저
+        쿨다운 차단 메시지가 Auth 타입이기 때문이라 이 테스트의 취지—대표 선택 로직
+        검증—를 실제로 검증하지 못한다). 쿨다운 없는 원인(SourceSchemaError)을 먼저
+        일으켜야 두 번째 시도가 실제로 실행되어 진짜 혼재(Schema 다음 Auth)를
+        재현하고, representative() 의 우선순위(Auth > Schema)를 실제로 검증한다."""
+        calls = {"n": 0}
+
+        class _Bad:
+            status_code = 200
+
+            def json(self):
+                return {"unexpected": []}  # 기대 키 없음 → SourceSchemaError(쿨다운 없음)
+
+        class _Html:
+            status_code = 200
+
+            def json(self):
+                raise ValueError("not json")
+
+        class _S:
+            def post(self, *a, **kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return _Bad()
+                return _Html()
+
+        monkeypatch.setattr(krx_index, "_session", lambda: _S())
+        with pytest.raises(SourceAuthError):
+            krx_index.index_members(date(2026, 8, 3))

@@ -25,6 +25,7 @@ import pandas as pd
 
 from app.schemas.recommend import RecommendMember, RecommendOut
 from app.services.data import krx_index, opendart
+from app.services.data.errors import DataSourceError
 from app.services.metrics import (
     _approx_start,
     _build_krx_name_map,
@@ -130,8 +131,8 @@ def compute_kospi200_scored(as_of: date) -> RecommendOut:
     # ── OpenDART 퀄리티·성장 팩터(있으면) ──
     try:
         qmetrics = opendart.metrics_by_symbol(members, as_of)
-    except Exception:  # noqa: BLE001
-        logger.warning("추천 OpenDART 퀄리티/성장 팩터 조회 실패 — 중립 처리", exc_info=True)
+    except DataSourceError as e:
+        logger.error("추천 OpenDART 퀄리티/성장 팩터 조회 실패 — 중립 처리: %s", e)
         qmetrics = {}
     if qmetrics:
         qdf = pd.DataFrame.from_dict(qmetrics, orient="index")

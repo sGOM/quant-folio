@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 
+from app.services.data.errors import DataSourceError
+
 logger = logging.getLogger(__name__)
 
 
@@ -130,8 +132,8 @@ def _build_catalog() -> tuple[list[dict[str, str]], bool]:
         if krx_stocks:
             external_ok = True
             logger.info("종목 카탈로그: KRX MDC %d개 병합", len(krx_stocks))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("KRX 전종목 목록 조회 실패: %s", e)
+    except DataSourceError as e:
+        logger.error("종목 카탈로그: KRX 전종목 목록 조회 실패 — 폴백 소스로 진행: %s", e)
 
     # 2순위(보조): FDR KRX 상장목록. 성공하면 누락 종목을 보강한다(실패해도 무해).
     try:

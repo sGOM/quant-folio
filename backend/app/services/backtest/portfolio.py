@@ -791,14 +791,26 @@ def run_rebalance_backtest(
     if risk_layer.get("max_sector_pct") and not config.get("_sector_map"):
         from datetime import date as _date
 
+        from app.services.data.errors import DataSourceError
         from app.services.data.krx_index import sector_map as _sector_map_fn
 
-        smap = _sector_map_fn(as_of=_date.today())
+        try:
+            smap = _sector_map_fn(as_of=_date.today())
+        except DataSourceError as e:
+            # 업종 매핑 미확보(else 분기, 자료 없음)와 조회 자체의 실패(예외)는 다른
+            # 사건이다 — "매핑이 없었다"가 아니라 "조회가 실패했다"를 드러낸다. 둘 다
+            # 섹터 캡 미적용으로 수렴하는 것은 max_sector_pct 가 선택적 리스크 정교화라
+            # 매핑 부재가 원래도 설계된 저하이기 때문이다(§20).
+            logger.error("섹터 집중 한도용 업종 매핑 조회 실패 — 섹터 캡 미적용: %s", e)
+            smap = {}
+        else:
+            # 조회는 성공했는데 매핑이 빈 경우에만 '미확보'다. 실패는 위에서 이미 ERROR 로
+            # 남겼으므로 여기서 다시 WARNING 을 찍지 않는다(두 줄이 겹치면 구분이 흐려진다).
+            if not smap:
+                logger.warning("섹터 한도 설정됨(max_sector_pct)이나 업종 매핑 미확보 — 섹터 캡 미적용.")
         if smap:
             config = {**config, "_sector_map": smap}
             logger.info("섹터 집중 한도용 업종 매핑 로드: %d종목", len(smap))
-        else:
-            logger.warning("섹터 한도 설정됨(max_sector_pct)이나 업종 매핑 미확보 — 섹터 캡 미적용.")
 
     # 현금화 오버레이(레짐 필터) 준비
     rf = config.get("regime_filter") or {}

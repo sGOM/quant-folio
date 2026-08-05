@@ -16,7 +16,11 @@
 - 새 외부 의존성 없음 — httpx(기존 의존) + 표준 라이브러리(zipfile/xml)만 사용.
 - pykrx `_fetch_fundamentals` 와 같은 데이터 계층 규약: 블로킹(sync) 함수이므로
   호출자는 스레드풀(run_in_threadpool)에서 실행한다.
-- 실패/키부재/무자료 시 예외 대신 None 반환(호출부가 중립 처리하도록).
+- **미설정(키부재)·무자료(status 013)만 None**, 실제 실패는 `app.services.data.errors`
+  의 원인별 `DataSourceError` 로 raise 한다(전송 계층 `_get`/`corp_code_map`). 셋을 모두
+  None 으로 뭉개던 것이 위험했다 — 일일 20,000건 한도(status 020)를 소진하면 전 종목이
+  조용히 '재무 정보 없음'이 되어 백테스트가 빈 팩터 위에서 '성공'했다. "성공"은 예외
+  없이 응답을 받은 것이지 데이터를 얻은 것이 아니다(과거 구간 미제출 종목은 흔하다).
 
 PIT(룩어헤드 방지) 주의: 재무 지표를 백테스트에 쓸 때는 반드시 접수번호(rcept_no)
 의 공시일(접수일자) 이후 시점부터만 반영해야 한다. 이 클라이언트는 원자료(접수일자
@@ -34,6 +38,19 @@ from datetime import date
 import httpx
 
 from app.core.config import settings
+from app.services.data.errors import (
+    DataSourceError,
+    SourceAuthError,
+    SourceQuotaError,
+    SourceRequestError,
+    SourceSchemaError,
+    SourceUnavailableError,
+    classify_httpx,
+    cooldown_remaining,
+    note_failure,
+    representative,
+    seconds_until_midnight,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +67,24 @@ FS_SEPARATE = "OFS"
 # OpenDART 정상 응답 status. "013"=조회된 데이터 없음(정상적 무자료).
 _STATUS_OK = "000"
 _STATUS_NO_DATA = "013"
+
+#: OpenDART status 코드 → 실패 원인. 013(무자료)·000(정상)은 여기 없다(실패가 아니다).
+#: 목록에 없는 코드는 보수적으로 Unavailable 로 본다(재시도 가능 쪽).
+_STATUS_CAUSE: dict[str, type[DataSourceError]] = {
+    "010": SourceAuthError,          # 등록되지 않은 키
+    "011": SourceAuthError,          # 사용할 수 없는 키
+    "012": SourceAuthError,          # 접근할 수 없는 IP
+    "014": SourceRequestError,       # 파일이 존재하지 않음
+    "020": SourceQuotaError,         # 요청 제한 초과(일 20,000건)
+    "021": SourceQuotaError,         # 조회 가능한 회사 개수 초과
+    "100": SourceRequestError,       # 필드의 부적절한 값
+    "101": SourceRequestError,       # 부적절한 접근
+    "800": SourceUnavailableError,   # 시스템 점검
+    "900": SourceUnavailableError,   # 정의되지 않은 오류
+}
+
+#: 일일 호출 한도(20,000건) 초과 — 자정에 리셋되므로 쿨다운을 그때까지로 잡는다.
+_STATUS_DAILY_QUOTA = "020"
 
 _TIMEOUT = 15.0
 
@@ -73,15 +108,30 @@ def is_enabled() -> bool:
 
 
 def _get(path: str, params: dict) -> dict | None:
-    """OpenDART REST 호출 공통부. 키부재/에러/무자료 시 None 반환.
+    """OpenDART REST 호출 공통부.
+
+    **미설정과 무자료(013)만 None** 이다 — 둘 다 실패가 아니다(전자는 애초에 안 물어본
+    것, 후자는 소스가 '없다'고 정상 응답한 것). 그 외 실패는 원인별 예외를 던진다.
+    특히 일일 20,000건 한도 초과(020)가 무자료와 같은 None 이던 것이 위험했다 —
+    한도를 소진하면 전 종목이 조용히 '재무 정보 없음'이 됐다.
 
     :param path: 엔드포인트 경로(예: "fnlttSinglAcnt.json")
     :param params: crtfc_key 를 제외한 쿼리 파라미터
-    :return: status=="000" 인 응답 dict, 그 외에는 None
+    :return: status=="000" 인 응답 dict, 미설정·무자료(013)면 None
+    :raises DataSourceError: 전송 실패·인증/한도/요청 오류·시스템 점검
     """
     if not is_enabled():
         logger.debug("OpenDART 미활성(API 키 없음) — %s 조회 건너뜀", path)
         return None
+
+    # 쿨다운 검사는 호출 직전 한 곳(여기)에서만 한다 — 종목 루프는 _get 을 종목당
+    # 여러 번 부르므로, 한도 소진(020) 후에도 막지 않으면 남은 전 종목이 확정 실패인
+    # 요청을 계속 내보낸다. 이미 걸린 쿨다운을 검사만 하고 갱신하지는 않는다
+    # (여기서 note_failure 하면 호출이 들어오는 한 쿨다운이 끝없이 연장된다).
+    remaining = cooldown_remaining("dart")
+    if remaining > 0:
+        raise SourceQuotaError("dart", f"쿨다운 중 — 조회 생략({remaining:.0f}초 남음)")
+
     url = f"{settings.OPENDART_BASE_URL}/{path}"
     q = {"crtfc_key": settings.OPENDART_API_KEY, **params}
     try:
@@ -90,16 +140,31 @@ def _get(path: str, params: dict) -> dict | None:
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:  # noqa: BLE001
-        logger.warning("OpenDART 호출 실패(%s): %s", path, _mask_key(e))
-        return None
+        base = classify_httpx("dart", e)
+        # 어느 엔드포인트였는지를 메시지에 넣는다(args 를 직접 건드리지 않고 재구성).
+        # 마스킹은 **예외 메시지 자체**에 건다 — httpx 예외 텍스트에는 요청 URL 전체가
+        # 담길 수 있어 crtfc_key 가 섞인다. 로컬 로그 줄에만 걸면 이 예외를 다시 로깅하는
+        # 상위 호출자(집계·라우트)에서 키가 원문으로 새어나간다.
+        exc = type(base)(
+            "dart", _mask_key(f"{path} — {base.detail}"), retry_after=base.retry_after
+        )
+        note_failure(exc)
+        logger.warning("OpenDART 호출 실패: %s", exc)
+        raise exc from e
 
     status = str(data.get("status"))
     if status == _STATUS_OK:
         return data
     if status == _STATUS_NO_DATA:
-        return None
-    logger.warning("OpenDART 응답 오류(%s): status=%s msg=%s", path, status, data.get("message"))
-    return None
+        return None  # 무자료 — 실패가 아니다
+
+    cls = _STATUS_CAUSE.get(status, SourceUnavailableError)
+    # 일일 한도는 자정에 리셋되므로 그때까지 재조회해봐야 확정적으로 실패한다.
+    retry_after = seconds_until_midnight() if status == _STATUS_DAILY_QUOTA else None
+    exc = cls("dart", f"{path} status={status} msg={data.get('message')}", retry_after=retry_after)
+    note_failure(exc)
+    logger.warning("%s", _mask_key(exc))
+    raise exc
 
 
 def corp_code_map() -> dict[str, str] | None:
@@ -107,7 +172,13 @@ def corp_code_map() -> dict[str, str] | None:
 
     모든 재무제표 API 는 종목코드가 아니라 corp_code 를 요구하므로 선행 조회가
     필요하다. corpCode.xml(zip) 을 내려받아 파싱한다(비교적 크므로 호출부가
-    결과를 캐시할 것). 키부재/실패 시 None.
+    결과를 캐시할 것).
+
+    **미설정만 None** 이다(실패가 아니다 — 애초에 안 물어본 것). 다운로드·파싱 실패와
+    '상장사 0개'는 원인별 예외로 올린다 — 빈 매핑을 그대로 돌려주면 이후 모든 종목이
+    corp_code 를 못 찾아 조용히 '재무 정보 없음'이 된다.
+
+    :raises DataSourceError: 다운로드 실패(전송) 또는 XML 파싱 실패·빈 매핑(스키마)
     """
     if not is_enabled():
         return None
@@ -119,8 +190,13 @@ def corp_code_map() -> dict[str, str] | None:
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
             xml_bytes = zf.read(zf.namelist()[0])
     except Exception as e:  # noqa: BLE001
-        logger.warning("OpenDART corpCode 다운로드 실패: %s", _mask_key(e))
-        return None
+        # 마스킹은 로그가 아니라 **예외 자체**에 건다 — 상위 호출자가 이 예외를 다시
+        # 로깅해도 키가 새지 않아야 한다(_get 과 같은 방침).
+        base = classify_httpx("dart", e)
+        exc = type(base)("dart", _mask_key(base.detail), retry_after=base.retry_after)
+        note_failure(exc)
+        logger.warning("OpenDART corpCode 다운로드 실패: %s", exc)
+        raise exc from e
 
     import xml.etree.ElementTree as ET
 
@@ -134,8 +210,11 @@ def corp_code_map() -> dict[str, str] | None:
             if stock and corp:
                 mapping[stock.zfill(6)] = corp
     except ET.ParseError as e:
-        logger.warning("OpenDART corpCode 파싱 실패: %s", e)
-        return None
+        raise SourceSchemaError("dart", f"corpCode XML 파싱 실패: {e}") from e
+    if not mapping:
+        # 다운로드·파싱은 됐는데 상장사가 0개면 스키마가 바뀐 것이다. 빈 매핑을
+        # 그대로 돌려주면 전 종목이 조용히 '재무 정보 없음'이 된다.
+        raise SourceSchemaError("dart", "corpCode 에 상장사가 0개 — 응답 스키마 변경 의심")
     logger.info("OpenDART corpCode 매핑 로드: %d개 상장사", len(mapping))
     return mapping
 
@@ -501,7 +580,12 @@ _PERIOD_METRICS_CACHE: dict[tuple, dict[str, float | None]] = {}
 
 
 def cached_corp_code_map() -> dict[str, str] | None:
-    """corp_code_map 을 프로세스 내 1회만 로드해 재사용한다(대용량 zip 반복 다운로드 방지)."""
+    """corp_code_map 을 프로세스 내 1회만 로드해 재사용한다(대용량 zip 반복 다운로드 방지).
+
+    실패 시 corp_code_map 의 예외를 **그대로 전파한다** — 여기서 잡지 않는다.
+    예외가 나면 _CORP_MAP_CACHE 는 None 으로 남으므로 다음 호출에서 자연히
+    재시도된다(실패를 캐시하지 않는다).
+    """
     global _CORP_MAP_CACHE
     if _CORP_MAP_CACHE is None:
         _CORP_MAP_CACHE = corp_code_map()
@@ -659,8 +743,15 @@ def metrics_by_symbol(
     공시된 가장 최신 분기/연간 보고서를 정하고, 분기면 ttm_metrics 로 텔레스코핑한다.
     어느 경로든 미래참조는 없다 — as_of 시점에 이미
     공시가 끝난 보고서만 사용한다(latest_report_period/announcement_lagged_year).
-    키 미승인/조회 실패 종목은 결과에서 제외된다(호출부가 중립 처리). 블로킹
-    함수이므로 호출자는 스레드풀에서 실행한다.
+
+    실패 처리: 종목별 조회가 **한 번도 성공하지 못했을 때만** 대표 예외를 올린다.
+    여기서 '성공'은 예외 없이 응답을 받은 것이지 데이터를 얻은 것이 아니다 —
+    과거 구간에는 미제출(무자료) 종목이 흔해서, 무자료를 실패로 세면 정상
+    백테스트가 전량 실패로 죽는다. 부분 실패는 ERROR 로그로 드러내고 부분 결과를
+    돌려준다(무자료·미매핑 종목은 그냥 결과에서 빠진다). 키 미승인이면 빈 dict.
+    블로킹 함수이므로 호출자는 스레드풀에서 실행한다.
+
+    :raises DataSourceError: corp_code 매핑 실패, 또는 전 종목 조회 실패
     """
     if not is_enabled() or not codes:
         return {}
@@ -674,22 +765,36 @@ def metrics_by_symbol(
         year, reprt_code = announcement_lagged_year(as_of), REPORT_ANNUAL
 
     out: dict[str, dict[str, float | None]] = {}
+    errors: list[DataSourceError] = []
+    ok = 0  # '성공' = 예외 없이 응답을 받은 종목 수(무자료 포함)
     for raw in codes:
+        # 직전 종목이 쿨다운을 걸었으면 더 시도해도 _get 이 즉시 같은 차단을 재현할
+        # 뿐이다 — 계속 돌리면 대표 원인이 이 자기유발 차단(Quota)으로 오염된다
+        # (원래 원인이 Unavailable 이어도). 쿨다운 검사 자체는 _get 의 몫이므로
+        # 여기서는 "더 부르지 않는다"만 판단한다. 이미 성공한 종목의 결과는 out 에
+        # 남아 그대로 반환된다(부분 실패는 값을 돌려준다는 계약 유지).
+        if errors and cooldown_remaining("dart") > 0:
+            break
         code = str(raw).strip().zfill(6)
         corp = corp_map.get(code)
         if not corp:
             continue
-        if use_ttm:
-            m = dict(ttm_metrics(corp, year, reprt_code))
-            # 전년(동일 reprt_code 기준 TTM)·전전년으로 YoY 성장·흑자전환·F-Score·
-            # 만성적자 판정을 파생한다. 모두 이미 공시된 과거 구간이라 PIT 안전.
-            prev = ttm_metrics(corp, year - 1, reprt_code)
-            prev2 = ttm_metrics(corp, year - 2, reprt_code)
-        else:
-            m = dict(annual_metrics(corp, year))
-            # 전년 실적으로 YoY 성장·흑자전환(실적상향/턴어라운드 팩터)·F-Score를 파생한다.
-            prev = annual_metrics(corp, year - 1)
-            prev2 = annual_metrics(corp, year - 2)
+        try:
+            if use_ttm:
+                m = dict(ttm_metrics(corp, year, reprt_code))
+                # 전년(동일 reprt_code 기준 TTM)·전전년으로 YoY 성장·흑자전환·F-Score·
+                # 만성적자 판정을 파생한다. 모두 이미 공시된 과거 구간이라 PIT 안전.
+                prev = ttm_metrics(corp, year - 1, reprt_code)
+                prev2 = ttm_metrics(corp, year - 2, reprt_code)
+            else:
+                m = dict(annual_metrics(corp, year))
+                # 전년 실적으로 YoY 성장·흑자전환(실적상향/턴어라운드 팩터)·F-Score를 파생한다.
+                prev = annual_metrics(corp, year - 1)
+                prev2 = annual_metrics(corp, year - 2)
+        except DataSourceError as e:
+            errors.append(e)
+            continue
+        ok += 1
         m["op_growth"] = _yoy_growth(m.get("op_income"), prev.get("op_income"))
         m["net_growth"] = _yoy_growth(m.get("net_income"), prev.get("net_income"))
         m["turnaround"] = _turnaround_flag(m.get("net_income"), prev.get("net_income"))
@@ -701,6 +806,20 @@ def metrics_by_symbol(
         )
         if any(v is not None for v in m.values()):
             out[code] = m
+
+    # 전 종목이 '무자료'라 out 이 비는 것은 실패가 아니다(과거 구간엔 흔하다).
+    # 응답을 한 번도 못 받은 경우에만 실패로 본다. 쿨다운은 _get 이 이미 걸었다.
+    if ok == 0 and errors:
+        raise representative(errors)
+    if errors:
+        # 성공·실패·전체를 모두 찍는다. 실패 건수만 찍으면 쿨다운 단락으로 **시도조차
+        # 안 된** 종목이 '정상'으로 읽힌다(200종목 중 2번째에서 단락되면 "1건 실패"지만
+        # 데이터를 얻은 것도 1종목뿐이다). ok 는 예외로도 반환값으로도 드러나지 않아
+        # 이 로그가 유일한 관측 신호다.
+        logger.error(
+            "OpenDART 부분 실패 — 성공 %d / 실패 %d / 전체 %d(대표: %s)",
+            ok, len(errors), len(codes), errors[0],
+        )
     return out
 
 
@@ -887,11 +1006,15 @@ def pead_sue_by_symbol(
 
     미래참조 없음: 각 종목의 실제 접수일(rcept_dt) 기준으로 as_of 시점에 이미 공시된
     정기공시만 사용한다(disclosure_calendar 가 접수일을 공급, _pead_sue_one 이 컷).
-    키 미승인/조회 실패/서프라이즈 표본 부족 종목은 결과에서 제외된다(호출부가 중립
-    처리). 블로킹 함수이므로 호출자는 스레드풀에서 실행한다.
+
+    실패 처리는 metrics_by_symbol 과 동일하다 — 종목별 조회가 한 번도 성공하지
+    못했을 때만 대표 예외를 올린다. 서프라이즈 표본 부족(None)은 실패가 아니라
+    정상적인 '산출 불가'이며 결과에서 빠질 뿐이다. 블로킹 함수이므로 호출자는
+    스레드풀에서 실행한다.
 
     :param lookback_q: SUE 표준화 분모에 쓸 최근 서프라이즈 시계열 길이(분기 수).
     :param min_obs: SUE 산출에 필요한 최소 유효 서프라이즈 개수(신뢰도 하한).
+    :raises DataSourceError: corp_code 매핑 실패, 또는 전 종목 조회 실패
     """
     if not is_enabled() or not codes:
         return {}
@@ -899,12 +1022,34 @@ def pead_sue_by_symbol(
     if not corp_map:
         return {}
     out: dict[str, float] = {}
+    errors: list[DataSourceError] = []
+    ok = 0  # '성공' = 예외 없이 응답을 받은 종목 수(표본 부족 포함)
     for raw in codes:
+        # metrics_by_symbol 과 같은 이유의 단락 — 자기유발 차단(Quota)이 대표 원인을
+        # 오염시키지 않게 한다. 이미 성공한 종목의 SUE 는 out 에 남는다.
+        if errors and cooldown_remaining("dart") > 0:
+            break
         code = str(raw).strip().zfill(6)
         corp = corp_map.get(code)
         if not corp:
             continue
-        sue = _pead_sue_one(corp, as_of, lookback_q, min_obs)
+        try:
+            sue = _pead_sue_one(corp, as_of, lookback_q, min_obs)
+        except DataSourceError as e:
+            errors.append(e)
+            continue
+        ok += 1
         if sue is not None:
             out[code] = sue
+
+    # 표본 부족으로 out 이 비는 것은 실패가 아니다. 쿨다운은 _get 이 이미 걸었다.
+    if ok == 0 and errors:
+        raise representative(errors)
+    if errors:
+        # metrics_by_symbol 과 같은 이유로 성공·실패·전체를 모두 찍는다(단락으로
+        # 건너뛴 종목이 로그에서 '정상'으로 보이면 안 된다).
+        logger.error(
+            "OpenDART PEAD 부분 실패 — 성공 %d / 실패 %d / 전체 %d(대표: %s)",
+            ok, len(errors), len(codes), errors[0],
+        )
     return out

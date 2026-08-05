@@ -1,14 +1,30 @@
-"""OpenDART 클라이언트 — 파생지표 계산(derive_metrics) 및 graceful degradation 검증.
+"""OpenDART 클라이언트 — 파생지표 계산(derive_metrics)·status 원인 분류 검증.
 
 네트워크 없이 도는 단위테스트다. 실제 OpenDART 응답(fnlttSinglAcntAll)의 계정
 구조를 축약한 fixture 로 account_id 우선 매칭·CIS 폴백·부호·경계값을 확인한다.
 실측 교차검증(삼성전자·현대차·NAVER 실제 수치 일치)은 구현 시 수동으로 완료했다.
+전송 계층(`_get`)의 status 코드 원인 분류는 httpx.Client 를 목으로 갈아끼워
+검증한다 — **실제 OpenDART 를 호출하지 않는다**.
 """
+import io
+import logging
+import zipfile
 from datetime import date
 
+import httpx
 import pytest
 
 from app.services.data import opendart
+from app.services.data.errors import (
+    SourceAuthError,
+    SourceQuotaError,
+    SourceRequestError,
+    SourceSchemaError,
+    SourceUnavailableError,
+    clear_cooldown,
+    cooldown_remaining,
+    note_failure,
+)
 
 
 def _row(sj, aid, nm, amt):
@@ -380,3 +396,386 @@ def test_metrics_by_symbol_use_ttm_false_uses_annual_path(monkeypatch):
     out = opendart.metrics_by_symbol(["000000"], date(2025, 5, 20), use_ttm=False)
     assert "000000" in out
     assert set(calls) == {2024, 2023, 2022}  # announcement_lagged_year 기반 연간만
+
+
+# ─────────────────── 전송 계층 status 코드 원인 분류 ───────────────────
+
+
+def _mock_status(monkeypatch, status: str):
+    """지정 status 를 돌려주는 httpx.Client 목(실제 네트워크를 타지 않는다)."""
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"status": status, "message": "목"}
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, *a, **kw):
+            return _Resp()
+
+    monkeypatch.setattr(opendart.httpx, "Client", _Client)
+
+
+class TestStatusClassification:
+    """OpenDART 응답 본문 status 코드 → 원인별 예외 매핑.
+
+    autouse 픽스처를 클래스 안에 두는 이유: 모듈 전역으로 두면 `is_enabled` 를 True 로
+    고정해 미설정 동작을 검증하는 `test_disabled_without_key` 를 깨뜨린다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+        clear_cooldown("dart")
+        yield
+        clear_cooldown("dart")
+
+    @pytest.mark.parametrize("status", ["010", "011", "012"])
+    def test_키_문제는_Auth(self, monkeypatch, status):
+        _mock_status(monkeypatch, status)
+        with pytest.raises(SourceAuthError):
+            opendart._get("fnlttSinglAcnt.json", {})
+
+    @pytest.mark.parametrize("status", ["020", "021"])
+    def test_한도_초과는_Quota(self, monkeypatch, status):
+        _mock_status(monkeypatch, status)
+        with pytest.raises(SourceQuotaError):
+            opendart._get("fnlttSinglAcnt.json", {})
+
+    def test_일일한도는_다음_자정까지_쿨다운(self, monkeypatch):
+        """실제 자정까지의 초를 쓰면 자정 직전에 실행될 때 흔들리므로 고정한다."""
+        monkeypatch.setattr(opendart, "seconds_until_midnight", lambda: 7200.0)
+        _mock_status(monkeypatch, "020")
+        with pytest.raises(SourceQuotaError):
+            opendart._get("fnlttSinglAcnt.json", {})
+        assert 7100 < cooldown_remaining("dart") <= 7200  # 클래스 기본값(300s)이 아니다
+
+    @pytest.mark.parametrize("status", ["014", "100", "101"])
+    def test_잘못된_요청은_Request(self, monkeypatch, status):
+        """014(파일 부재)·100(부적절한 값)·101(부적절한 접근) — 모두 우리 요청이 잘못된 것."""
+        _mock_status(monkeypatch, status)
+        with pytest.raises(SourceRequestError):
+            opendart._get("fnlttSinglAcnt.json", {})
+
+    def test_시스템_점검은_Unavailable(self, monkeypatch):
+        _mock_status(monkeypatch, "800")
+        with pytest.raises(SourceUnavailableError):
+            opendart._get("fnlttSinglAcnt.json", {})
+
+    def test_미지_코드는_보수적으로_Unavailable(self, monkeypatch):
+        _mock_status(monkeypatch, "777")
+        with pytest.raises(SourceUnavailableError):
+            opendart._get("fnlttSinglAcnt.json", {})
+
+    def test_무자료_013은_예외가_아니라_None(self, monkeypatch):
+        """소스가 '없다'고 정상 응답한 것 — 과거 구간엔 이런 종목이 흔하다."""
+        _mock_status(monkeypatch, "013")
+        assert opendart._get("fnlttSinglAcnt.json", {}) is None
+
+    def test_정상_000은_데이터_반환(self, monkeypatch):
+        _mock_status(monkeypatch, "000")
+        assert opendart._get("fnlttSinglAcnt.json", {})["status"] == "000"
+
+    def test_미설정이면_예외가_아니라_None(self, monkeypatch):
+        monkeypatch.setattr(opendart, "is_enabled", lambda: False)
+        assert opendart._get("fnlttSinglAcnt.json", {}) is None
+
+    def test_쿨다운_중이면_요청_자체를_하지_않는다(self, monkeypatch):
+        """쿨다운 가드의 값어치는 예외를 던지는 것이 아니라 **전송을 막는 것**이다.
+
+        종목 루프는 _get 을 종목당 여러 번 부른다 — 일일 한도(020)를 소진한 뒤에도
+        막지 않으면 남은 전 종목이 확정 실패인 요청을 그대로 내보내 한도 차단을
+        스스로 연장한다. 그래서 '요청이 0건'을 직접 단언한다.
+        (선례: test_krx_index.py 의 test_쿨다운_중이면_POST_자체를_하지_않는다)
+        """
+        note_failure(SourceQuotaError("dart", "한도 소진"))
+        calls: list[int] = []
+
+        class _Client:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, *a, **kw):
+                calls.append(1)
+                raise AssertionError("쿨다운 중에는 요청을 보내면 안 된다")
+
+        monkeypatch.setattr(opendart.httpx, "Client", _Client)
+        with pytest.raises(SourceQuotaError):
+            opendart._get("fnlttSinglAcnt.json", {})
+        assert calls == []  # 요청 자체가 나가지 않았다
+
+
+class TestAggregateFailure:
+    """집계 계층 — '성공'은 응답 수신이지 데이터 획득이 아니다.
+
+    과거 백테스트 구간에는 재무제표 미제출 종목이 흔하다. 무자료(013→None)를
+    실패로 세면 정상 백테스트가 '전량 실패'로 죽는다. 그래서 전량 실패
+    (성공 0 & 실패 ≥1)일 때만 raise 하고, 부분 실패는 부분 결과를 돌려준다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        # is_enabled 를 고정하지 않으면 컨테이너의 키 주입 여부에 따라 결과가 갈리고,
+        # 키가 있으면 실제 OpenDART 를 호출하게 된다. corp_map 도 함께 대역으로 건다.
+        monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            opendart,
+            "cached_corp_code_map",
+            lambda: {"005930": "00126380", "000660": "00164779", "035720": "00164742"},
+        )
+        clear_cooldown("dart")
+        yield
+        clear_cooldown("dart")
+
+    def test_전_종목_무자료면_빈_dict(self, monkeypatch):
+        """실패가 아니다 — 정상 백테스트가 죽으면 안 된다."""
+        monkeypatch.setattr(opendart, "annual_metrics", lambda c, y: {"roe": None})
+        out = opendart.metrics_by_symbol(["005930", "000660"], date(2026, 8, 3))
+        assert out == {}
+
+    def test_전_종목_실패면_raise(self, monkeypatch):
+        def _boom(corp, year):
+            raise SourceUnavailableError("dart", "타임아웃")
+
+        monkeypatch.setattr(opendart, "annual_metrics", _boom)
+        with pytest.raises(SourceUnavailableError):
+            opendart.metrics_by_symbol(["005930", "000660"], date(2026, 8, 3))
+
+    def test_일부만_실패하면_부분_결과(self, monkeypatch):
+        """`_half` 는 note_failure 를 부르지 않아 쿨다운이 안 걸린다 — 실패 종목 이후에도
+        루프가 끝까지 돈다. 실제 `_get` 은 실패 시 쿨다운을 걸므로 현실의 '부분 결과'는
+        항상 **첫 실패 지점까지**다(그 경로는 TestAggregateCooldownShortCircuit 이 덮는다).
+        여기서 고정하는 것은 '실패가 섞여도 raise 하지 않고 값을 돌려준다'는 계약뿐이다.
+        """
+        def _half(corp, year):
+            if corp == "00126380":
+                return {"roe": 0.12}
+            raise SourceUnavailableError("dart", "타임아웃")
+
+        monkeypatch.setattr(opendart, "annual_metrics", _half)
+        out = opendart.metrics_by_symbol(["005930", "000660"], date(2026, 8, 3))
+        assert "005930" in out and "000660" not in out
+
+    def test_PEAD_전_종목_표본부족은_빈_dict(self, monkeypatch):
+        """SUE 표본 부족(None)은 실패가 아니라 정상적인 '산출 불가'다."""
+        monkeypatch.setattr(opendart, "_pead_sue_one", lambda *a: None)
+        assert opendart.pead_sue_by_symbol(["005930", "000660"], date(2026, 8, 3)) == {}
+
+    def test_PEAD_전_종목_실패면_raise(self, monkeypatch):
+        def _boom(*a):
+            raise SourceUnavailableError("dart", "타임아웃")
+
+        monkeypatch.setattr(opendart, "_pead_sue_one", _boom)
+        with pytest.raises(SourceUnavailableError):
+            opendart.pead_sue_by_symbol(["005930", "000660"], date(2026, 8, 3))
+
+    def test_PEAD_일부만_실패하면_부분_결과(self, monkeypatch):
+        def _half(corp, as_of, lookback_q, min_obs):
+            if corp == "00126380":
+                return 1.5
+            raise SourceUnavailableError("dart", "타임아웃")
+
+        monkeypatch.setattr(opendart, "_pead_sue_one", _half)
+        out = opendart.pead_sue_by_symbol(["005930", "000660"], date(2026, 8, 3))
+        assert out == {"005930": 1.5}
+
+
+class TestAggregateCooldownShortCircuit:
+    """쿨다운이 걸린 뒤에는 남은 종목을 더 부르지 않는다.
+
+    첫 실패가 쿨다운을 걸면 이후 종목의 `_get` 은 네트워크 전에 차단돼
+    `SourceQuotaError("쿨다운 중 …")` 를 던진다. 계속 돌리면 이 **자기유발** 예외가
+    쌓여 `representative` 의 우선순위(Quota > Unavailable)를 타고 대표 원인이 되고,
+    운영자는 네트워크 장애를 '한도 초과'로 오독한다. 선례: krx_index.py 의 집계들.
+
+    대역은 전송 계층(`_get`)의 두 가지 행동을 그대로 흉내낸다 —
+    실패 시 `note_failure`, 쿨다운 중이면 Quota 로 즉시 거절.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            opendart,
+            "cached_corp_code_map",
+            lambda: {"005930": "00126380", "000660": "00164779", "035720": "00164742"},
+        )
+        clear_cooldown("dart")
+        yield
+        clear_cooldown("dart")
+
+    @staticmethod
+    def _transport(calls: list[str], ok_corp: str | None = None):
+        """`_get` 의 쿨다운 가드·note_failure 를 흉내내는 종목 단위 대역."""
+
+        def _fake(corp, *_a):
+            calls.append(corp)
+            if cooldown_remaining("dart") > 0:
+                raise SourceQuotaError("dart", "쿨다운 중 — 조회 생략")
+            if corp == ok_corp:
+                return {"roe": 0.12}
+            exc = SourceUnavailableError("dart", "타임아웃")
+            note_failure(exc)
+            raise exc
+
+        return _fake
+
+    def test_대표_원인이_자기유발_Quota_로_오염되지_않는다(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(opendart, "annual_metrics", self._transport(calls))
+        with pytest.raises(SourceUnavailableError):  # Quota 가 아니다
+            opendart.metrics_by_symbol(["005930", "000660", "035720"], date(2026, 8, 3))
+        assert calls == ["00126380"]  # 첫 실패 이후 아무도 더 부르지 않았다
+
+    def test_단락해도_이미_성공한_종목의_결과는_살아남는다(self, monkeypatch):
+        """조기 break 가 '부분 실패는 값을 반환한다' 계약을 깨면 안 된다."""
+        calls: list[str] = []
+        monkeypatch.setattr(
+            opendart, "annual_metrics", self._transport(calls, ok_corp="00126380")
+        )
+        out = opendart.metrics_by_symbol(["005930", "000660", "035720"], date(2026, 8, 3))
+        assert "005930" in out  # 쿨다운 전에 성공한 종목은 보존
+        assert "00164742" not in calls  # 세 번째 종목은 시도조차 하지 않는다
+
+    def test_부분_실패_로그가_건너뛴_종목을_감추지_않는다(self, monkeypatch, caplog):
+        """단락이 걸리면 '실패 N / 전체 M' 만으로는 운영자가 나머지를 정상으로 오독한다.
+
+        200 종목 중 2번째에서 단락되면 실패는 1건뿐이지만 데이터를 얻은 것도 1종목이고
+        198 종목은 **시도조차 안 됐다**. ok(성공 수)가 예외도 반환값도 아닌 이 로그에만
+        드러나므로, 셋을 함께 찍지 않으면 이 스펙이 없애려는 조용한 실패를 로그가
+        정상으로 포장한다.
+        """
+        calls: list[str] = []
+        monkeypatch.setattr(
+            opendart, "annual_metrics", self._transport(calls, ok_corp="00126380")
+        )
+        with caplog.at_level(logging.ERROR, logger="app.services.data.opendart"):
+            opendart.metrics_by_symbol(["005930", "000660", "035720"], date(2026, 8, 3))
+        # 전체 3 중 성공 1 — 나머지 2 를 '정상'으로 읽을 수 없어야 한다.
+        assert "성공 1 / 실패 1 / 전체 3" in caplog.text
+
+    def test_PEAD_도_같은_단락을_한다(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(opendart, "_pead_sue_one", self._transport(calls))
+        with pytest.raises(SourceUnavailableError):
+            opendart.pead_sue_by_symbol(["005930", "000660", "035720"], date(2026, 8, 3))
+        assert calls == ["00126380"]
+
+
+class TestCorpCodeMap:
+    """corpCode 매핑의 실패 분기 — 빈 매핑을 조용히 돌려주지 않는지가 핵심.
+
+    corp_code 매핑이 비면 이후 모든 종목이 corp_code 를 못 찾아 전 종목이 조용히
+    '재무 정보 없음'이 된다. 이 스펙 전체가 없애려는 실패 형태가 바로 그것이다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+        clear_cooldown("dart")
+        yield
+        clear_cooldown("dart")
+
+    @staticmethod
+    def _mock_zip(monkeypatch, xml: bytes):
+        """corpCode.xml(zip) 을 돌려주는 httpx.Client 목(실제 네트워크를 타지 않는다)."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("CORPCODE.xml", xml)
+        payload = buf.getvalue()
+
+        class _Resp:
+            status_code = 200
+            content = payload
+
+            def raise_for_status(self):
+                return None
+
+        class _Client:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, *a, **kw):
+                return _Resp()
+
+        monkeypatch.setattr(opendart.httpx, "Client", _Client)
+
+    def test_다운로드_실패는_Unavailable(self, monkeypatch):
+        class _Client:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, *a, **kw):
+                raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(opendart.httpx, "Client", _Client)
+        with pytest.raises(SourceUnavailableError):
+            opendart.corp_code_map()
+
+    def test_XML_파싱_실패는_Schema(self, monkeypatch):
+        self._mock_zip(monkeypatch, b"<result><list>")  # 닫히지 않은 태그
+        with pytest.raises(SourceSchemaError):
+            opendart.corp_code_map()
+
+    def test_상장사_0개는_Schema(self, monkeypatch):
+        """다운로드·파싱은 됐는데 상장사가 0개 — 스키마 변경으로 보고 raise 한다.
+
+        빈 dict 를 그대로 돌려주면 호출부는 '정상적으로 조회했는데 매칭이 없다'로
+        읽어, 전 종목 재무 지표가 조용히 사라진다.
+        """
+        # stock_code 가 공백인 항목만(비상장·상폐) → 상장사 매핑이 0개가 된다.
+        self._mock_zip(monkeypatch, (
+            "<result>"
+            "<list><corp_code>00126380</corp_code>"
+            "<corp_name>비상장회사</corp_name><stock_code> </stock_code></list>"
+            "</result>"
+        ).encode("utf-8"))
+        with pytest.raises(SourceSchemaError):
+            opendart.corp_code_map()
+
+    def test_정상_매핑은_그대로_반환(self, monkeypatch):
+        """빈 매핑 가드가 무조건 raise 하는 것이 아님을 고정한다(상장사 0개 테스트의 대조군)."""
+        self._mock_zip(monkeypatch, (
+            "<result>"
+            "<list><corp_code>00126380</corp_code>"
+            "<corp_name>삼성전자</corp_name><stock_code>005930</stock_code></list>"
+            "<list><corp_code>00164779</corp_code>"
+            "<corp_name>비상장회사</corp_name><stock_code> </stock_code></list>"
+            "</result>"
+        ).encode("utf-8"))
+        assert opendart.corp_code_map() == {"005930": "00126380"}
+
+    def test_미설정이면_예외가_아니라_None(self, monkeypatch):
+        monkeypatch.setattr(opendart, "is_enabled", lambda: False)
+        assert opendart.corp_code_map() is None

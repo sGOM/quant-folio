@@ -26,6 +26,11 @@ from app.api.routes import (
 )
 from app.core.config import settings
 from app.core.redis import redis_client
+from app.services.data.errors import (
+    DataSourceError,
+    SourceRequestError,
+    SourceSchemaError,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -52,6 +57,49 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _data_source_http_status(exc: DataSourceError) -> tuple[int, str]:
+    """외부 데이터 소스 실패의 원인을 HTTP 상태로 옮긴다.
+
+    **전부 503 으로 뭉개지 않는다.** 5갈래 원인 분류를 만든 목적이 "재시도해도 되는가 /
+    사람이 고쳐야 하는가"를 가르는 것인데, HTTP 계층에서 다시 하나로 합치면 상태 코드만
+    보고 대응하는 알림·온콜이 "외부 장애, 복구 대기"로 오판해 정작 필요한 코드 핫픽스를
+    미룬다.
+    """
+    if isinstance(exc, SourceRequestError):
+        # 정의상 우리가 잘못 보낸 것이다(부적절한 파라미터·접근). 외부는 멀쩡하다.
+        return 500, "외부 데이터 소스 요청이 잘못됐습니다."
+    if isinstance(exc, SourceSchemaError):
+        # 외부는 응답했는데 우리가 해석하지 못한다(상류 계약 변경) — 게이트웨이가 상류에서
+        # 유효하지 않은 응답을 받은 상황이므로 502.
+        return 502, "외부 데이터 소스 응답을 해석할 수 없습니다."
+    # 인증 차단·한도 소진·연결 실패 — 의존성을 쓸 수 없는 상태.
+    return 503, "외부 데이터 소스를 사용할 수 없습니다."
+
+
+@app.exception_handler(DataSourceError)
+async def data_source_error_handler(request: Request, exc: DataSourceError) -> JSONResponse:
+    """외부 데이터 소스(KRX/DART/KOFIA) 실패를 원인별 HTTP 상태로 매핑한다.
+
+    대부분은 서버 버그가 아니라 의존성 장애이므로 500 이 아니라 503 이다. 다만 원인에
+    따라 귀속이 다르다 — `_data_source_http_status` 참고. 어느 소스(`source`)·원인
+    (`cause`)이고 재시도해도 되는지(`retryable`)를 응답에 실어, 상태 코드만으로 판단하지
+    않아도 되게 한다.
+    """
+    status_code, detail = _data_source_http_status(exc)
+    logger.error(
+        "외부 데이터 소스 실패 (%s → %d): %s", request.url.path, status_code, exc
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "detail": detail,
+            "source": exc.source,
+            "cause": type(exc).__name__,
+            "retryable": exc.retryable,
+        },
+    )
 
 
 @app.exception_handler(Exception)
