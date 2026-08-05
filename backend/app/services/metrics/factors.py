@@ -12,6 +12,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from app.services.data.errors import DataSourceError
 from app.services.data.loader import bounded_socket_timeout
 from app.services.metrics.common import _approx_start, _is_nan, _ymd
 from app.services.metrics.fetch import (
@@ -659,7 +660,6 @@ def compute_universe_scores(
     # 중립 처리된다. factor_weights.quality>0 인 전략에서만 실제로 점수에 반영된다.
     try:
         from app.services.data import opendart
-        from app.services.data.errors import DataSourceError
 
         qmetrics = opendart.metrics_by_symbol(codes, as_of, use_ttm=financial_period == "ttm")
     except DataSourceError as e:
@@ -679,8 +679,7 @@ def compute_universe_scores(
     if neutralize in ("size", "size_sector"):
         try:
             from app.services.data import krx_index
-            from app.services.data.errors import DataSourceError
-
+    
             caps = krx_index.market_caps(as_of)
         except DataSourceError as e:
             logger.error("사이즈 중립화용 시가총액 조회 실패 — 중립화 생략: %s", e)
@@ -694,8 +693,7 @@ def compute_universe_scores(
     if neutralize in ("sector", "size_sector"):
         try:
             from app.services.data import krx_index
-            from app.services.data.errors import DataSourceError
-
+    
             smap = krx_index.sector_map(as_of)
         except DataSourceError as e:
             logger.error("섹터 중립화용 업종분류 조회 실패 — 중립화 생략: %s", e)

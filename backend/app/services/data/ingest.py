@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Strategy
+from app.services.data.errors import DataSourceError
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,6 @@ async def build_universe(db: AsyncSession, index: str = "KOSPI200") -> list[str]
     """
     codes: set[str] = set()
     try:
-        from app.services.data.errors import DataSourceError
         from app.services.data.krx_index import index_members
 
         codes.update(await asyncio.to_thread(index_members, date.today(), index))

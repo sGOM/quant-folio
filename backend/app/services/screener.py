@@ -105,6 +105,8 @@ def screen_turnaround(
 
     # ── 3) OpenDART 재무 하드 필터 + 종합점수 ──
     qmetrics: dict = {}
+    # 조회 실패로 하드 필터를 건너뛰었는지. 응답에 실어 사용자가 정상 결과와 구분하게 한다.
+    financial_filter_applied = True
     if candidates:
         try:
             qmetrics = opendart.metrics_by_symbol(candidates, as_of)
@@ -116,6 +118,7 @@ def screen_turnaround(
                 "스크리너 OpenDART 조회 실패 — 재무 하드 필터를 적용하지 못한 채 반환한다: %s", e
             )
             qmetrics = {}
+            financial_filter_applied = False
 
     seed_names = _build_name_map()
     krx_names = _build_krx_name_map(pc_5d, pc_60d)
@@ -172,7 +175,8 @@ def screen_turnaround(
     items = items[:top_n]
     return TurnaroundScreenOut(
         as_of=as_of, market=market, scanned=scanned, count=len(items),
-        opendart_enabled=opendart.is_enabled(), items=items,
+        opendart_enabled=opendart.is_enabled(),
+        financial_filter_applied=financial_filter_applied, items=items,
     )
 
 

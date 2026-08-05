@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 
+from app.services.data.errors import DataSourceError
+
 logger = logging.getLogger(__name__)
 
 
@@ -123,7 +125,6 @@ def _build_catalog() -> tuple[list[dict[str, str]], bool]:
     # pykrx/FDR 의 '오늘' 기반 조회가 실패하는 환경에서도 이름을 확보하는 신뢰 소스.
     try:
         from app.services.data import krx_index
-        from app.services.data.errors import DataSourceError
 
         krx_stocks = krx_index.all_listed_stocks()
         for s in krx_stocks:

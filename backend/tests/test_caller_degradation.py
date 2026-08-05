@@ -362,3 +362,61 @@ class TestLiveSectorMapDegradation:
         monkeypatch.setattr(krx_index, "sector_map", _bug)
         with pytest.raises(TypeError):
             await self._runner()._get_sector_map()
+
+
+# ───── screener.py: 저하 사실이 응답에 드러나는가 — Task 7 리뷰 M-1 ─────
+
+
+class TestScreenerDegradationIsVisibleInResponse:
+    """하드 필터를 건너뛴 결과와 정상 결과가 응답에서 구분돼야 한다.
+
+    로그에만 남기면 사용자는 `opendart_enabled=True` 인 정상 응답을 받으면서 걸러졌어야
+    할 종목이 섞인 목록을 본다 — 이 작업이 없애려는 §44-1 의 형태 그대로다.
+    """
+
+    @staticmethod
+    def _stub_market(monkeypatch):
+        """screen_turnaround 가 후보 1종목을 만들도록 하는 최소 대역(전부 목 — 실 조회 없음)."""
+        from app.services import screener as sc
+
+        monkeypatch.setattr(
+            sc, "_fetch_market_cap",
+            lambda ymd, mkts: pd.DataFrame({"시가총액": {"005930": 5.0e10}}),
+        )
+
+        # 5일창은 일평균 10억, 60일창은 일평균 5억 → 유동성(≥3억)·급증(2.0배≥1.5) 통과.
+        calls = {"n": 0}
+
+        def _fake_price_change(start, end, mkts):
+            calls["n"] += 1
+            total = 5 * 1.0e9 if calls["n"] == 1 else 60 * 5.0e8
+            return pd.DataFrame({"등락률": {"005930": 1.0}, "거래대금": {"005930": total}})
+
+        monkeypatch.setattr(sc, "_fetch_price_change", _fake_price_change)
+        monkeypatch.setattr(sc, "_fetch_fundamentals", lambda ymd, mkts: pd.DataFrame())
+        # 종목명 해석은 이 계약과 무관한데 실제 KRX/FDR 조회를 탄다 — 반드시 대역화한다.
+        monkeypatch.setattr(sc, "_build_name_map", lambda: {"005930": "삼성전자"})
+        monkeypatch.setattr(sc, "_build_krx_name_map", lambda a, b: {})
+        return sc
+
+    def test_조회_실패시_필터_미적용이_응답에_드러난다(self, monkeypatch):
+        sc = self._stub_market(monkeypatch)
+
+        def _boom(codes, as_of):
+            raise SourceUnavailableError("dart", "연결 실패")
+
+        monkeypatch.setattr(sc.opendart, "metrics_by_symbol", _boom)
+        # as_of 를 명시한다 — 생략하면 _last_business_day() 가 pykrx 지수 조회(실 네트워크)를 탄다.
+        out = sc.screen_turnaround(as_of=date(2026, 7, 1), market="ALL")
+
+        assert out.scanned == 1  # 후보가 실제로 생겼는지(대역이 무력하지 않은지) 확인
+        assert out.financial_filter_applied is False
+
+    def test_정상_조회면_필터_적용으로_표시된다(self, monkeypatch):
+        sc = self._stub_market(monkeypatch)
+        monkeypatch.setattr(sc.opendart, "metrics_by_symbol", lambda codes, as_of: {})
+        # as_of 를 명시한다 — 생략하면 _last_business_day() 가 pykrx 지수 조회(실 네트워크)를 탄다.
+        out = sc.screen_turnaround(as_of=date(2026, 7, 1), market="ALL")
+
+        assert out.scanned == 1
+        assert out.financial_filter_applied is True

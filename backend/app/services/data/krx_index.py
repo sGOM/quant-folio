@@ -206,7 +206,19 @@ def _krx_rows(sess, payload: dict, key: str, label: str, timeout: float = 20) ->
         raise _fail(
             SourceSchemaError("krx", f"{label} 응답에 '{key}' 키가 없다: {str(data)[:120]}")
         )
-    return data.get(key) or []
+    rows = data.get(key) or []
+    # 키가 있어도 값의 **형태**까지 맞는지 여기서 확정한다. 호출자들은 반환 직후
+    # `r.get(...)` 으로 파싱하는데 그 구간은 이 try 밖이라, 원소가 dict 가 아니면
+    # AttributeError 가 DataSourceError 계약을 뚫고 그대로 샌다. 호출자는 좁힌
+    # `except DataSourceError` 로 저하하므로, 그런 응답은 저하되지 못하고 곧장
+    # 크래시한다(웹은 500, 라이브 엔진은 틱 실패). 상류 형식 문제는 Schema 로 귀속한다.
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+        raise _fail(
+            SourceSchemaError(
+                "krx", f"{label} 응답의 '{key}' 가 dict 리스트가 아니다: {str(rows)[:120]}"
+            )
+        )
+    return rows
 
 
 def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
