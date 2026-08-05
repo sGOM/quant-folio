@@ -6,8 +6,10 @@
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from app.services import screener
+from app.services.data.errors import SourceUnavailableError
 
 
 # 6자리 코드(스크리너가 index 를 zfill(6) 하므로 fixture 도 6자리로).
@@ -94,3 +96,48 @@ def test_empty_market_returns_empty(monkeypatch):
     monkeypatch.setattr(screener.opendart, "is_enabled", lambda: True)
     out = screener.screen_turnaround(date(2025, 6, 2), "ALL")
     assert out.count == 0 and out.items == []
+
+
+def test_opendart_failure_degrades_without_hard_filter(monkeypatch, caplog):
+    """DataSourceError(외부 장애)는 삼키고 하드 필터 없이 반환한다(Task 7). 로그가 그
+    결과(필터 미적용)를 명시적으로 드러내야 한다 — 조용히 넘어가면 걸러졌어야 할
+    종목이 남는 왜곡이 은폐된다."""
+    def _boom(codes, as_of):
+        raise SourceUnavailableError("dart", "OpenDART 장애")
+
+    monkeypatch.setattr(screener, "_fetch_market_cap", lambda *a, **k: _cap_df())
+    monkeypatch.setattr(
+        screener, "_fetch_price_change",
+        lambda start, end, mkts: _pc({S1: 60e8, S2: 60e8, M1: 60e8, L1: 60e8, L2: 60e8}),
+    )
+    monkeypatch.setattr(screener, "_fetch_fundamentals", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(screener.opendart, "is_enabled", lambda: True)
+    monkeypatch.setattr(screener.opendart, "metrics_by_symbol", _boom)
+
+    with caplog.at_level("ERROR"):
+        out = screener.screen_turnaround(
+            date(2025, 6, 2), "ALL", min_value=50_000_000, surge=1.5, smallcap_pct=0.4,
+        )
+
+    assert {S1, S2} <= {c.code for c in out.items}  # 하드 필터 미적용 — 후보 그대로 남음
+    assert "하드 필터를 적용하지 못한 채 반환" in caplog.text
+
+
+def test_opendart_bug_propagates(monkeypatch):
+    """우리 쪽 버그(TypeError)는 삼키지 않고 전파된다(Task 7 — 좁힌 except 의 핵심 계약)."""
+    def _bug(codes, as_of):
+        raise TypeError("잘못된 인자")
+
+    monkeypatch.setattr(screener, "_fetch_market_cap", lambda *a, **k: _cap_df())
+    monkeypatch.setattr(
+        screener, "_fetch_price_change",
+        lambda start, end, mkts: _pc({S1: 60e8, S2: 60e8, M1: 60e8, L1: 60e8, L2: 60e8}),
+    )
+    monkeypatch.setattr(screener, "_fetch_fundamentals", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(screener.opendart, "is_enabled", lambda: True)
+    monkeypatch.setattr(screener.opendart, "metrics_by_symbol", _bug)
+
+    with pytest.raises(TypeError):
+        screener.screen_turnaround(
+            date(2025, 6, 2), "ALL", min_value=50_000_000, surge=1.5, smallcap_pct=0.4,
+        )

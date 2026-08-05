@@ -23,6 +23,7 @@ import pandas as pd
 from app.schemas.screener import TurnaroundCandidate, TurnaroundScreenOut
 from app.services._num import is_nan
 from app.services.data import opendart
+from app.services.data.errors import DataSourceError
 from app.services.metrics import (
     _approx_start,
     _build_krx_name_map,
@@ -107,8 +108,13 @@ def screen_turnaround(
     if candidates:
         try:
             qmetrics = opendart.metrics_by_symbol(candidates, as_of)
-        except Exception:  # noqa: BLE001
-            logger.warning("스크리너 OpenDART 조회 실패", exc_info=True)
+        except DataSourceError as e:
+            # qmetrics 가 비면 아래 하드 필터(부채비율·만성적자)가 후보 전원에 대해
+            # 통째로 건너뛰어진다 — "중립 처리"가 아니라 걸러졌어야 할 종목이 결과에
+            # 남는 실질적 왜곡이다. 그 결과를 로그에 명시한다.
+            logger.error(
+                "스크리너 OpenDART 조회 실패 — 재무 하드 필터를 적용하지 못한 채 반환한다: %s", e
+            )
             qmetrics = {}
 
     seed_names = _build_name_map()

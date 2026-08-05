@@ -30,11 +30,12 @@ async def build_universe(db: AsyncSession, index: str = "KOSPI200") -> list[str]
     """
     codes: set[str] = set()
     try:
+        from app.services.data.errors import DataSourceError
         from app.services.data.krx_index import index_members
 
         codes.update(await asyncio.to_thread(index_members, date.today(), index))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("KOSPI200 구성종목 조회 실패(그 부분만 제외): %s", e)
+    except DataSourceError as e:
+        logger.error("KOSPI200 구성종목 조회 실패(그 부분만 제외): %s", e)
 
     rows = await db.scalars(select(Strategy.config))
     for cfg in rows:

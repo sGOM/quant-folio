@@ -15,6 +15,7 @@ import pytest
 
 from app.services import recommend as recommend_mod
 from app.services.data import krx_index, opendart
+from app.services.data.errors import SourceUnavailableError
 
 AS_OF = date(2026, 7, 20)
 
@@ -104,8 +105,9 @@ def test_price_close_falls_back_to_market_cap_over_shares(monkeypatch):
 
 
 def test_opendart_failure_falls_back_to_neutral_without_raising(monkeypatch):
+    """DataSourceError(외부 장애)는 삼키고 중립 처리한다(Task 7 — except DataSourceError)."""
     def _boom(members, as_of):
-        raise RuntimeError("OpenDART 장애")
+        raise SourceUnavailableError("dart", "OpenDART 장애")
 
     _patch_common(monkeypatch, qmetrics_side_effect=_boom)
 
@@ -117,6 +119,17 @@ def test_opendart_failure_falls_back_to_neutral_without_raising(monkeypatch):
         # OpenDART 실패로 quality 원천 컬럼이 아예 없었으므로 score_quality 는 중립(0)
         # 혹은 결측 처리되며, 최소한 예외 없이 항목이 만들어진다는 것만 검증한다.
         assert m.code in ("005930", "000660")
+
+
+def test_opendart_bug_propagates(monkeypatch):
+    """우리 쪽 버그(TypeError)는 삼키지 않고 전파된다(Task 7 — 좁힌 except 의 핵심 계약)."""
+    def _bug(members, as_of):
+        raise TypeError("잘못된 인자")
+
+    _patch_common(monkeypatch, qmetrics_side_effect=_bug)
+
+    with pytest.raises(TypeError):
+        recommend_mod.compute_kospi200_scored(AS_OF)
 
 
 def test_opendart_success_populates_items_without_error(monkeypatch):

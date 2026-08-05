@@ -164,6 +164,7 @@ def _fundamentals_provider_with_neutralize_cols(
         생략한다(순수 팩터 그대로, §20).
     """
     from app.services.data import krx_index
+    from app.services.data.errors import DataSourceError
 
     fdf = _fundamentals_provider(as_of_date, codes, use_ttm=use_ttm)
     norm_codes = [str(c).zfill(6) for c in codes]
@@ -172,7 +173,10 @@ def _fundamentals_provider_with_neutralize_cols(
     if neutralize in ("size", "size_sector"):
         try:
             caps = krx_index.market_caps(as_of_date)
-        except Exception:  # noqa: BLE001
+        except DataSourceError as e:
+            # 사이즈 중립화 생략은 §20 에 설계된 저하다(순수 팩터 그대로). 다만 조용히
+            # 넘어가면 요청한 중립화가 적용됐는지 알 수 없으므로 ERROR 로 남긴다.
+            logger.error("사이즈 중립화 생략 — 시가총액 조회 실패: %s", e)
             caps = {}
         if caps:
             cols["market_cap"] = pd.Series(
@@ -182,7 +186,8 @@ def _fundamentals_provider_with_neutralize_cols(
     if neutralize in ("sector", "size_sector"):
         try:
             smap = krx_index.sector_map(as_of_date)
-        except Exception:  # noqa: BLE001
+        except DataSourceError as e:
+            logger.error("섹터 중립화 생략 — 업종분류 조회 실패: %s", e)
             smap = {}
         if smap:
             cols["sector"] = pd.Series(

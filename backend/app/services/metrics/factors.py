@@ -675,10 +675,11 @@ def compute_universe_scores(
     if neutralize in ("size", "size_sector"):
         try:
             from app.services.data import krx_index
+            from app.services.data.errors import DataSourceError
 
             caps = krx_index.market_caps(as_of)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("사이즈 중립화용 시가총액 조회 실패 — 중립화 생략: %s", e)
+        except DataSourceError as e:
+            logger.error("사이즈 중립화용 시가총액 조회 실패 — 중립화 생략: %s", e)
             caps = {}
         if caps:
             df["market_cap"] = pd.Series(
@@ -689,10 +690,11 @@ def compute_universe_scores(
     if neutralize in ("sector", "size_sector"):
         try:
             from app.services.data import krx_index
+            from app.services.data.errors import DataSourceError
 
             smap = krx_index.sector_map(as_of)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("섹터 중립화용 업종분류 조회 실패 — 중립화 생략: %s", e)
+        except DataSourceError as e:
+            logger.error("섹터 중립화용 업종분류 조회 실패 — 중립화 생략: %s", e)
             smap = {}
         if smap:
             df["sector"] = pd.Series(
