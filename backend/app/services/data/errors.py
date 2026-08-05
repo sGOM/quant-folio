@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter
+from collections.abc import Sequence
 from datetime import datetime, time as dtime, timedelta
 
 
@@ -127,7 +128,7 @@ _CAUSE_PRIORITY: tuple[type[DataSourceError], ...] = (
 )
 
 
-def representative(errors: list[DataSourceError]) -> DataSourceError:
+def representative(errors: Sequence[DataSourceError]) -> DataSourceError:
     """집계 계층이 전량 실패했을 때 올릴 대표 예외를 고른다.
 
     원인이 섞이면 우선순위 최상위를 고르고, 메시지에 원인별 건수를 담아
@@ -145,6 +146,45 @@ def representative(errors: list[DataSourceError]) -> DataSourceError:
                 retry_after=picked.retry_after,
             )
     return errors[0]
+
+
+#: 스키마 오류가 '종목별 사정'이 아니라 '응답 형식이 통째로 바뀐 것'이라고 단정하기까지
+#: 허용할 연속 실패 수. 1건으로도 사실상 확정이지만, 특정 종목만 이상한 응답을 주는
+#: 경우를 배제하지 못하므로 몇 건을 본다.
+_SCHEMA_SYSTEMIC_THRESHOLD = 3
+
+
+def stop_aggregate(source: str, errors: Sequence[DataSourceError], ok: int) -> bool:
+    """종목별 집계 루프를 여기서 멈춰야 하는가(부분 결과는 그대로 반환된다).
+
+    두 가지를 본다.
+
+    1. **쿨다운 중**: 더 시도해도 전송 계층이 즉시 같은 차단을 재현할 뿐이고, 그
+       자기유발 차단이 `representative()` 의 대표 원인을 오염시킨다(원래 원인이
+       Unavailable 이어도 Quota 로 뒤바뀐다).
+    2. **쿨다운이 없는 체계적 실패**: Schema·Request 는 기다려도 해결되지 않으므로
+       쿨다운을 걸지 않는다(설계). 그래서 1번만 보면 이 원인들은 단락이 **아예 걸리지
+       않아**, DART 포맷이 바뀐 날 200종목 루프가 끝까지 돌며 종목당 3회씩 호출을
+       소진한 뒤에야 raise 한다 — 일일 20,000건 한도가 있고, 리밸런싱일마다 부르는
+       백테스트 한 건이면 한도를 통째로 태울 수 있다.
+
+    2번은 **스키마 오류에만** 적용한다. 스키마 불일치는 우리 파서와 상대 형식이
+    어긋난 것이라 종목별로 다를 수 없다. 반면 `SourceRequestError` 는 특정 종목의
+    인자 문제로 날 수 있어, 앞 몇 건이 실패했다고 나머지를 포기하면 돌려줄 수 있었던
+    부분 결과를 잃는다. 한 번이라도 성공했다면(`ok > 0`) 형식은 맞다는 뜻이므로
+    나머지 실패는 종목별 사정으로 보고 계속한다.
+
+    :param ok: 지금까지 예외 없이 응답을 받은 항목 수('성공' = 응답 수신, 데이터 획득 아님).
+    """
+    if not errors:
+        return False
+    if cooldown_remaining(source) > 0:
+        return True
+    if ok == 0 and len(errors) >= _SCHEMA_SYSTEMIC_THRESHOLD:
+        recent = errors[-_SCHEMA_SYSTEMIC_THRESHOLD:]
+        if all(isinstance(e, SourceSchemaError) for e in recent):
+            return True
+    return False
 
 
 def seconds_until_midnight() -> float:
