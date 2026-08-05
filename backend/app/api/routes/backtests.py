@@ -308,6 +308,10 @@ def _build_pit_pool(config: dict, start, end):
 
     from app.services.data import krx_index
 
+    # 인증 없이 돌면 월별 조회가 전부 빈 값을 주고 백테스트가 빈 패널 위에서
+    # '성공'한다(§44-1). 19개월치를 다 돌기 전에 막는다.
+    krx_index.require_krx_auth()
+
     # 유동성 필터: 시가총액(억 원) 하한. 각 월 시점 시총 기준으로 소형주를 후보풀에서 제외.
     min_cap = rule.get("min_market_cap")
     min_cap_won = int(min_cap) * 10**8 if min_cap else 0

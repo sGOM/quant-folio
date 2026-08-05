@@ -26,6 +26,7 @@ from app.api.routes import (
 )
 from app.core.config import settings
 from app.core.redis import redis_client
+from app.services.data.errors import DataSourceError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -52,6 +53,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(DataSourceError)
+async def data_source_error_handler(request: Request, exc: DataSourceError) -> JSONResponse:
+    """외부 데이터 소스(KRX/DART/KOFIA) 장애는 서버 버그가 아니다 — 500 이 아니라 503.
+
+    호출자가 재시도해도 되는지(`retryable`)와 어느 소스(`source`)·원인(`cause`)인지를
+    응답에 실어, 클라이언트가 "우리 코드가 깨졌다"가 아니라 "외부 의존성이 죽었다"로
+    구분할 수 있게 한다.
+    """
+    logger.error("외부 데이터 소스 실패 (%s): %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "외부 데이터 소스를 사용할 수 없습니다.",
+            "source": exc.source,
+            "cause": type(exc).__name__,
+            "retryable": exc.retryable,
+        },
+    )
 
 
 @app.exception_handler(Exception)

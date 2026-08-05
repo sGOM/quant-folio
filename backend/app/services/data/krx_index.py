@@ -141,6 +141,20 @@ def has_krx_auth() -> bool:
         return False
 
 
+def require_krx_auth() -> None:
+    """KRX 인증이 **필수** 인 실행의 진입점에서 호출한다(PIT 유니버스 백테스트 등).
+
+    미설정 자체는 실패가 아니지만(개발환경에서 앱은 떠야 한다), PIT 유니버스처럼
+    없으면 결과가 무의미해지는 필수 입력에는 다르다. 인증 없이 돌리면 모든 조회가
+    빈 값을 주고 백테스트가 **빈 패널 위에서 '성공'** 한다(§44-1 과 동일한 결과).
+    필수/선택을 소스가 아니라 용도로 가르기 위한 사전 검사.
+    """
+    if not has_krx_auth():
+        raise SourceAuthError(
+            "krx", "KRX 인증이 필요한 실행인데 KRX_ID/KRX_PW 가 없거나 로그인에 실패했다"
+        )
+
+
 def _krx_rows(sess, payload: dict, key: str, label: str, timeout: float = 20) -> list[dict]:
     """KRX MDC POST 1회. 실패는 원인별 DataSourceError 로 raise 한다.
 
