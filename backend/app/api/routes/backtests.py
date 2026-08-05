@@ -300,6 +300,10 @@ def _build_pit_pool(config: dict, start, end):
     백테스트 루프 밖으로 빼기 위해 월별 멤버십을 미리 조회해 dict 로 캐시한다.
     source="fixed" 이면 (None, None) 을 반환해 기존 고정 universe 경로를 쓴다.
     (블로킹 — 호출부가 run_in_threadpool 로 감쌀 것.)
+
+    :raises SourceAuthError: 지수 소스인데 KRX 인증이 없거나 로그인에 실패한 경우
+        (preflight — 월별 조회를 시작하기 전에 막는다). 스크립트에서 직접 호출할 때도
+        동일하게 던지므로, 인증 없이 돌려 빈 결과를 얻는 일이 생기지 않는다.
     """
     rule = (config.get("selection") or {}).get("universe_rule") or {}
     source = rule.get("source", "fixed")
