@@ -779,3 +779,57 @@ class TestCorpCodeMap:
     def test_미설정이면_예외가_아니라_None(self, monkeypatch):
         monkeypatch.setattr(opendart, "is_enabled", lambda: False)
         assert opendart.corp_code_map() is None
+
+
+class TestAggregateSystemicSchemaShortCircuit:
+    """쿨다운이 없는 체계적 실패(응답 포맷 변경)도 루프를 멈춰야 한다.
+
+    Schema 는 기다려도 해결되지 않으므로 쿨다운을 걸지 않는다(설계). 그래서 단락이
+    쿨다운만 보면 이 원인에는 **아예 걸리지 않아**, 포맷이 바뀐 날 전 종목 루프가 끝까지
+    돌며 종목당 3회씩 호출을 소진한 뒤에야 raise 한다 — DART 는 일일 20,000건 한도가
+    있고, 리밸런싱일마다 부르는 백테스트 한 건이면 한도를 통째로 태울 수 있다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            opendart, "cached_corp_code_map",
+            lambda: {f"00{i:04d}": f"c{i}" for i in range(12)},
+        )
+        clear_cooldown("dart")
+        yield
+        clear_cooldown("dart")
+
+    def test_스키마_오류가_이어지면_전_종목을_돌지_않는다(self, monkeypatch):
+        calls: list[str] = []
+
+        def _fake(corp, *_a):
+            calls.append(corp)
+            raise SourceSchemaError("dart", "list 키가 없다")  # 쿨다운 없음
+
+        monkeypatch.setattr(opendart, "annual_metrics", _fake)
+        codes = [f"00{i:04d}" for i in range(12)]
+        with pytest.raises(SourceSchemaError):
+            opendart.metrics_by_symbol(codes, date(2026, 8, 3))
+
+        # 12종목 전부(×3회)를 태우지 않고 임계에서 멈춘다.
+        assert len(calls) < len(codes)
+
+    def test_한_번이라도_성공했으면_끝까지_돈다(self, monkeypatch):
+        """형식이 맞다는 증거가 있으면 나머지 실패는 종목별 사정 — 부분 결과를 지킨다."""
+        calls: list[str] = []
+
+        def _fake(corp, *_a):
+            calls.append(corp)
+            if corp == "c0":
+                return {"roe": 0.12}
+            raise SourceSchemaError("dart", "list 키가 없다")
+
+        monkeypatch.setattr(opendart, "annual_metrics", _fake)
+        codes = [f"00{i:04d}" for i in range(12)]
+        out = opendart.metrics_by_symbol(codes, date(2026, 8, 3))
+
+        assert "000000" in out  # 성공한 종목의 부분 결과가 살아 있다
+        # 첫 종목만 성공(3회 호출) → 나머지 11종목도 각각 시도됐다
+        assert len({c for c in calls}) == len(codes)

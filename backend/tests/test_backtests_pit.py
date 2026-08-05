@@ -30,6 +30,32 @@ class TestRequireKrxAuth:
         monkeypatch.setattr(krx_index, "has_krx_auth", lambda: True)
         krx_index.require_krx_auth()  # 예외 없음
 
+    def test_미설정과_로그인_실패와_쿨다운을_구분한다(self, monkeypatch):
+        """'없거나 실패했다'로 뭉치면 시크릿을 봐야 하는지 차단이 풀리기를 기다려야
+        하는지 알 수 없다. 세 갈래 모두 메모리 읽기라 추가 로그인 시도는 없다."""
+        from app.core.config import settings
+        from app.services.data.errors import clear_cooldown, note_failure
+
+        monkeypatch.setattr(krx_index, "has_krx_auth", lambda: False)
+        clear_cooldown("krx")
+
+        monkeypatch.setattr(settings, "KRX_ID", "", raising=False)
+        monkeypatch.setattr(settings, "KRX_PW", "", raising=False)
+        with pytest.raises(SourceAuthError, match="설정되지 않았다"):
+            krx_index.require_krx_auth()
+
+        monkeypatch.setattr(settings, "KRX_ID", "id", raising=False)
+        monkeypatch.setattr(settings, "KRX_PW", "pw", raising=False)
+        with pytest.raises(SourceAuthError, match="로그인에 실패했다"):
+            krx_index.require_krx_auth()
+
+        note_failure(SourceAuthError("krx", "인증 세션 생성 실패"))
+        try:
+            with pytest.raises(SourceAuthError, match="쿨다운 중"):
+                krx_index.require_krx_auth()
+        finally:
+            clear_cooldown("krx")
+
 
 class TestBuildPitPoolPreflight:
     """`_build_pit_pool` 진입점 배선 — 월별 루프에 들어가기 전에 막혀야 한다."""

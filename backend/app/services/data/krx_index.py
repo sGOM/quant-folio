@@ -148,11 +148,26 @@ def require_krx_auth() -> None:
     없으면 결과가 무의미해지는 필수 입력에는 다르다. 인증 없이 돌리면 모든 조회가
     빈 값을 주고 백테스트가 **빈 패널 위에서 '성공'** 한다(§44-1 과 동일한 결과).
     필수/선택을 소스가 아니라 용도로 가르기 위한 사전 검사.
+
+    실패 시 **원인을 갈라서** 올린다. "없거나 실패했다"로 뭉치면 운영자가 시크릿을
+    확인해야 하는지 KRX 차단이 풀리기를 기다려야 하는지 알 수 없다. 세 갈래 모두
+    메모리 읽기(설정값·쿨다운 레지스트리)라 여기서 추가 로그인 시도는 일어나지 않는다
+    — `has_krx_auth()` 를 유일한 관문으로 두는 구조도 그대로다(테스트 격리 지점).
     """
-    if not has_krx_auth():
+    if has_krx_auth():
+        return
+    if not (settings.KRX_ID and settings.KRX_PW):
         raise SourceAuthError(
-            "krx", "KRX 인증이 필요한 실행인데 KRX_ID/KRX_PW 가 없거나 로그인에 실패했다"
+            "krx", "KRX_ID/KRX_PW 가 설정되지 않았다 — PIT 유니버스 백테스트에는 필수다"
         )
+    remaining = cooldown_remaining("krx")
+    if remaining > 0:
+        raise SourceAuthError(
+            "krx", f"KRX 로그인 실패 후 쿨다운 중({remaining:.0f}초 남음)"
+        )
+    raise SourceAuthError(
+        "krx", "KRX 로그인에 실패했다 — 자격증명 유효성·차단 여부를 확인하라"
+    )
 
 
 def _krx_rows(sess, payload: dict, key: str, label: str, timeout: float = 20) -> list[dict]:

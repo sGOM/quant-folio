@@ -14,6 +14,7 @@ from app.services.data.errors import (
     cooldown_remaining,
     note_failure,
     representative,
+    stop_aggregate,
 )
 
 
@@ -109,3 +110,46 @@ class TestRepresentative:
     def test_빈_목록은_ValueError(self):
         with pytest.raises(ValueError):
             representative([])
+
+
+class TestStopAggregate:
+    """집계 루프 단락 판단 — 쿨다운뿐 아니라 '쿨다운이 없는 체계적 실패'도 멈춘다.
+
+    Schema·Request 는 기다려도 해결되지 않아 쿨다운이 없다(설계). 그런데 집계 단락이
+    쿨다운만 보면, DART 포맷이 바뀐 날 전 종목 루프가 끝까지 돌며 종목당 3회씩 호출을
+    소진한 뒤에야 raise 한다 — 일일 20,000건 한도가 있고, 리밸런싱일마다 부르는 백테스트
+    한 건이면 한도를 통째로 태울 수 있다.
+    """
+
+    def setup_method(self):
+        clear_cooldown("dart")
+
+    def teardown_method(self):
+        clear_cooldown("dart")
+
+    def test_실패가_없으면_계속한다(self):
+        assert stop_aggregate("dart", [], ok=0) is False
+
+    def test_쿨다운_중이면_멈춘다(self):
+        note_failure(SourceQuotaError("dart", "한도"))
+        assert stop_aggregate("dart", [SourceUnavailableError("dart", "x")], ok=5) is True
+
+    def test_스키마_오류가_연속이고_성공이_없으면_멈춘다(self):
+        """스키마 불일치는 종목별 사정이 아니라 응답 형식 문제다 — 체계적이다."""
+        errs = [SourceSchemaError("dart", f"키 없음 {i}") for i in range(3)]
+        assert stop_aggregate("dart", errs, ok=0) is True
+
+    def test_한_번이라도_성공했으면_스키마_오류여도_계속한다(self):
+        """성공이 있었다면 형식은 맞다 — 나머지는 종목별 사정이므로 부분 결과를 지킨다."""
+        errs = [SourceSchemaError("dart", f"키 없음 {i}") for i in range(3)]
+        assert stop_aggregate("dart", errs, ok=1) is False
+
+    def test_스키마가_아닌_실패는_임계에_도달해도_계속한다(self):
+        """Request 는 종목별로 날 수 있다 — 앞 몇 개가 실패했다고 나머지를 포기하면
+        돌려줄 수 있었던 부분 결과를 잃는다."""
+        errs = [SourceRequestError("dart", f"잘못된 인자 {i}") for i in range(5)]
+        assert stop_aggregate("dart", errs, ok=0) is False
+
+    def test_임계_미만이면_계속한다(self):
+        errs = [SourceSchemaError("dart", "키 없음")]
+        assert stop_aggregate("dart", errs, ok=0) is False
