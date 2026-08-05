@@ -568,13 +568,15 @@ def _session():
     except Exception as e:  # noqa: BLE001
         raise SourceUnavailableError("krx", f"pykrx 로드 실패: {e}") from e
 
-    sess = getattr(auth, "_auth_session", None)
-    if sess is not None and getattr(sess, "is_valid", lambda: False)():
-        return sess
-
+    # 쿨다운 검사는 '유효 세션 재사용'보다 **앞**이다 — 차단 상태에서도 세션 쿠키는
+    # 유효할 수 있어(§44-1), 재사용 분기가 먼저면 쿨다운을 그대로 통과한다.
     remaining = cooldown_remaining("krx")
     if remaining > 0:
         raise SourceAuthError("krx", f"로그인 쿨다운 중 — 재시도 생략({remaining:.0f}초 남음)")
+
+    sess = getattr(auth, "_auth_session", None)
+    if sess is not None and getattr(sess, "is_valid", lambda: False)():
+        return sess
 
     try:
         built = _build_session()
@@ -615,12 +617,18 @@ def _krx_rows(sess, payload: dict, key: str, label: str, timeout: float = 20) ->
     정상 JSON 이면서 리스트가 비어 있는 것은 **실패가 아니다**(휴장일·미상장).
     호출자가 직전 영업일로 소급하도록 빈 리스트를 그대로 돌려준다.
 
-    쿨다운은 **여기서만** 건다 — 호출자(단일 조회/7일 루프)마다 거는 위치가 달라지면
-    어떤 경로는 쿨다운 없이 폭주한다.
+    쿨다운은 **여기서만** 걸고, **여기서 검사도 한다** — §44-1 의 실제 형태는 세션
+    쿠키는 살아 있고 POST 응답만 HTML 로 오는 것이라, `_session()` 의 검사만으로는
+    "유효 세션 재사용" 분기를 타고 넘어가 차단된 POST 가 계속 나간다. 7일 소급 루프의
+    연속 POST 까지 막으려면 매 왕복 직전에 검사해야 한다.
     """
     def _fail(exc: DataSourceError) -> DataSourceError:
         note_failure(exc)
         return exc
+
+    remaining = cooldown_remaining("krx")
+    if remaining > 0:
+        raise SourceAuthError("krx", f"{label} 쿨다운 중 — 조회 생략({remaining:.0f}초 남음)")
 
     try:
         resp = sess.post(_JSON_URL, data=payload, timeout=timeout)
