@@ -29,6 +29,7 @@
 | `backend/app/models/__init__.py` (수정) | 새 모델 re-export — `Base.metadata` 에 등록되어야 alembic 이 본다 |
 | `backend/alembic/versions/0013_local_store.py` (신규) | 6테이블 생성 + `stock_daily_snapshots` hypertable 변환 |
 | `backend/app/services/data/store/ledger.py` (신규) | `LedgerEntry`·`Ledger` 프로토콜·`InMemoryLedger`·`SqlLedger` |
+| `backend/app/services/data/store/coerce.py` (신규) | DataFrame 값 → DB 컬럼 타입 변환. 리포지토리 3종이 공유한다 |
 | `backend/app/services/data/store/frame.py` (신규) | `cached_frame` 4상태 코어 + `is_final_date` |
 | `backend/app/services/data/store/daily.py` (신규) | `stock_daily_snapshots` 읽기/쓰기(NULL 보존 upsert) |
 | `backend/app/services/data/store/periods.py` (신규) | `stock_period_stats` 읽기/쓰기 |
@@ -1156,6 +1157,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ### Task 5: `stock_daily_snapshots` 리포지토리
 
 **Files:**
+- Create: `backend/app/services/data/store/coerce.py`
 - Create: `backend/app/services/data/store/daily.py`
 - Modify: `backend/app/services/data/store/__init__.py`
 - Test: `backend/tests/test_local_store_repo.py`
@@ -1163,6 +1165,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `app.models.store.StockDailySnapshot`, `LocalStoreSession`, `run_sync`
 - Produces:
+  - `coerce_value(value: object, kind: str) -> object | None` — `kind` 는 `"numeric"`·`"integer"`·`"text"`. **Task 7·8 의 리포지토리도 이것을 쓴다 — 모듈마다 다시 정의하지 말 것.**
   - `write_daily(trade_day: date, df: pd.DataFrame, *, columns: dict[str, str]) -> None`
     `df` 는 티커 인덱스, `columns` 는 `{DataFrame 컬럼명: 테이블 컬럼명}` 매핑(예: `{"PER": "per", "market": "market"}`).
   - `read_daily(trade_day: date, table_columns: list[str], *, out_columns: dict[str, str]) -> pd.DataFrame`
@@ -1241,7 +1244,56 @@ def test_행이_없으면_요청한_컬럼의_빈_프레임을_준다():
 Run: `docker compose exec -T -e QF_DB_TESTS=1 web pytest tests/test_local_store_repo.py -v`
 Expected: FAIL — `ImportError: cannot import name 'daily'`
 
-- [ ] **Step 3: 구현**
+- [ ] **Step 3: 공유 변환 헬퍼 구현**
+
+`backend/app/services/data/store/coerce.py`:
+
+```python
+"""DataFrame 값 → DB 컬럼 타입 변환.
+
+리포지토리 3종(daily·periods·indexes)이 같은 변환 규칙을 쓴다. 다른 것은 어떤
+컬럼이 어떤 타입인가뿐이라, 규칙은 여기 한 벌만 두고 컬럼→종류 매핑만 각자 갖는다.
+"""
+from __future__ import annotations
+
+from decimal import Decimal, InvalidOperation
+
+import pandas as pd
+
+#: 컬럼 종류 — NUMERIC / BigInteger / String 에 대응.
+NUMERIC = "numeric"
+INTEGER = "integer"
+TEXT = "text"
+
+
+def coerce_value(value: object, kind: str) -> object | None:
+    """DataFrame 셀 값을 저장 타입으로 변환한다. 결측·변환 불가는 None.
+
+    pykrx 는 결측을 NaN·None·빈 문자열로 섞어 돌려주고, 컬럼 하나에 숫자와 문자열이
+    섞여 오는 경우도 있다. 변환 실패를 예외로 올리지 않고 None 으로 떨어뜨리는 이유는
+    종목 한 개의 이상값이 그 날짜 전체 적재를 막으면 안 되기 때문이다.
+    """
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass  # pd.isna 가 스칼라를 못 주는 값(배열 등) — 아래 변환에서 걸러진다
+    if kind == NUMERIC:
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return None
+    if kind == INTEGER:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+    return str(value)
+```
+
+- [ ] **Step 4: 리포지토리 구현**
 
 `backend/app/services/data/store/daily.py`:
 
@@ -1256,7 +1308,6 @@ from __future__ import annotations
 
 import logging
 from datetime import date
-from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 from sqlalchemy import delete, func, select
@@ -1264,35 +1315,19 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.local_store_db import LocalStoreSession, run_sync
 from app.models.store import StockDailySnapshot
+from app.services.data.store.coerce import INTEGER, NUMERIC, TEXT, coerce_value
 
 logger = logging.getLogger("app.services.data.store")
 
-#: 숫자로 저장할 컬럼(NUMERIC) — Decimal 변환이 필요하다.
-_NUMERIC_COLS = {"per", "pbr", "div", "open", "high", "low", "close", "change_pct"}
-#: 정수로 저장할 컬럼(BigInteger).
-_INT_COLS = {"market_cap", "shares", "volume", "trading_value"}
-
-
-def _coerce(col: str, value: object):
-    """DataFrame 값을 컬럼 타입에 맞게 변환한다. 변환 불가·결측은 None."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return None
-    try:
-        if pd.isna(value):  # pd.NA·NaT 등
-            return None
-    except (TypeError, ValueError):
-        pass
-    if col in _NUMERIC_COLS:
-        try:
-            return Decimal(str(value))
-        except (InvalidOperation, ValueError):
-            return None
-    if col in _INT_COLS:
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
-    return str(value)
+#: 테이블 컬럼 → 저장 타입. 변환 규칙 자체는 coerce 모듈이 갖는다.
+_KINDS = {
+    "per": NUMERIC, "pbr": NUMERIC, "div": NUMERIC,
+    "open": NUMERIC, "high": NUMERIC, "low": NUMERIC, "close": NUMERIC,
+    "change_pct": NUMERIC,
+    "market_cap": INTEGER, "shares": INTEGER,
+    "volume": INTEGER, "trading_value": INTEGER,
+    "market": TEXT,
+}
 
 
 def write_daily(trade_day: date, df: pd.DataFrame, *, columns: dict[str, str]) -> None:
@@ -1311,7 +1346,7 @@ def write_daily(trade_day: date, df: pd.DataFrame, *, columns: dict[str, str]) -
     for ticker, r in df.iterrows():
         row: dict = {"trade_date": trade_day, "symbol": str(ticker).zfill(6)}
         for src, dst in present.items():
-            row[dst] = _coerce(dst, r[src])
+            row[dst] = coerce_value(r[src], _KINDS.get(dst, TEXT))
         rows.append(row)
     if not rows:
         return
@@ -1389,10 +1424,11 @@ async def _delete(trade_day: date) -> None:
 
 ```python
 from app.services.data.store import daily
+from app.services.data.store.coerce import coerce_value
 ```
-`__all__` 에 `"daily"` 추가.
+`__all__` 에 `"daily"`, `"coerce_value"` 추가.
 
-- [ ] **Step 4: 통과 확인**
+- [ ] **Step 5: 통과 확인**
 
 ```bash
 docker compose exec -T -e QF_DB_TESTS=1 web pytest tests/test_local_store_repo.py -v
@@ -1405,10 +1441,10 @@ docker compose exec -T web pytest tests/test_local_store_repo.py -v
 ```
 Expected: 3 skipped
 
-- [ ] **Step 5: 커밋**
+- [ ] **Step 6: 커밋**
 
 ```bash
-git add backend/app/services/data/store/daily.py backend/app/services/data/store/__init__.py backend/tests/test_local_store_repo.py
+git add backend/app/services/data/store/coerce.py backend/app/services/data/store/daily.py backend/app/services/data/store/__init__.py backend/tests/test_local_store_repo.py
 git commit -m "feat: stock_daily_snapshots 리포지토리를 추가한다
 
 펀더멘털·시총·전종목 OHLCV 가 같은 (거래일, 종목) 행을 서로 다른 시점에 채우므로
@@ -1945,7 +1981,6 @@ from __future__ import annotations
 
 import logging
 from datetime import date
-from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 from sqlalchemy import delete, func, select
@@ -1953,33 +1988,17 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.local_store_db import LocalStoreSession, run_sync
 from app.models.store import StockPeriodStat
+from app.services.data.store.coerce import INTEGER, NUMERIC, TEXT, coerce_value
 
 logger = logging.getLogger("app.services.data.store")
 
-_NUMERIC_COLS = {"change_pct", "open", "close", "net_buy_value"}
-_INT_COLS = {"volume", "trading_value"}
-
-
-def _coerce(col: str, value: object):
-    """DataFrame 값을 컬럼 타입에 맞게 변환한다. 변환 불가·결측은 None."""
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if col in _NUMERIC_COLS:
-        try:
-            return Decimal(str(value))
-        except (InvalidOperation, ValueError):
-            return None
-    if col in _INT_COLS:
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
-    return str(value)
+#: 테이블 컬럼 → 저장 타입. 변환 규칙은 coerce 모듈이 갖는다(Task 5 에서 만든 공용 헬퍼).
+_KINDS = {
+    "change_pct": NUMERIC, "open": NUMERIC, "close": NUMERIC,
+    "net_buy_value": NUMERIC,
+    "volume": INTEGER, "trading_value": INTEGER,
+    "market": TEXT,
+}
 
 
 def write_periods(
@@ -1999,7 +2018,7 @@ def write_periods(
             "investors": investors, "symbol": str(ticker).zfill(6),
         }
         for src, dst in present.items():
-            row[dst] = _coerce(dst, r[src])
+            row[dst] = coerce_value(r[src], _KINDS.get(dst, TEXT))
         rows.append(row)
 
     run_sync(_upsert(rows, list(present.values())))
@@ -2319,7 +2338,6 @@ from __future__ import annotations
 
 import logging
 from datetime import date
-from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 from sqlalchemy import delete, func, select
@@ -2327,35 +2345,18 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.local_store_db import LocalStoreSession, run_sync
 from app.models.store import IndexConstituent, IndexOhlcv
+from app.services.data.store.coerce import INTEGER, NUMERIC, TEXT, coerce_value
 
 logger = logging.getLogger("app.services.data.store")
 
 #: 지수 OHLCV 의 표준 컬럼 순서 — _fetch_index_ohlcv 의 한글→영문 변환 결과와 같다.
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume", "trading_value"]
 
-_NUMERIC_COLS = {"open", "high", "low", "close"}
-_INT_COLS = {"volume", "trading_value"}
-
-
-def _coerce(col: str, value: object):
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if col in _NUMERIC_COLS:
-        try:
-            return Decimal(str(value))
-        except (InvalidOperation, ValueError):
-            return None
-    if col in _INT_COLS:
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
-    return str(value)
+#: 테이블 컬럼 → 저장 타입. 변환 규칙은 coerce 모듈이 갖는다(Task 5 에서 만든 공용 헬퍼).
+_KINDS = {
+    "open": NUMERIC, "high": NUMERIC, "low": NUMERIC, "close": NUMERIC,
+    "volume": INTEGER, "trading_value": INTEGER,
+}
 
 
 def write_index_ohlcv(
@@ -2372,7 +2373,9 @@ def write_index_ohlcv(
             "index_name": index_name,
         }
         for col in OHLCV_COLUMNS:
-            row[col] = _coerce(col, r[col]) if col in df.columns else None
+            row[col] = (
+                coerce_value(r[col], _KINDS.get(col, TEXT)) if col in df.columns else None
+            )
         rows.append(row)
 
     run_sync(_upsert_ohlcv(rows))
