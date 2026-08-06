@@ -875,6 +875,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `Ledger`, `LedgerEntry`, `default_ledger` (Task 3), `app.services.data.errors.DataSourceError`
 - Produces:
   - `cached_frame(source, cache_key, *, read_local, fetch_remote, write_local, is_final, ledger=None) -> pd.DataFrame`
+    `is_final` 은 `bool | Callable[[], bool]`. **콜러블 형태가 필수다** — 확정 여부가 `fetch_remote()` 실행 결과(부분 실패 여부)에 달린 호출자가 있고(Task 6·7), 값으로 받으면 `fetch_remote()` 가 돌기 **전에** 평가되어 항상 틀린다. `write_local()` 다음, `ledger.put()` 직전에 호출해 평가한다.
   - `is_final_date(last_day: date, *, today: date | None = None) -> bool`
   - `make_cache_key(*parts: object) -> str`
 
@@ -1012,6 +1013,39 @@ def test_ledger_생략시_기본_구현을_쓴다(monkeypatch):
     assert fake.get("market_cap", "20190312|KOSPI") == LedgerEntry(row_count=1, final=True)
 
 
+def test_is_final_은_콜러블도_받는다():
+    """확정 여부가 조회 결과에 달린 호출자가 있다 — 부분 실패면 굳히면 안 된다."""
+    ledger = InMemoryLedger()
+    spy = _Spy(_frame(2))
+
+    cached_frame(
+        "price_change", "20190101|20190131|KOSPI",
+        read_local=spy.read_local, fetch_remote=spy.fetch_remote,
+        write_local=spy.write_local, is_final=lambda: True, ledger=ledger,
+    )
+
+    assert ledger.get("price_change", "20190101|20190131|KOSPI").final is True
+
+
+def test_is_final_콜러블은_외부조회_뒤에_평가된다():
+    """값으로 미리 평가하면 fetch_remote 결과에 의존하는 판단이 항상 틀린다."""
+    ledger = InMemoryLedger()
+    complete = False
+
+    def _fetch():
+        nonlocal complete
+        complete = True  # 조회가 끝나야 확정 여부가 정해진다
+        return _frame(1)
+
+    cached_frame(
+        "price_change", "20190201|20190228|KOSPI",
+        read_local=lambda: pd.DataFrame(), fetch_remote=_fetch,
+        write_local=lambda df: None, is_final=lambda: complete, ledger=ledger,
+    )
+
+    assert ledger.get("price_change", "20190201|20190228|KOSPI").final is True
+
+
 def test_is_final_date_는_전일까지만_확정으로_본다():
     today = date(2026, 8, 6)
     assert is_final_date(date(2026, 8, 5), today=today) is True
@@ -1055,7 +1089,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'app.services.data.stor
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from datetime import date
 
 import pandas as pd
@@ -1098,14 +1132,16 @@ def cached_frame(
     read_local: Callable[[], pd.DataFrame],
     fetch_remote: Callable[[], pd.DataFrame],
     write_local: Callable[[pd.DataFrame], None],
-    is_final: bool,
+    is_final: bool | Callable[[], bool],
     ledger: Ledger | None = None,
 ) -> pd.DataFrame:
     """로컬에 있으면 로컬에서, 없으면 외부에서 1회 가져와 영구 저장한다.
 
     :param source: 조회 종류(fundamentals·market_cap·index_ohlcv 등)
     :param cache_key: make_cache_key 로 만든 결정적 인자 키
-    :param is_final: 이 결과를 영구 확정으로 굳혀도 되는가(당일분·미확정 DART 는 False)
+    :param is_final: 이 결과를 영구 확정으로 굳혀도 되는가(당일분·미확정 DART 는 False).
+        콜러블을 넘기면 `fetch_remote()` 가 끝난 **뒤에** 평가한다 — 확정 여부가 조회
+        결과(부분 실패 여부)에 달린 호출자가 있어, 값으로 미리 평가하면 항상 틀린다.
     :raises DataSourceError: 외부 조회가 실패했을 때. **빈 프레임으로 삼키지 않는다.**
     """
     led = ledger if ledger is not None else default_ledger()
@@ -1119,9 +1155,11 @@ def cached_frame(
         df = pd.DataFrame()
 
     write_local(df)
-    led.put(source, cache_key, row_count=len(df), final=is_final)
+    # 확정 여부는 조회가 끝난 지금 평가한다 — 부분 실패 여부에 달린 호출자가 있다.
+    final = is_final() if callable(is_final) else is_final
+    led.put(source, cache_key, row_count=len(df), final=final)
     logger.debug(
-        "로컬 적재: %s %s rows=%d final=%s", source, cache_key, len(df), is_final
+        "로컬 적재: %s %s rows=%d final=%s", source, cache_key, len(df), final
     )
     return df
 ```
@@ -1714,7 +1752,8 @@ def _fetch_fundamentals(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
         fetch_remote=_remote,
         write_local=lambda df: _store_write_daily(day, df, cols),
         # 부분 실패는 확정으로 굳히지 않는다 — 다음 호출에서 빠진 시장을 보완해야 한다.
-        is_final=is_final_date(day) and complete,
+        # 콜러블로 넘기는 이유: complete 는 _remote() 가 돈 뒤에야 정해진다.
+        is_final=lambda: is_final_date(day) and complete,
         ledger=_store_ledger(),
     )
 
@@ -1728,19 +1767,12 @@ def _fetch_fundamentals(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
     return result
 ```
 
-> **주의**: `is_final=is_final_date(day) and complete` 의 `complete` 는 `_remote()` 가
-> 실행된 **뒤에** 읽혀야 한다. `cached_frame` 이 `fetch_remote()` 를 부른 다음
-> `led.put(...)` 을 하므로 순서는 맞지만, `is_final` 은 인자로 **미리 평가**된다.
-> 따라서 `cached_frame` 의 `is_final` 파라미터를 `bool | Callable[[], bool]` 로 받아
-> `led.put` 직전에 호출하도록 `frame.py` 를 수정한다:
->
-> ```python
-> #  frame.py 의 cached_frame 안, write_local(df) 다음 줄
->     final = is_final() if callable(is_final) else is_final
->     led.put(source, cache_key, row_count=len(df), final=final)
-> ```
-> 그리고 타입힌트를 `is_final: bool | Callable[[], bool]` 로 바꾼다. 위 호출부는
-> `is_final=lambda: is_final_date(day) and complete` 로 넘긴다.
+> **주의**: `is_final` 을 반드시 **콜러블로** 넘겨라. `complete` 는 `_remote()` 가
+> 실행된 뒤에야 정해지는데, 값으로 넘기면 `cached_frame` 호출 시점에 — 즉
+> `fetch_remote()` 가 돌기 전에 — 평가되어 언제나 초기값 `True` 가 박힌다. 그러면
+> 부분 실패가 확정으로 굳어 빠진 시장이 영구히 채워지지 않는다.
+> Task 4 의 `cached_frame` 이 이미 `bool | Callable[[], bool]` 을 받고
+> `ledger.put()` 직전에 평가하므로, 호출부만 `lambda:` 로 감싸면 된다.
 
 `_fetch_market_cap`(118-131행)을 아래로 교체한다:
 
@@ -3273,9 +3305,11 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **3. 타입 정합**
 
-- `cached_frame` 의 `is_final` 은 Task 4 에서 `bool` 로 정의됐다가 Task 6 에서
-  `bool | Callable[[], bool]` 로 확장된다. Task 6 Step 3 의 인용 블록이 그 변경을
-  명시하고, 이후 Task 7·8 은 확장된 형태(`lambda: ...`)를 쓴다. 일관.
+- `cached_frame` 의 `is_final` 은 Task 4 에서부터 `bool | Callable[[], bool]` 이다.
+  단일 조회(Task 6 의 `_fetch_market_ohlcv_snapshot`, Task 8 의 `_fetch_index_ohlcv`)는
+  실패하면 raise 하므로 부분 실패 개념이 없어 `bool` 을 그대로 넘기고, 시장별 집계
+  (Task 6 의 펀더멘털·시총, Task 7 의 등락률·순매수)는 `complete` 가 조회 뒤에 정해지므로
+  `lambda:` 로 넘긴다. 두 형태가 공존하는 것이 의도다.
 - `_fetch_per_market` 은 이제 `tuple[pd.DataFrame, bool]` 을 반환한다. 이 함수를 쓰는
   곳은 `fetch.py` 내부뿐(Task 6·7 이 전부 갱신)이며 외부 호출자는 없다 —
   Step 1 의 grep 결과로 확인됨.
