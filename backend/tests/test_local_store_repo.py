@@ -163,3 +163,29 @@ def test_PIT_지수구성을_쓰고_읽는다():
 
 def test_지수구성_미적재는_빈_목록이다():
     assert indexes.read_constituents(_IDX, date(1991, 5, 5)) == []
+
+
+from app.services.data.store import dart_store  # noqa: E402
+
+_CORP = "00000000"  # 실제 corp_code 와 겹치지 않는 시험값
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_dart():
+    yield
+    dart_store.delete_accounts(_CORP, 1990, "11011", "CFS")
+
+
+def test_원계정을_쓰고_읽는다():
+    accounts = [{"account_nm": "자산총계", "thstrm_amount": "1000", "rcept_no": "19910301000001"}]
+    dart_store.write_accounts(_CORP, 1990, "11011", "CFS", accounts)
+
+    got = dart_store.read_accounts(_CORP, 1990, "11011", "CFS")
+    assert got is not None
+    rows, final = got
+    assert rows[0]["account_nm"] == "자산총계"
+    assert final is True  # 1991년 접수 + 90일은 이미 한참 지났다
+
+
+def test_미적재는_None_이다():
+    assert dart_store.read_accounts(_CORP, 1989, "11011", "CFS") is None

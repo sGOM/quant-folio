@@ -580,6 +580,52 @@ _METRICS_CACHE: dict[tuple, dict[str, float | None]] = {}
 _PERIOD_METRICS_CACHE: dict[tuple, dict[str, float | None]] = {}
 
 
+# 로컬 스토어(dart_financials) 접근을 모듈 수준 얇은 래퍼로 감싼다 — 테스트가
+# opendart 네임스페이스에서 실 DB 없이 갈아끼울 수 있게(다른 store 배선과 동일 패턴,
+# app/services/metrics/fetch.py 의 _store_read_daily 등 참고).
+def _store_read_accounts(
+    corp_code: str, bsns_year: int, reprt_code: str, fs_div: str
+) -> tuple[list[dict], bool] | None:
+    from app.services.data.store import dart_store
+
+    return dart_store.read_accounts(corp_code, bsns_year, reprt_code, fs_div)
+
+
+def _store_write_accounts(
+    corp_code: str, bsns_year: int, reprt_code: str, fs_div: str, accounts: list[dict]
+) -> None:
+    from app.services.data.store import dart_store
+
+    dart_store.write_accounts(corp_code, bsns_year, reprt_code, fs_div, accounts)
+
+
+def cached_accounts(
+    corp_code: str, bsns_year: int, reprt_code: str, fs_div: str
+) -> list[dict] | None:
+    """원계정을 2단 캐시(프로세스 → 로컬 DB) 뒤에서 가져온다.
+
+    확정된 보고서(접수일 + 90일 경과)는 로컬에서만 읽는다. 미확정이면 정정공시가
+    아직 들어올 수 있으므로 재조회한다.
+
+    실패는 single_company_accounts 의 DataSourceError 를 그대로 전파한다(§48).
+    """
+    key = (corp_code, bsns_year, reprt_code, fs_div)
+    cached = _ACCOUNTS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    stored = _store_read_accounts(corp_code, bsns_year, reprt_code, fs_div)
+    if stored is not None and stored[1]:  # 확정분
+        _ACCOUNTS_CACHE[key] = stored[0]
+        return stored[0]
+
+    acc = single_company_accounts(corp_code, bsns_year, reprt_code, fs_div)
+    if acc:
+        _store_write_accounts(corp_code, bsns_year, reprt_code, fs_div, acc)
+        _ACCOUNTS_CACHE[key] = acc
+    return acc
+
+
 def cached_corp_code_map() -> dict[str, str] | None:
     """corp_code_map 을 프로세스 내 1회만 로드해 재사용한다(대용량 zip 반복 다운로드 방지).
 
@@ -606,12 +652,7 @@ def annual_metrics(corp_code: str, bsns_year: int) -> dict[str, float | None]:
 
     accounts: list[dict] | None = None
     for fs_div in (FS_CONSOLIDATED, FS_SEPARATE):
-        acc_key = (corp_code, bsns_year, REPORT_ANNUAL, fs_div)
-        acc = _ACCOUNTS_CACHE.get(acc_key)
-        if acc is None:
-            acc = single_company_accounts(corp_code, bsns_year, REPORT_ANNUAL, fs_div)
-            if acc:
-                _ACCOUNTS_CACHE[acc_key] = acc
+        acc = cached_accounts(corp_code, bsns_year, REPORT_ANNUAL, fs_div)
         if acc:
             accounts = acc
             break
@@ -648,12 +689,7 @@ def _period_metrics(corp_code: str, bsns_year: int, reprt_code: str) -> dict[str
 
     accounts: list[dict] | None = None
     for fs_div in (FS_CONSOLIDATED, FS_SEPARATE):
-        acc_key = (corp_code, bsns_year, reprt_code, fs_div)
-        acc = _ACCOUNTS_CACHE.get(acc_key)
-        if acc is None:
-            acc = single_company_accounts(corp_code, bsns_year, reprt_code, fs_div)
-            if acc:
-                _ACCOUNTS_CACHE[acc_key] = acc
+        acc = cached_accounts(corp_code, bsns_year, reprt_code, fs_div)
         if acc:
             accounts = acc
             break

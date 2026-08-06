@@ -27,6 +27,31 @@ from app.services.data.errors import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _fake_dart_store(monkeypatch):
+    """dart_financials 로컬 스토어를 인메모리로 대역한다.
+
+    cached_accounts() 가 opendart._store_read_accounts/_store_write_accounts 를
+    거쳐 로컬 DB 를 두드리므로, 네트워크 없이 도는 이 단위테스트 스위트가 실 DB 를
+    타지 않도록(그리고 이전 테스트가 남긴 레코드에 캐시가 선점당하지 않도록) 매
+    테스트마다 새 dict 로 갈아끼운다. 참고: tests/test_krx_index.py 의 _clear_cache.
+    """
+    store: dict[tuple, list[dict]] = {}
+
+    def fake_read(corp_code, bsns_year, reprt_code, fs_div):
+        key = (corp_code, bsns_year, reprt_code, fs_div)
+        if key not in store:
+            return None
+        return store[key], True  # 확정 여부 자체는 이 모듈의 관심사가 아니다
+
+    def fake_write(corp_code, bsns_year, reprt_code, fs_div, accounts):
+        store[(corp_code, bsns_year, reprt_code, fs_div)] = accounts
+
+    monkeypatch.setattr(opendart, "_store_read_accounts", fake_read)
+    monkeypatch.setattr(opendart, "_store_write_accounts", fake_write)
+    yield store
+
+
 def _row(sj, aid, nm, amt):
     """OpenDART fnlttSinglAcntAll 한 행(축약)."""
     return {"sj_div": sj, "account_id": aid, "account_nm": nm, "thstrm_amount": amt}
@@ -833,3 +858,15 @@ class TestAggregateSystemicSchemaShortCircuit:
         assert "000000" in out  # 성공한 종목의 부분 결과가 살아 있다
         # 첫 종목만 성공(3회 호출) → 나머지 11종목도 각각 시도됐다
         assert len({c for c in calls}) == len(codes)
+
+
+from app.services.data.store.dart_store import confirmed_date  # noqa: E402
+
+
+def test_확정일은_접수일_90일_후다():
+    assert confirmed_date(date(2026, 3, 20), 2025) == date(2026, 6, 18)
+
+
+def test_접수일_미상이면_사업연도_말_1년_후다():
+    """보수적으로 잡는다 — 확정을 앞당기는 것보다 늦추는 쪽이 안전하다."""
+    assert confirmed_date(None, 2025) == date(2026, 12, 31)
