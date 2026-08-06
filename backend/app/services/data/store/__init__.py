@@ -5,6 +5,8 @@
 공개 진입점은 frame.cached_frame 하나다. 나머지 모듈(ledger·daily·periods·indexes·
 dart_store)은 그 뒤에서 테이블별 읽기/쓰기를 담당한다.
 """
+from app.services.data.store import daily
+from app.services.data.store.coerce import coerce_value
 from app.services.data.store.frame import cached_frame, is_final_date, make_cache_key
 from app.services.data.store.ledger import (
     InMemoryLedger,
@@ -23,4 +25,6 @@ __all__ = [
     "cached_frame",
     "is_final_date",
     "make_cache_key",
+    "daily",
+    "coerce_value",
 ]
