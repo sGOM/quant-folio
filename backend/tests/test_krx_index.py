@@ -18,6 +18,8 @@ from app.services.data.errors import (
     cooldown_remaining,
     note_failure,
 )
+from app.services.data.store import indexes as store_indexes
+from app.services.data.store.ledger import InMemoryLedger
 
 
 class _FakeResp:
@@ -52,6 +54,22 @@ def _clear_cache(monkeypatch):
     # "스냅샷 없음"(빈 dict)으로 목 처리해 실제 DB 접속을 타지 않게 한다. 스냅샷 동작
     # 자체를 검증하는 테스트는 개별적으로 이 목을 덮어쓴다.
     monkeypatch.setattr(krx_index, "_lookup_pit_snapshot_sync", lambda as_of: {})
+    # index_members 의 로컬 스토어 2차 캐시(원장 + PIT 지수구성)도 실제 DB 대신
+    # 테스트마다 새 인메모리 대역으로 갈아끼운다. 실제 DB 로 대역하면 한 테스트가 쓴
+    # (index, base_date) 조합이 이후 테스트에서 final=True 로 남아, _session 을 어떻게
+    # 목해도 로컬 스토어가 먼저 응답해버려 세션 목이 무의미해진다(실제로 재현: 실 DB
+    # 대역 없이 돌리면 이전 테스트의 잔존 레코드 때문에 unauthenticated 테스트가 깨졌다).
+    fake_ledger = InMemoryLedger()
+    monkeypatch.setattr("app.services.data.store.ledger.default_ledger", lambda: fake_ledger)
+    fake_constituents: dict[tuple[str, object], list[str]] = {}
+    monkeypatch.setattr(
+        store_indexes, "write_constituents",
+        lambda code, day, codes: fake_constituents.__setitem__((code, day), list(codes)),
+    )
+    monkeypatch.setattr(
+        store_indexes, "read_constituents",
+        lambda code, day: fake_constituents.get((code, day), []),
+    )
     clear_cooldown("krx")
     yield
     krx_index._MEMBERS_CACHE.clear()

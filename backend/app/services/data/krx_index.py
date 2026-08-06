@@ -256,6 +256,19 @@ def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
     if key in _MEMBERS_CACHE:
         return _MEMBERS_CACHE[key]
 
+    # 2차 캐시: 로컬 영구 저장소. PIT 지수구성은 확정 후 불변이므로 한 번 적재되면
+    # KRX 로그인 없이도 조회된다(§44-1 차단 시 백테스트가 살아남는다).
+    from app.services.data.store import indexes as _indexes
+    from app.services.data.store.frame import is_final_date, make_cache_key
+    from app.services.data.store.ledger import default_ledger
+
+    _store_key = make_cache_key(index, as_of)
+    _entry = default_ledger().get("index_members", _store_key)
+    if _entry is not None and _entry.final:
+        codes = _indexes.read_constituents(index, as_of)
+        _MEMBERS_CACHE[key] = codes
+        return codes
+
     sess = _session()
     if sess is None:
         logger.debug("KRX 미인증 — %s 구성종목 조회 건너뜀", index)
@@ -293,6 +306,11 @@ def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
     # 쿨다운은 _krx_rows 가 이미 걸었다 — 여기서 또 걸지 않는다.
     if not ok and errors:
         raise representative(errors)
+
+    _indexes.write_constituents(index, as_of, codes)
+    default_ledger().put(
+        "index_members", _store_key, row_count=len(codes), final=is_final_date(as_of)
+    )
 
     # 성공 결과만 캐시한다(실패/미인증/일시 장애의 빈 응답을 캐시하면 프로세스 수명
     # 내내 해당 시점 구성이 []로 고착 → 조용히 고정 유니버스로 폴백하는 생존편향 재유입).

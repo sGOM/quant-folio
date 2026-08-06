@@ -118,3 +118,48 @@ def test_투자자군이_다르면_다른_행이다():
     )
     assert float(pc.loc["005930", "등락률"]) == pytest.approx(5.5)
     assert float(npv.loc["005930", "net_buy_value"]) == pytest.approx(1e9)
+
+
+from app.services.data.store import indexes  # noqa: E402
+
+_IDX = "9999"  # 실제 지수코드와 겹치지 않는 시험용 코드
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_indexes():
+    yield
+    indexes.delete_index_ohlcv(_IDX)
+    indexes.delete_constituents(_IDX, _DAY)
+
+
+def test_지수_OHLCV_를_쓰고_기간으로_읽는다():
+    df = pd.DataFrame(
+        {"open": [100.0, 110.0], "high": [120.0, 130.0], "low": [90.0, 100.0],
+         "close": [115.0, 125.0], "volume": [1000, 2000], "trading_value": [10, 20]},
+        index=pd.to_datetime(["1990-01-02", "1990-01-03"]),
+    )
+    indexes.write_index_ohlcv(_IDX, df, index_name="시험지수")
+
+    out = indexes.read_index_ohlcv(_IDX, date(1990, 1, 2), date(1990, 1, 3))
+    assert len(out) == 2
+    assert float(out.iloc[0]["close"]) == pytest.approx(115.0)
+    assert list(out.columns) == ["open", "high", "low", "close", "volume", "trading_value"]
+
+
+def test_지수_OHLCV_기간_밖은_안_읽힌다():
+    df = pd.DataFrame(
+        {"open": [100.0], "high": [120.0], "low": [90.0],
+         "close": [115.0], "volume": [1000], "trading_value": [10]},
+        index=pd.to_datetime(["1990-01-02"]),
+    )
+    indexes.write_index_ohlcv(_IDX, df)
+    assert indexes.read_index_ohlcv(_IDX, date(1990, 2, 1), date(1990, 2, 28)).empty
+
+
+def test_PIT_지수구성을_쓰고_읽는다():
+    indexes.write_constituents(_IDX, _DAY, ["005930", "000660"])
+    assert sorted(indexes.read_constituents(_IDX, _DAY)) == ["000660", "005930"]
+
+
+def test_지수구성_미적재는_빈_목록이다():
+    assert indexes.read_constituents(_IDX, date(1991, 5, 5)) == []

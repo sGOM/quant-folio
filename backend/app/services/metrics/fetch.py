@@ -29,6 +29,7 @@ from app.services.data.errors import (
 )
 from app.services.data.loader import bounded_socket_timeout  # pykrx 무응답 행 방지
 from app.services.data.store import daily as _daily
+from app.services.data.store import indexes as _indexes
 from app.services.data.store import periods as _periods
 from app.services.data.store.frame import cached_frame, is_final_date, make_cache_key
 from app.services.data.store.ledger import default_ledger
@@ -66,6 +67,14 @@ def _store_write_periods(start, end, investors, df, columns):
 
 def _store_read_periods(start, end, investors, cols, out_columns):
     return _periods.read_periods(start, end, investors, cols, out_columns=out_columns)
+
+
+def _store_write_index_ohlcv(code, df, name):
+    _indexes.write_index_ohlcv(code, df, index_name=name)
+
+
+def _store_read_index_ohlcv(code, start, end):
+    return _indexes.read_index_ohlcv(code, start, end)
 
 
 def _ymd_to_date(ymd: str) -> date:
@@ -420,28 +429,49 @@ def _fetch_market_ohlcv_snapshot(date_ymd: str, mkt: str) -> pd.DataFrame | None
 
 
 def _fetch_index_ohlcv(start_ymd: str, end_ymd: str, ticker: str) -> pd.DataFrame | None:
-    """업종지수 OHLCV를 조회한다. 실패 시 None 반환.
+    """지수 OHLCV 를 조회한다 — 로컬 우선. 데이터가 없으면 None.
 
     pykrx 한글 컬럼 → 영문 변환:
       시가→open, 고가→high, 저가→low, 종가→close,
       거래량→volume, 거래대금→trading_value
-    """
-    stock = _pykrx_stock()
 
-    try:
-        with bounded_socket_timeout(20):
-            df = stock.get_index_ohlcv(start_ymd, end_ymd, ticker)
+    :raises DataSourceError: 조회가 실패했을 때(이전 판은 None 을 돌려줬다).
+    """
+    start_d, end_d = _ymd_to_date(start_ymd), _ymd_to_date(end_ymd)
+
+    def _remote() -> pd.DataFrame:
+        stock = _pykrx_stock()
+        try:
+            with bounded_socket_timeout(20):
+                df = stock.get_index_ohlcv(start_ymd, end_ymd, ticker)
+        except DataSourceError as e:
+            note_failure(e)
+            raise
+        except Exception as e:  # noqa: BLE001 - pykrx 는 임의 예외를 던진다
+            wrapped = SourceUnavailableError(
+                "krx", f"지수 OHLCV 조회 실패({ticker} {start_ymd}~{end_ymd}): {e}"
+            )
+            # 패닉·섹터 지표의 핵심 입력이라 원인 스택을 운영 로그에 남긴다.
+            logger.warning("지수 OHLCV 조회 실패 (%s)", ticker, exc_info=True)
+            note_failure(wrapped)
+            raise wrapped from e
         if df is None or df.empty:
-            return None
-        df = df.rename(columns={
+            return pd.DataFrame(columns=_indexes.OHLCV_COLUMNS)
+        return df.rename(columns={
             "시가": "open", "고가": "high", "저가": "low", "종가": "close",
             "거래량": "volume", "거래대금": "trading_value",
         })
-        return df
-    except Exception:
-        # 패닉·섹터 지표의 핵심 입력이므로 원인 스택을 운영 로그(warning)에 남긴다.
-        logger.warning("업종지수 OHLCV 조회 실패 (%s)", ticker, exc_info=True)
-        return None
+
+    out = cached_frame(
+        "index_ohlcv",
+        make_cache_key(ticker, start_ymd, end_ymd),
+        read_local=lambda: _store_read_index_ohlcv(ticker, start_d, end_d),
+        fetch_remote=_remote,
+        write_local=lambda df: _store_write_index_ohlcv(ticker, df, None),
+        is_final=is_final_date(end_d),
+        ledger=_store_ledger(),
+    )
+    return out if not out.empty else None
 
 
 def _fetch_index_tickers(date_ymd: str, mkt: str) -> list[str]:
