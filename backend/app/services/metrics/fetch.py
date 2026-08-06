@@ -14,12 +14,23 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from datetime import date, datetime
 from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 
+from app.services.data.errors import (
+    DataSourceError,
+    SourceUnavailableError,
+    note_failure,
+    representative,
+    stop_aggregate,
+)
 from app.services.data.loader import bounded_socket_timeout  # pykrx 무응답 행 방지
+from app.services.data.store import daily as _daily
+from app.services.data.store.frame import cached_frame, is_final_date, make_cache_key
+from app.services.data.store.ledger import default_ledger
 
 logger = logging.getLogger("app.services.metrics")
 
@@ -35,37 +46,79 @@ def _pykrx_stock():
     return stock
 
 
+# 스토어 접근을 모듈 수준 얇은 래퍼로 감싼다 — 테스트가 실제 DB 없이 갈아끼울 수 있게.
+def _store_ledger():
+    return default_ledger()
+
+
+def _store_write_daily(day, df, columns):
+    _daily.write_daily(day, df, columns=columns)
+
+
+def _store_read_daily(day, cols, out_columns):
+    return _daily.read_daily(day, cols, out_columns=out_columns)
+
+
+def _ymd_to_date(ymd: str) -> date:
+    """'20190312' → date(2019, 3, 12)."""
+    return datetime.strptime(ymd, "%Y%m%d").date()
+
+
 def _fetch_per_market(
     fetch_one: Callable[[Any, str], pd.DataFrame | None],
     mkts: list[str],
     *,
     what: str,
     when: str,
+    source: str,
     empty_columns: list[str] | None = None,
-) -> pd.DataFrame:
-    """시장별 조회를 "루프 → 실패 경고 → concat" 골격으로 일반화한다.
+) -> tuple[pd.DataFrame, bool]:
+    """시장별 조회를 "루프 → 실패 수집 → concat" 골격으로 일반화한다.
 
-    `fetch_one(stock, mkt)` 이 시장별 DataFrame(또는 None/빈 프레임=건너뜀)을 반환한다.
-    개별 시장 실패는 경고 로그 후 건너뛰고, 전부 실패하면 빈 프레임을 반환한다
-    (`empty_columns` 지정 시 해당 컬럼 스켈레톤).
+    이전 판은 개별 시장 실패를 경고만 남기고 삼켜, **전 시장이 실패해도 빈 프레임을
+    반환**했다. §44-1(KRX 차단)·§47(폐기된 검증)에서 백테스트가 빈 패널 위에서
+    '성공'하며 무의미한 수치를 낸 원인이 이것이다.
 
-    :param what: 실패 로그용 데이터 명칭(예: "펀더멘털")
-    :param when: 실패 로그용 기간/일자 표기(예: as_of, "start~end")
+    이제 전량 실패는 `representative()` 가 고른 대표 예외로 raise 한다. 일부만
+    실패하면 성공분을 돌려주되 `complete=False` 로 알려, 호출자가 그 결과를 확정으로
+    굳히지 않게 한다(다음 호출에서 빠진 시장을 보완할 수 있어야 한다).
+
+    :param source: 쿨다운·집계 단락 판정에 쓰는 소스 식별자
+    :returns: (합친 프레임, 전 시장 성공 여부)
     """
     stock = _pykrx_stock()
     frames: list[pd.DataFrame] = []
+    errors: list[DataSourceError] = []
+    ok = 0
+
     for mkt in mkts:
+        if stop_aggregate(source, errors, ok):
+            logger.warning("%s 집계 단락 (%s %s) — 남은 시장 건너뜀", what, mkt, when)
+            break
         try:
             df = fetch_one(stock, mkt)
+            ok += 1
             if df is None or df.empty:
                 continue
             frames.append(df)
-        except Exception:
+        except DataSourceError as e:
+            logger.warning("%s 조회 실패 (%s %s): %s", what, mkt, when, e)
+            note_failure(e)
+            errors.append(e)
+        except Exception as e:  # noqa: BLE001 - pykrx 는 임의 예외를 던진다
+            wrapped = SourceUnavailableError(source, f"{what} 조회 실패({mkt} {when}): {e}")
             logger.warning("%s 조회 실패 (%s %s)", what, mkt, when, exc_info=True)
+            note_failure(wrapped)
+            errors.append(wrapped)
 
+    if errors and ok == 0:
+        raise representative(errors)
+
+    complete = not errors and ok == len(mkts)
     if not frames:
-        return pd.DataFrame(columns=empty_columns) if empty_columns else pd.DataFrame()
-    return pd.concat(frames)
+        empty = pd.DataFrame(columns=empty_columns) if empty_columns else pd.DataFrame()
+        return empty, complete
+    return pd.concat(frames), complete
 
 # 펀더멘털(PER/PBR/DIV) 프로세스 내 LRU 캐시.
 # 특정 as_of 일자의 전 종목 펀더멘털은 확정 후 변하지 않으므로 (as_of, 시장) 단위로
@@ -77,18 +130,26 @@ _FUND_CACHE_MAX = 64  # 스냅샷 상한(초과 시 가장 오래된 항목 축�
 
 
 def _fetch_fundamentals(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
-    """전 종목 펀더멘털(PER/PBR/DIV)을 시장별로 조회해 합산한다.
+    """전 종목 펀더멘털(PER/PBR/DIV)을 조회한다 — 로컬 우선.
 
-    컬럼: PER, PBR, DIV + market(추가). 티커 인덱스.
-    PER=0은 적자(undefined)로 간주해 음수로 취급한다.
-    (as_of, 시장) 키로 프로세스 내 LRU 캐시하며, 호출자가 결과를 변형해도 캐시가
-    오염되지 않도록 항상 사본을 반환한다.
+    컬럼: PER, PBR, DIV + market. 티커 인덱스.
+    PER=0 은 적자(undefined)로 간주해 NaN 으로 바꾼다.
+
+    2단 캐시다. 1차는 프로세스 내 LRU(_FUND_CACHE, DB 왕복도 아낀다), 2차는
+    stock_daily_snapshots. 확정된 과거 일자는 최초 1회만 pykrx 를 탄다.
+
+    :raises DataSourceError: 전 시장 조회가 실패했을 때(빈 프레임을 돌려주지 않는다).
     """
     key = (as_of_ymd, tuple(sorted(mkts)))
     cached = _FUND_CACHE.get(key)
     if cached is not None:
-        _FUND_CACHE.move_to_end(key)  # 최근 사용으로 갱신
+        _FUND_CACHE.move_to_end(key)
         return cached.copy()
+
+    day = _ymd_to_date(as_of_ymd)
+    cols = {"PER": "per", "PBR": "pbr", "DIV": "div", "market": "market"}
+    out_cols = {"per": "PER", "pbr": "PBR", "div": "DIV", "market": "market"}
+    complete = True
 
     def _one(stock, mkt: str) -> pd.DataFrame | None:
         df = stock.get_market_fundamental(as_of_ymd, market=mkt)
@@ -96,39 +157,81 @@ def _fetch_fundamentals(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
             return None
         df = df[["PER", "PBR", "DIV"]].copy()
         df["market"] = mkt
-        # PER=0 → NaN 처리 (pykrx 는 적자 종목에 0 반환)
         df.loc[df["PER"] <= 0, "PER"] = np.nan
         return df
 
-    result = _fetch_per_market(
-        _one, mkts, what="펀더멘털", when=as_of_ymd,
-        empty_columns=["PER", "PBR", "DIV", "market"],
+    def _remote() -> pd.DataFrame:
+        nonlocal complete
+        df, complete = _fetch_per_market(
+            _one, mkts, what="펀더멘털", when=as_of_ymd, source="krx",
+            empty_columns=["PER", "PBR", "DIV", "market"],
+        )
+        return df
+
+    result = cached_frame(
+        "fundamentals",
+        make_cache_key(as_of_ymd, mkts),
+        read_local=lambda: _store_read_daily(day, list(out_cols), out_cols),
+        fetch_remote=_remote,
+        write_local=lambda df: _store_write_daily(day, df, cols),
+        # 부분 실패는 확정으로 굳히지 않는다 — 다음 호출에서 빠진 시장을 보완해야 한다.
+        # 콜러블로 넘기는 이유: complete 는 _remote() 가 돈 뒤에야 정해진다.
+        is_final=lambda: is_final_date(day) and complete,
+        ledger=_store_ledger(),
     )
+
     if result.empty:
-        # 빈 결과는 캐시하지 않는다(일시적 조회 실패를 영구화하지 않기 위함).
         return result
 
     _FUND_CACHE[key] = result.copy()
     _FUND_CACHE.move_to_end(key)
     if len(_FUND_CACHE) > _FUND_CACHE_MAX:
-        _FUND_CACHE.popitem(last=False)  # 가장 오래된 항목 축출
+        _FUND_CACHE.popitem(last=False)
     return result
 
 
 def _fetch_market_cap(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
-    """전 종목 시가총액·상장주식수·거래대금을 조회한다.
+    """전 종목 시가총액·상장주식수·거래대금을 조회한다 — 로컬 우선.
 
-    컬럼: 시가총액, 상장주식수, 거래대금. 티커 인덱스.
+    컬럼: 시가총액, 거래량, 거래대금, 상장주식수. 티커 인덱스.
+
+    :raises DataSourceError: 전 시장 조회가 실패했을 때.
     """
+    day = _ymd_to_date(as_of_ymd)
+    cols = {
+        "시가총액": "market_cap", "거래량": "volume",
+        "거래대금": "trading_value", "상장주식수": "shares",
+    }
+    out_cols = {
+        "market_cap": "시가총액", "volume": "거래량",
+        "trading_value": "거래대금", "shares": "상장주식수",
+    }
+    complete = True
+
     def _one(stock, mkt: str) -> pd.DataFrame | None:
         df = stock.get_market_cap(as_of_ymd, market=mkt)
         if df is None or df.empty:
             return None
-        # 필요 컬럼만 선택 (버전 차이 대비)
-        cols = [c for c in ["시가총액", "거래량", "거래대금", "상장주식수"] if c in df.columns]
-        return df[cols]
+        # 필요 컬럼만 선택 (pykrx 버전 차이 대비)
+        keep = [c for c in ["시가총액", "거래량", "거래대금", "상장주식수"] if c in df.columns]
+        return df[keep]
 
-    return _fetch_per_market(_one, mkts, what="시가총액", when=as_of_ymd)
+    def _remote() -> pd.DataFrame:
+        nonlocal complete
+        df, complete = _fetch_per_market(
+            _one, mkts, what="시가총액", when=as_of_ymd, source="krx",
+        )
+        return df
+
+    return cached_frame(
+        "market_cap",
+        make_cache_key(as_of_ymd, mkts),
+        read_local=lambda: _store_read_daily(day, list(out_cols), out_cols),
+        fetch_remote=_remote,
+        write_local=lambda df: _store_write_daily(day, df, cols),
+        is_final=lambda: is_final_date(day) and complete,
+        ledger=_store_ledger(),
+    )
 
 
 def _fetch_price_change(start_ymd: str, end_ymd: str, mkts: list[str]) -> pd.DataFrame:
@@ -136,13 +239,16 @@ def _fetch_price_change(start_ymd: str, end_ymd: str, mkts: list[str]) -> pd.Dat
 
     컬럼: 시가, 종가, 변동폭, 등락률, 거래량, 거래대금. 티커 인덱스.
     등락률은 pykrx 원값 그대로(%) — 호출자가 /100으로 변환한다.
+
+    :raises DataSourceError: 전 시장 조회가 실패했을 때(빈 프레임을 돌려주지 않는다).
     """
     def _one(stock, mkt: str) -> pd.DataFrame | None:
         return stock.get_market_price_change(start_ymd, end_ymd, market=mkt)
 
-    return _fetch_per_market(
-        _one, mkts, what="가격변동", when=f"{start_ymd}~{end_ymd}",
+    df, _complete = _fetch_per_market(
+        _one, mkts, what="가격변동", when=f"{start_ymd}~{end_ymd}", source="krx",
     )
+    return df
 
 
 #: 수급(flow) 팩터 기본 투자자군 — 외국인 + 기관합계 순매수. KRX 투자자 분류 라벨.
@@ -201,23 +307,46 @@ def _fetch_net_purchases(
 
 
 def _fetch_market_ohlcv_snapshot(date_ymd: str, mkt: str) -> pd.DataFrame | None:
-    """단일 거래일의 전 종목 OHLCV 스냅샷을 조회한다(패닉셀 S9 신저가 브레드스 등).
+    """단일 거래일의 전 종목 OHLCV 스냅샷을 조회한다 — 로컬 우선.
 
-    컬럼: 시가/고가/저가/종가/거래량/거래대금/등락률/시가총액. 티커 인덱스.
-    기간 조회(_fetch_price_change)와 달리 "그 날짜 하루"만 반환하므로, 여러 날짜를
-    누적하면(캐시) 종목별 종가 시계열을 재구성할 수 있다. 1회 호출로 시장 전체를
-    받아오므로 브레드스 계열 호출과 비용이 같은 급(시장당 1회)이다.
+    컬럼: 시가/고가/저가/종가/거래량/거래대금/등락률. 티커 인덱스.
+    패닉셀 S9(신저가 브레드스)가 날짜를 훑으며 부르므로 로컬 적재 효과가 가장 크다.
+
+    :raises DataSourceError: 조회가 실패했을 때(이전 판은 None 을 돌려줬다).
     """
-    stock = _pykrx_stock()
-    try:
-        with bounded_socket_timeout(20):
-            df = stock.get_market_ohlcv(date_ymd, market=mkt)
-        if df is None or df.empty:
-            return None
-        return df
-    except Exception:
-        logger.warning("전종목 OHLCV 스냅샷 조회 실패 (%s %s)", mkt, date_ymd, exc_info=True)
-        return None
+    day = _ymd_to_date(date_ymd)
+    cols = {
+        "시가": "open", "고가": "high", "저가": "low", "종가": "close",
+        "거래량": "volume", "거래대금": "trading_value", "등락률": "change_pct",
+    }
+    out_cols = {v: k for k, v in cols.items()}
+
+    def _remote() -> pd.DataFrame:
+        stock = _pykrx_stock()
+        try:
+            with bounded_socket_timeout(20):
+                df = stock.get_market_ohlcv(date_ymd, market=mkt)
+        except DataSourceError as e:
+            note_failure(e)
+            raise
+        except Exception as e:  # noqa: BLE001 - pykrx 는 임의 예외를 던진다
+            wrapped = SourceUnavailableError(
+                "krx", f"전종목 OHLCV 스냅샷 조회 실패({mkt} {date_ymd}): {e}"
+            )
+            note_failure(wrapped)
+            raise wrapped from e
+        return df if df is not None else pd.DataFrame()
+
+    out = cached_frame(
+        "market_ohlcv",
+        make_cache_key(date_ymd, mkt),
+        read_local=lambda: _store_read_daily(day, list(out_cols), out_cols),
+        fetch_remote=_remote,
+        write_local=lambda df: _store_write_daily(day, df, cols),
+        is_final=is_final_date(day),
+        ledger=_store_ledger(),
+    )
+    return out if not out.empty else None
 
 
 def _fetch_index_ohlcv(start_ymd: str, end_ymd: str, ticker: str) -> pd.DataFrame | None:

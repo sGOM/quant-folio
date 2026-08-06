@@ -149,10 +149,19 @@ def test_compute_flow_norm_value_denominator(monkeypatch):
 
 
 def test_compute_flow_norm_empty_when_all_fail(monkeypatch):
-    """순매수 전량 실패면 빈 Series(호출자 스킵 판단)."""
+    """순매수 전량 실패면 빈 Series(호출자 스킵 판단).
+
+    compute_flow_norm 은 npf.empty 를 확인하기 전에 정규화 분모(_fetch_market_cap)도
+    함께 조회한다. 여기선 net_purchases 실패 경로만 검증하는 것이 목적이라, 무관한
+    market_cap 호출이 (지금은 예외를 던지는) 실제 pykrx 를 타지 않도록 함께 대역한다.
+    """
     monkeypatch.setattr(
         factors, "_fetch_net_purchases",
         lambda s, e, m: pd.DataFrame(columns=["net_buy_value"]),
+    )
+    monkeypatch.setattr(
+        factors, "_fetch_market_cap",
+        lambda ymd, m: pd.DataFrame(columns=["시가총액"]),
     )
     out = factors.compute_flow_norm(["005930"], date(2024, 4, 1))
     assert out.empty
