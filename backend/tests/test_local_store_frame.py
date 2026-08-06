@@ -34,3 +34,181 @@ def test_인메모리_원장은_같은_키를_덮어쓴다():
     ledger.put("index_ohlcv", "1001|20260806", row_count=1, final=False)
     ledger.put("index_ohlcv", "1001|20260806", row_count=1, final=True)
     assert ledger.get("index_ohlcv", "1001|20260806").final is True
+
+
+from datetime import date
+
+import pandas as pd
+import pytest
+
+from app.services.data.errors import SourceAuthError
+from app.services.data.store.frame import cached_frame, is_final_date, make_cache_key
+
+
+class _Spy:
+    """외부 호출 횟수와 로컬 저장을 추적하는 대역."""
+
+    def __init__(self, remote: pd.DataFrame | Exception):
+        self.remote = remote
+        self.calls = 0
+        self.stored: pd.DataFrame | None = None
+
+    def fetch_remote(self) -> pd.DataFrame:
+        self.calls += 1
+        if isinstance(self.remote, Exception):
+            raise self.remote
+        return self.remote
+
+    def write_local(self, df: pd.DataFrame) -> None:
+        self.stored = df
+
+    def read_local(self) -> pd.DataFrame:
+        return self.stored if self.stored is not None else pd.DataFrame()
+
+
+def _frame(n: int) -> pd.DataFrame:
+    return pd.DataFrame({"PER": [10.0] * n})
+
+
+def test_미적재면_외부를_한_번_호출하고_저장한다():
+    ledger = InMemoryLedger()
+    spy = _Spy(_frame(3))
+
+    out = cached_frame(
+        "fundamentals", "20190312|KOSPI",
+        read_local=spy.read_local, fetch_remote=spy.fetch_remote,
+        write_local=spy.write_local, is_final=True, ledger=ledger,
+    )
+
+    assert spy.calls == 1
+    assert len(out) == 3
+    assert ledger.get("fundamentals", "20190312|KOSPI") == LedgerEntry(
+        row_count=3, final=True
+    )
+
+
+def test_확정_적재분은_외부를_호출하지_않는다():
+    ledger = InMemoryLedger()
+    spy = _Spy(_frame(3))
+    kwargs = dict(
+        read_local=spy.read_local, fetch_remote=spy.fetch_remote,
+        write_local=spy.write_local, is_final=True, ledger=ledger,
+    )
+
+    cached_frame("fundamentals", "20190312|KOSPI", **kwargs)
+    out = cached_frame("fundamentals", "20190312|KOSPI", **kwargs)
+
+    assert spy.calls == 1  # 두 번째 호출은 로컬에서 읽었다
+    assert len(out) == 3
+
+
+def test_확정된_0행은_빈_결과를_주되_재조회하지_않는다():
+    """휴장일이 매번 외부를 두드리면 저장소의 목적이 무너진다."""
+    ledger = InMemoryLedger()
+    spy = _Spy(pd.DataFrame())
+    kwargs = dict(
+        read_local=spy.read_local, fetch_remote=spy.fetch_remote,
+        write_local=spy.write_local, is_final=True, ledger=ledger,
+    )
+
+    cached_frame("fundamentals", "20190101|KOSPI", **kwargs)
+    out = cached_frame("fundamentals", "20190101|KOSPI", **kwargs)
+
+    assert spy.calls == 1
+    assert out.empty
+
+
+def test_외부_실패는_빈_프레임이_아니라_예외로_전파된다():
+    """§48 의 핵심 계약 — 실패가 값이 되면 호출자가 무시할 수 있다."""
+    ledger = InMemoryLedger()
+    spy = _Spy(SourceAuthError("krx", "로그인 차단"))
+
+    with pytest.raises(SourceAuthError):
+        cached_frame(
+            "fundamentals", "20190312|KOSPI",
+            read_local=spy.read_local, fetch_remote=spy.fetch_remote,
+            write_local=spy.write_local, is_final=True, ledger=ledger,
+        )
+
+    assert ledger.get("fundamentals", "20190312|KOSPI") is None  # 실패는 기록하지 않는다
+
+
+def test_미확정_적재분은_다음_호출에서_재조회된다():
+    """당일 시세·미확정 DART 는 저장하되 굳히지 않는다."""
+    ledger = InMemoryLedger()
+    spy = _Spy(_frame(2))
+    kwargs = dict(
+        read_local=spy.read_local, fetch_remote=spy.fetch_remote,
+        write_local=spy.write_local, is_final=False, ledger=ledger,
+    )
+
+    cached_frame("index_ohlcv", "1001|20260806", **kwargs)
+    cached_frame("index_ohlcv", "1001|20260806", **kwargs)
+
+    assert spy.calls == 2
+
+
+def test_ledger_생략시_기본_구현을_쓴다(monkeypatch):
+    """프로덕션 경로가 default_ledger 를 경유하는지 확인한다."""
+    fake = InMemoryLedger()
+    monkeypatch.setattr(
+        "app.services.data.store.frame.default_ledger", lambda: fake
+    )
+    spy = _Spy(_frame(1))
+
+    cached_frame(
+        "market_cap", "20190312|KOSPI",
+        read_local=spy.read_local, fetch_remote=spy.fetch_remote,
+        write_local=spy.write_local, is_final=True,
+    )
+
+    assert fake.get("market_cap", "20190312|KOSPI") == LedgerEntry(row_count=1, final=True)
+
+
+def test_is_final_은_콜러블도_받는다():
+    """확정 여부가 조회 결과에 달린 호출자가 있다 — 부분 실패면 굳히면 안 된다."""
+    ledger = InMemoryLedger()
+    spy = _Spy(_frame(2))
+
+    cached_frame(
+        "price_change", "20190101|20190131|KOSPI",
+        read_local=spy.read_local, fetch_remote=spy.fetch_remote,
+        write_local=spy.write_local, is_final=lambda: True, ledger=ledger,
+    )
+
+    assert ledger.get("price_change", "20190101|20190131|KOSPI").final is True
+
+
+def test_is_final_콜러블은_외부조회_뒤에_평가된다():
+    """값으로 미리 평가하면 fetch_remote 결과에 의존하는 판단이 항상 틀린다."""
+    ledger = InMemoryLedger()
+    complete = False
+
+    def _fetch():
+        nonlocal complete
+        complete = True  # 조회가 끝나야 확정 여부가 정해진다
+        return _frame(1)
+
+    cached_frame(
+        "price_change", "20190201|20190228|KOSPI",
+        read_local=lambda: pd.DataFrame(), fetch_remote=_fetch,
+        write_local=lambda df: None, is_final=lambda: complete, ledger=ledger,
+    )
+
+    assert ledger.get("price_change", "20190201|20190228|KOSPI").final is True
+
+
+def test_is_final_date_는_전일까지만_확정으로_본다():
+    today = date(2026, 8, 6)
+    assert is_final_date(date(2026, 8, 5), today=today) is True
+    assert is_final_date(date(2026, 8, 6), today=today) is False
+    assert is_final_date(date(2026, 8, 7), today=today) is False
+
+
+def test_make_cache_key_는_결정적이다():
+    assert make_cache_key("20190312", "KOSPI") == "20190312|KOSPI"
+    assert make_cache_key("20190312", ["KOSDAQ", "KOSPI"]) == "20190312|KOSDAQ,KOSPI"
+    # 순서가 달라도 같은 키가 나와야 한다 — 시장 목록은 정렬된다.
+    assert make_cache_key("20190312", ["KOSPI", "KOSDAQ"]) == make_cache_key(
+        "20190312", ["KOSDAQ", "KOSPI"]
+    )
