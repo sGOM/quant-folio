@@ -3124,9 +3124,28 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Files:**
 - Modify: `backend/app/services/metrics/panic.py` (`_fetch_market_ohlcv_snapshot`·`_fetch_index_ohlcv` 반환 계약 변경 반영)
 - Modify: `backend/app/services/metrics/sectors.py` (`_fetch_index_ohlcv` 반환 계약 변경 반영)
+- Modify: `backend/app/services/metrics/factors.py` (낡은 docstring 정리 — Task 6·7·8 리뷰 이월)
+- Modify: `backend/engine/rebalance_runner.py` (`_is_risk_off` docstring — Task 8 리뷰 이월)
+- Modify: `backend/app/api/routes/backtests.py` (`_provider_with_flow` 의 `except Exception` — Task 7 리뷰 이월)
 - Modify: `docs/improvements.md`
 - Modify: `CLAUDE.md`
 - Test: `backend/tests/test_caller_degradation.py` (이어 씀)
+
+**Task 6·7·8 리뷰에서 이월된 필수 판단 항목** (Step 1 에서 반드시 결론 낼 것):
+- **(중요)** `api/routes/backtests.py:220-223` `_provider_with_flow` 가 `compute_flow_norm` 을
+  `try/except Exception: flow = None` 으로 감싼다 — §47 사고 패턴이 이 진입 경로에 그대로 남아 있다.
+- `factors.compute_flow_norm` 이 `npf.empty` 체크 **전에** 무조건 `_fetch_market_cap` 을
+  호출한다(`factors.py:262-269`). 순매수와 무관하게 flow 팩터 전체가 죽을 수 있다.
+- `fetch._fetch_net_purchases` docstring 의 "전량 실패면 빈 프레임을 반환한다"가 같은 블록의
+  `:raises:` 와 정면 모순. `factors.compute_flow_norm` docstring 도 동일.
+- `factors.py:189-190` `compute_residual_momentum_provider` docstring("조회 실패는 빈/부분
+  Series 반환")이 낡음 — 206행은 이제 예외를 전파한다.
+- `engine/rebalance_runner.py:686-703` `_is_risk_off` docstring("기준지수 조회 실패 시
+  False=투자 유지")이 낡음. 실거래 엔진에서 KRX 일시 장애 시 이전엔 "레짐만 건너뛰고 틱 계속"
+  이었으나 이제 "틱 전체 실패 기록 후 조기 종료"(`base_runner.py:131-147` 이 흡수해 크래시는
+  없음). **이 동작 변경이 의도된 정책인지 먼저 판단하고, 그 결론대로 코드 또는 문서를 맞출 것.**
+- `factors.compute_flow_norm` 의 `if npf is None or npf.empty` 분기는 이제 "로컬 스토어가 0행을
+  확정 기록한 경우"에만 도달하는 사실상 죽은 경로.
 
 **Interfaces:**
 - Consumes: Task 6·7·8 이 바꾼 `fetch.py` 공개 함수들
