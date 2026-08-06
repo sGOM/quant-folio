@@ -55,6 +55,18 @@ def test_다른_소스가_같은_행의_다른_컬럼을_채운다():
     assert int(out.loc["005930", "시가총액"]) == 500_000  # 앞선 적재가 살아있다
 
 
+def test_같은_컬럼_재적재시_NaN이_기존값을_지우지_않는다():
+    """재조회에서 그 종목만 결측이 나와도 먼저 저장된 값이 살아있어야 한다."""
+    first = pd.DataFrame({"PER": [10.5]}, index=["005930"])
+    daily.write_daily(_DAY, first, columns={"PER": "per"})
+
+    second = pd.DataFrame({"PER": [float("nan")]}, index=["005930"])
+    daily.write_daily(_DAY, second, columns={"PER": "per"})
+
+    out = daily.read_daily(_DAY, ["per"], out_columns={"per": "PER"})
+    assert float(out.loc["005930", "PER"]) == pytest.approx(10.5)
+
+
 def test_행이_없으면_요청한_컬럼의_빈_프레임을_준다():
     out = daily.read_daily(_DAY, ["per"], out_columns={"per": "PER"})
     assert out.empty
