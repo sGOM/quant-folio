@@ -29,6 +29,7 @@ from app.services.data.errors import (
 )
 from app.services.data.loader import bounded_socket_timeout  # pykrx 무응답 행 방지
 from app.services.data.store import daily as _daily
+from app.services.data.store import periods as _periods
 from app.services.data.store.frame import cached_frame, is_final_date, make_cache_key
 from app.services.data.store.ledger import default_ledger
 
@@ -57,6 +58,14 @@ def _store_write_daily(day, df, columns):
 
 def _store_read_daily(day, cols, out_columns):
     return _daily.read_daily(day, cols, out_columns=out_columns)
+
+
+def _store_write_periods(start, end, investors, df, columns):
+    _periods.write_periods(start, end, investors, df, columns=columns)
+
+
+def _store_read_periods(start, end, investors, cols, out_columns):
+    return _periods.read_periods(start, end, investors, cols, out_columns=out_columns)
 
 
 def _ymd_to_date(ymd: str) -> date:
@@ -235,20 +244,40 @@ def _fetch_market_cap(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
 
 
 def _fetch_price_change(start_ymd: str, end_ymd: str, mkts: list[str]) -> pd.DataFrame:
-    """기간 등락률·거래대금을 전 종목 일괄 조회한다.
+    """기간 등락률·거래대금을 전 종목 일괄 조회한다 — 로컬 우선.
 
-    컬럼: 시가, 종가, 변동폭, 등락률, 거래량, 거래대금. 티커 인덱스.
-    등락률은 pykrx 원값 그대로(%) — 호출자가 /100으로 변환한다.
+    컬럼: 시가, 종가, 등락률, 거래량, 거래대금. 티커 인덱스.
+    등락률은 pykrx 원값 그대로(%) — 호출자가 /100 으로 변환한다.
 
-    :raises DataSourceError: 전 시장 조회가 실패했을 때(빈 프레임을 돌려주지 않는다).
+    :raises DataSourceError: 전 시장 조회가 실패했을 때.
     """
+    start_d, end_d = _ymd_to_date(start_ymd), _ymd_to_date(end_ymd)
+    cols = {
+        "시가": "open", "종가": "close", "등락률": "change_pct",
+        "거래량": "volume", "거래대금": "trading_value",
+    }
+    out_cols = {v: k for k, v in cols.items()}
+    complete = True
+
     def _one(stock, mkt: str) -> pd.DataFrame | None:
         return stock.get_market_price_change(start_ymd, end_ymd, market=mkt)
 
-    df, _complete = _fetch_per_market(
-        _one, mkts, what="가격변동", when=f"{start_ymd}~{end_ymd}", source="krx",
+    def _remote() -> pd.DataFrame:
+        nonlocal complete
+        df, complete = _fetch_per_market(
+            _one, mkts, what="가격변동", when=f"{start_ymd}~{end_ymd}", source="krx",
+        )
+        return df
+
+    return cached_frame(
+        "price_change",
+        make_cache_key(start_ymd, end_ymd, mkts),
+        read_local=lambda: _store_read_periods(start_d, end_d, "", list(out_cols), out_cols),
+        fetch_remote=_remote,
+        write_local=lambda df: _store_write_periods(start_d, end_d, "", df, cols),
+        is_final=lambda: is_final_date(end_d) and complete,
+        ledger=_store_ledger(),
     )
-    return df
 
 
 #: 수급(flow) 팩터 기본 투자자군 — 외국인 + 기관합계 순매수. KRX 투자자 분류 라벨.
@@ -273,37 +302,78 @@ def _fetch_net_purchases(
     처리), 전량 실패면 빈 프레임을 반환한다(호출자가 리밸런싱 스킵 판단).
 
     미래참조 방지: 호출자가 end_ymd 를 as_of(직전 확정 영업일) 이하로 넘겨야 한다.
-    """
-    stock = _pykrx_stock()
-    # 종목별 순매수거래대금을 (시장, 투자자)에 걸쳐 누적 합산한다.
-    accum: dict[str, float] = {}
-    any_ok = False
-    for mkt in mkts:
-        for investor in investors:
-            try:
-                df = stock.get_market_net_purchases_of_equities(
-                    start_ymd, end_ymd, mkt, investor
-                )
-                if df is None or df.empty or "순매수거래대금" not in df.columns:
-                    continue
-                any_ok = True
-                vals = pd.to_numeric(df["순매수거래대금"], errors="coerce")
-                for ticker, v in vals.items():
-                    if pd.isna(v):
-                        continue
-                    key = str(ticker).zfill(6)
-                    accum[key] = accum.get(key, 0.0) + float(v)
-            except Exception:
-                logger.warning(
-                    "투자자별 순매수 조회 실패 (%s %s %s~%s)",
-                    mkt, investor, start_ymd, end_ymd, exc_info=True,
-                )
 
-    if not any_ok or not accum:
-        return pd.DataFrame(columns=["net_buy_value"])
-    out = pd.DataFrame.from_dict(accum, orient="index", columns=["net_buy_value"])
-    out.index.name = "티커"
-    return out
+    :raises DataSourceError: 전량(모든 시장×투자자) 조회가 실패했을 때.
+    """
+    investors_key = ",".join(sorted(investors))
+    start_d, end_d = _ymd_to_date(start_ymd), _ymd_to_date(end_ymd)
+    complete = True
+
+    def _remote() -> pd.DataFrame:
+        nonlocal complete
+        stock = _pykrx_stock()
+        accum: dict[str, float] = {}
+        errors: list[DataSourceError] = []
+        ok = 0
+        for mkt in mkts:
+            for investor in investors:
+                if stop_aggregate("krx", errors, ok):
+                    logger.warning("순매수 집계 단락 (%s %s) — 남은 조회 건너뜀", mkt, investor)
+                    break
+                try:
+                    df = stock.get_market_net_purchases_of_equities(
+                        start_ymd, end_ymd, mkt, investor
+                    )
+                    ok += 1
+                    if df is None or df.empty or "순매수거래대금" not in df.columns:
+                        continue
+                    vals = pd.to_numeric(df["순매수거래대금"], errors="coerce")
+                    for ticker, v in vals.items():
+                        if pd.isna(v):
+                            continue
+                        k = str(ticker).zfill(6)
+                        accum[k] = accum.get(k, 0.0) + float(v)
+                except DataSourceError as e:
+                    logger.warning("투자자별 순매수 조회 실패 (%s %s): %s", mkt, investor, e)
+                    note_failure(e)
+                    errors.append(e)
+                except Exception as e:  # noqa: BLE001 - pykrx 는 임의 예외를 던진다
+                    wrapped = SourceUnavailableError(
+                        "krx", f"순매수 조회 실패({mkt} {investor} {start_ymd}~{end_ymd}): {e}"
+                    )
+                    logger.warning(
+                        "투자자별 순매수 조회 실패 (%s %s %s~%s)",
+                        mkt, investor, start_ymd, end_ymd, exc_info=True,
+                    )
+                    note_failure(wrapped)
+                    errors.append(wrapped)
+
+        if errors and ok == 0:
+            raise representative(errors)
+        complete = not errors and ok == len(mkts) * len(investors)
+
+        if not accum:
+            out = pd.DataFrame(columns=["net_buy_value"])
+            out.index.name = "티커"
+            return out
+        out = pd.DataFrame.from_dict(accum, orient="index", columns=["net_buy_value"])
+        out.index.name = "티커"
+        return out
+
+    return cached_frame(
+        "net_purchases",
+        make_cache_key(start_ymd, end_ymd, mkts, investors),
+        read_local=lambda: _store_read_periods(
+            start_d, end_d, investors_key, ["net_buy_value"],
+            out_columns={"net_buy_value": "net_buy_value"},
+        ),
+        fetch_remote=_remote,
+        write_local=lambda df: _store_write_periods(
+            start_d, end_d, investors_key, df, {"net_buy_value": "net_buy_value"}
+        ),
+        is_final=lambda: is_final_date(end_d) and complete,
+        ledger=_store_ledger(),
+    )
 
 
 def _fetch_market_ohlcv_snapshot(date_ymd: str, mkt: str) -> pd.DataFrame | None:

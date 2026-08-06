@@ -71,3 +71,50 @@ def test_행이_없으면_요청한_컬럼의_빈_프레임을_준다():
     out = daily.read_daily(_DAY, ["per"], out_columns={"per": "PER"})
     assert out.empty
     assert list(out.columns) == ["PER"]
+
+
+from app.services.data.store import periods  # noqa: E402
+
+_START = date(1990, 1, 2)
+_END = date(1990, 1, 31)
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_periods():
+    yield
+    periods.delete_periods(_START, _END, "")
+    periods.delete_periods(_START, _END, "기관합계,외국인")
+
+
+def test_기간통계를_쓰고_읽는다():
+    df = pd.DataFrame({"등락률": [5.5], "거래대금": [1_000_000]}, index=["005930"])
+    periods.write_periods(
+        _START, _END, "", df, columns={"등락률": "change_pct", "거래대금": "trading_value"}
+    )
+
+    out = periods.read_periods(
+        _START, _END, "", ["change_pct", "trading_value"],
+        out_columns={"change_pct": "등락률", "trading_value": "거래대금"},
+    )
+    assert float(out.loc["005930", "등락률"]) == pytest.approx(5.5)
+
+
+def test_투자자군이_다르면_다른_행이다():
+    """등락률 행과 순매수 행이 서로를 덮어쓰면 안 된다."""
+    periods.write_periods(
+        _START, _END, "", pd.DataFrame({"등락률": [5.5]}, index=["005930"]),
+        columns={"등락률": "change_pct"},
+    )
+    periods.write_periods(
+        _START, _END, "기관합계,외국인",
+        pd.DataFrame({"net_buy_value": [1e9]}, index=["005930"]),
+        columns={"net_buy_value": "net_buy_value"},
+    )
+
+    pc = periods.read_periods(_START, _END, "", ["change_pct"], out_columns={"change_pct": "등락률"})
+    npv = periods.read_periods(
+        _START, _END, "기관합계,외국인", ["net_buy_value"],
+        out_columns={"net_buy_value": "net_buy_value"},
+    )
+    assert float(pc.loc["005930", "등락률"]) == pytest.approx(5.5)
+    assert float(npv.loc["005930", "net_buy_value"]) == pytest.approx(1e9)

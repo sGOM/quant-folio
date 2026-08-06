@@ -86,3 +86,18 @@ def test_확정_적재분은_pykrx_를_다시_부르지_않는다(_store, monkey
     F._fetch_fundamentals("20190312", ["KOSPI", "KOSDAQ"])
 
     assert len(fake.calls) == 2  # 첫 호출의 두 시장뿐
+
+
+def test_순매수_전량실패는_예외로_전파된다(_store, monkeypatch):
+    """이전 판은 빈 프레임을 돌려줘 수급 팩터가 조용히 중립이 됐다."""
+
+    class _Boom:
+        def get_market_net_purchases_of_equities(self, *a, **kw):
+            raise RuntimeError("차단")
+
+    monkeypatch.setattr(F, "_pykrx_stock", lambda: _Boom())
+    monkeypatch.setattr(F, "_store_write_periods", lambda *a, **kw: None)
+    monkeypatch.setattr(F, "_store_read_periods", lambda *a, **kw: pd.DataFrame())
+
+    with pytest.raises(DataSourceError):
+        F._fetch_net_purchases("20190101", "20190131", ["KOSPI"])
