@@ -166,6 +166,11 @@ def test_annual_metrics_caches_and_falls_back_to_ofs(monkeypatch):
                  "account_nm": "부채총계", "thstrm_amount": "500"}]
 
     monkeypatch.setattr(opendart, "single_company_accounts", fake_accounts)
+    # annual_metrics → cached_accounts 가 로컬 DB 스토어를 거친다. 이 테스트는 순수
+    # 폴백 로직(호출 회수)만 검증하므로 인메모리로 대역해 실 DB 를 두드리지 않게 하고,
+    # 이전 실행이 남긴 레코드가 fake_accounts 재호출 여부를 가려버리는 것도 막는다.
+    monkeypatch.setattr(opendart, "_store_read_accounts", lambda *a: None)
+    monkeypatch.setattr(opendart, "_store_write_accounts", lambda *a: None)
     m1 = opendart.annual_metrics("00999999", 2024)
     assert m1["debt_ratio"] == 0.5
     assert opendart.FS_SEPARATE in fetched  # OFS 폴백 발생
