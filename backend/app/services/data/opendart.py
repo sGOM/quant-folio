@@ -599,31 +599,77 @@ def _store_write_accounts(
     dart_store.write_accounts(corp_code, bsns_year, reprt_code, fs_div, accounts)
 
 
+def _store_ledger():
+    """cached_accounts 가 쓰는 페치 원장(SqlLedger 기본) — 테스트가 갈아끼우는 지점."""
+    from app.services.data.store.ledger import default_ledger
+
+    return default_ledger()
+
+
+#: 원장(external_fetches)의 source 값. 설계서 §4.6 이 명시한 이름.
+_LEDGER_SOURCE = "dart_accounts"
+
+
 def cached_accounts(
     corp_code: str, bsns_year: int, reprt_code: str, fs_div: str
 ) -> list[dict] | None:
-    """원계정을 2단 캐시(프로세스 → 로컬 DB) 뒤에서 가져온다.
+    """원계정을 2단 캐시(프로세스 → 로컬 DB) + 원장 뒤에서 가져온다.
 
     확정된 보고서(접수일 + 90일 경과)는 로컬에서만 읽는다. 미확정이면 정정공시가
     아직 들어올 수 있으므로 재조회한다.
 
+    무자료(OpenDART status 013)도 원장에 기록해 재조회를 막는다 — 연결재무제표를
+    내지 않는 회사(자회사 없는 코스닥 다수)는 annual_metrics/_period_metrics 가 매번
+    CFS 를 먼저 시도해 매번 무자료이므로, 이 경로를 닫지 않으면 같은 (법인·연도)가
+    리밸런싱일마다 실 OpenDART 망을 탄다.
+
+    KRX index_members 의 "빈 결과는 확정하지 않는다"(파싱 실패로도 빈 결과가 나올 수
+    있어 '진짜 없음'을 확신할 수 없다)와 겉보기엔 비슷해 보이지만 판단이 다르다:
+    OpenDART 는 status 013 이라는 **명시적 코드**로 무자료를 선언하므로 여기서는
+    '진짜 없음'이 확실하다 — 그래서 확정 기록해도 안전하다. 원장 기록은 이 013 경로
+    (아래 `acc`가 falsy)뿐이다. `single_company_accounts` 가 던지는 DataSourceError 는
+    아래로 전파되어 `put` 에 도달하지 않는다(실패를 '무자료'로 뭉개지 않는다, §48).
+
     실패는 single_company_accounts 의 DataSourceError 를 그대로 전파한다(§48).
     """
+    from app.services.data.store.frame import make_cache_key
+
     key = (corp_code, bsns_year, reprt_code, fs_div)
     cached = _ACCOUNTS_CACHE.get(key)
     if cached is not None:
         return cached
+
+    ledger = _store_ledger()
+    cache_key = make_cache_key(corp_code, bsns_year, reprt_code, fs_div)
+    entry = ledger.get(_LEDGER_SOURCE, cache_key)
+    if entry is not None and entry.final and entry.row_count == 0:
+        # 무자료 확정 — 망을 타지 않는다(이번 수정의 핵심 회귀 차단).
+        return None
 
     stored = _store_read_accounts(corp_code, bsns_year, reprt_code, fs_div)
     if stored is not None and stored[1]:  # 확정분
         _ACCOUNTS_CACHE[key] = stored[0]
         return stored[0]
 
-    acc = single_company_accounts(corp_code, bsns_year, reprt_code, fs_div)
+    acc = single_company_accounts(corp_code, bsns_year, reprt_code, fs_div)  # 실패는 여기서 raise → 아래 도달 안 함
     if acc:
         _store_write_accounts(corp_code, bsns_year, reprt_code, fs_div, acc)
         _ACCOUNTS_CACHE[key] = acc
-    return acc
+        # 방금 적재한 확정여부를 로컬 스토어 재조회로 얻는다 — 접수일 파싱(rcept_dt →
+        # confirmed_date)이 dart_store 한 곳에만 있게 유지하기 위함(중복 구현 금지).
+        restored = _store_read_accounts(corp_code, bsns_year, reprt_code, fs_div)
+        final = restored[1] if restored is not None else False
+        ledger.put(_LEDGER_SOURCE, cache_key, row_count=len(acc), final=final)
+        return acc
+
+    # 무자료(status 013). 접수번호가 없어 접수일을 모르므로 사업연도말 + 1년(보수적)을
+    # 확정 시점으로 삼는다 — 당해/직전 사업연도는 아직 공시가 들어올 수 있어 미확정으로
+    # 남기고, 그 전 연도는 앞으로도 안 바뀌므로 확정한다.
+    from app.services.data.store import dart_store
+
+    final = date.today() >= dart_store.confirmed_date(None, bsns_year)
+    ledger.put(_LEDGER_SOURCE, cache_key, row_count=0, final=final)
+    return None
 
 
 def cached_corp_code_map() -> dict[str, str] | None:

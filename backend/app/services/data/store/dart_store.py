@@ -53,7 +53,13 @@ def _parse_rcept(accounts: list[dict]) -> tuple[str | None, date | None]:
 def write_accounts(
     corp_code: str, bsns_year: int, reprt_code: str, fs_div: str, accounts: list[dict]
 ) -> None:
-    """원계정을 저장한다. 빈 목록은 저장하지 않는다(원장이 '무자료'를 기록한다)."""
+    """원계정을 저장한다. 빈 목록은 저장하지 않는다.
+
+    무자료(OpenDART status 013)는 이 함수가 아니라 호출자
+    (`app.services.data.opendart.cached_accounts`)가 페치 원장(`external_fetches`,
+    source="dart_accounts")에 `row_count=0` 으로 기록한다 — 이 정규화 테이블은
+    원계정이 실제로 있을 때만 값을 갖는다.
+    """
     if not accounts:
         return
     rcept_no, rcept_dt = _parse_rcept(accounts)
