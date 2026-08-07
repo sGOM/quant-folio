@@ -53,6 +53,9 @@ docker compose exec frontend npm run build
 - `frontend/tsconfig.tsbuildinfo` 등 빌드 산출물은 커밋하지 말 것.
 - 종목명 해석의 신뢰 소스는 `krx_index.all_listed_stocks`(KRX MDC). FDR/pykrx는 이 환경에서 불안정.
 - KRX PIT 지수구성 조회는 KRX 로그인 필요(`KRX_ID/PW`가 `app.core.config`로 주입됨).
+- 확정 과거 데이터(펀더멘털·시총·OHLCV·PIT구성·DART재무)는 Postgres 에 영구 저장돼
+  로컬 우선으로 읽힌다. 조회 계약은 `app/services/data/store/frame.py`, 강제 재적재는
+  각 리포지토리의 `delete_*` 후 `external_fetches` 행 삭제.
 
 ## 작업별 에이전트 라우팅
 

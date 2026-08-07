@@ -9,6 +9,7 @@ import logging
 from datetime import date
 
 from app.schemas.metrics import SectorMetric, SectorsOut
+from app.services.data.errors import DataSourceError
 from app.services.metrics.common import (
     _approx_start,
     _compute_mdd,
@@ -95,7 +96,11 @@ def _compute_one_sector(
     ref_return: float | None,
 ) -> SectorMetric | None:
     """업종지수 1개의 지표를 계산한다."""
-    df = _fetch_index_ohlcv(hist_start_ymd, date_ymd, ticker)
+    try:
+        df = _fetch_index_ohlcv(hist_start_ymd, date_ymd, ticker)
+    except DataSourceError as e:
+        logger.warning("업종지수 건너뜀 (%s): %s", ticker, e)
+        return None
     if df is None or "close" not in df.columns or len(df) < 21:
         return None
 
