@@ -9,6 +9,7 @@ import gzip
 import logging
 import os
 import subprocess
+from collections.abc import Callable
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -591,3 +592,69 @@ def ingest_news() -> dict:
     기사를 정리하고, 전체 피드 실패 시 전역 warning 알림을 발행한다.
     """
     return _run_async(_ingest_news_async())
+
+
+# ─────────────────────────── 로컬 영구 저장소 야간 선적재 ───────────────────────────
+def _snapshot_target_date() -> date:
+    """선적재 대상 일자 — 전날(확정된 마지막 날).
+
+    당일분은 장중 값이 계속 바뀌어 확정으로 굳힐 수 없으므로(스토어 설계 §6)
+    배치는 전날까지만 다룬다.
+    """
+    return date.today() - timedelta(days=1)
+
+
+def _snapshot_steps(ymd: str) -> list[tuple[str, Callable[[], object]]]:
+    """선적재 단계 목록 — (이름, 호출) 쌍.
+
+    별도 함수로 뽑은 이유는 테스트가 실제 pykrx 를 부르지 않고 갈아끼우기 위함이다.
+    """
+    from app.services.metrics.fetch import (
+        _fetch_fundamentals,
+        _fetch_index_ohlcv,
+        _fetch_market_cap,
+        _fetch_market_ohlcv_snapshot,
+    )
+
+    mkts = ["KOSPI", "KOSDAQ"]
+    steps: list[tuple[str, Callable[[], object]]] = [
+        ("펀더멘털", lambda: _fetch_fundamentals(ymd, mkts)),
+        ("시가총액", lambda: _fetch_market_cap(ymd, mkts)),
+    ]
+    for mkt in mkts:
+        steps.append((f"전종목OHLCV({mkt})", lambda m=mkt: _fetch_market_ohlcv_snapshot(ymd, m)))
+    # 1001=KOSPI, 2001=KOSDAQ 대표지수 — 레짐·패닉 지표의 기준선.
+    for code in ("1001", "2001"):
+        steps.append((f"지수OHLCV({code})", lambda c=code: _fetch_index_ohlcv(ymd, ymd, c)))
+    return steps
+
+
+@celery_app.task(name="worker.ingest_daily_snapshots")
+def ingest_daily_snapshots() -> dict:
+    """전날 확정분을 로컬 저장소에 선적재한다.
+
+    온디맨드 write-through 만으로도 저장소는 채워지지만, 그러면 그 날짜를 처음 밟는
+    백테스트가 대기 비용을 전부 문다. 배치가 미리 채워두면 장중 조회가 사라진다.
+
+    한 종류가 실패해도 나머지를 계속한다 — 부분 선적재라도 다음 백테스트의 외부
+    조회를 그만큼 줄인다. 실패는 집계해 로그로 남긴다.
+    """
+    from app.services.data.errors import DataSourceError
+
+    target = _snapshot_target_date()
+    ymd = target.strftime("%Y%m%d")
+    ok = failed = 0
+
+    for name, call in _snapshot_steps(ymd):
+        try:
+            call()
+            ok += 1
+        except DataSourceError as e:
+            failed += 1
+            logger.warning("선적재 실패 [%s] %s: %s", ymd, name, e)
+        except Exception:  # noqa: BLE001 - 한 단계 실패가 배치 전체를 멈추면 안 된다
+            failed += 1
+            logger.warning("선적재 실패 [%s] %s", ymd, name, exc_info=True)
+
+    logger.info("일별 스냅샷 선적재 완료 [%s] ok=%d failed=%d", ymd, ok, failed)
+    return {"date": ymd, "ok": ok, "failed": failed}

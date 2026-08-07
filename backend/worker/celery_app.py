@@ -31,6 +31,12 @@ celery_app.conf.beat_schedule = {
         "task": "worker.ingest_daily_ohlcv",
         "schedule": crontab(hour=18, minute=30),
     },
+    # 로컬 영구 저장소 선적재 — 일봉 적재(18:30) 직후. 온디맨드 write-through 만으로도
+    # 저장소는 채워지지만, 그러면 그 날짜를 처음 밟는 백테스트가 대기 비용을 다 문다.
+    "ingest-daily-snapshots": {
+        "task": "worker.ingest_daily_snapshots",
+        "schedule": crontab(hour=18, minute=50),
+    },
     # 체결 정합 정기 점검(B-2) — 주간(월요일 아침). 슬리피지 실측이 서서히 벌어지는
     # 종류의 이슈라 일 단위로 돌 필요는 없다.
     "check-fill-quality-drift": {
