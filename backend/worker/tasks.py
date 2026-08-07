@@ -639,9 +639,15 @@ def _snapshot_steps(ymd: str) -> list[tuple[str, Callable[[], object]]]:
 
 
 async def _publish_snapshot_alert(ymd: str, failed_names: list[str], total: int) -> None:
-    """스냅샷 선적재 실패율 초과 알림을 발행한다. ingest_daily_snapshots 는 동기라
-    이 async 헬퍼만 asyncio.run 으로 감싸 호출한다(전역 DB 엔진을 건드리는
-    `_run_async` 는 여기서 불필요 — 이 알림은 Redis 만 쓴다)."""
+    """스냅샷 선적재 실패율 초과 알림을 발행한다.
+
+    `engine.alerts.publish_alert` 는 Redis 뿐 아니라 전역 `AsyncSessionLocal`(풀링
+    엔진)로 dedup 조회·`Alert` 영속화도 한다 — 이 함수를 단순 `asyncio.run` 으로
+    감싸면 그 루프에서 연 커넥션이 풀에 반환된 채 루프가 닫혀, 같은 워커 프로세스의
+    다음 태스크가 그 커넥션을 재사용하다 "Future attached to a different loop" 로
+    죽는다. 그래서 호출부는 반드시 `_run_async`(종료 전 전역 엔진 dispose)를 써야
+    한다.
+    """
     from redis.asyncio import Redis
 
     from app.core.config import settings
@@ -706,7 +712,7 @@ def ingest_daily_snapshots() -> dict:
     total = ok + failed
     if total and failed / total > _INGEST_FAILURE_ALERT_RATIO:
         try:
-            asyncio.run(_publish_snapshot_alert(ymd, failed_names, total))
+            _run_async(_publish_snapshot_alert(ymd, failed_names, total))
         except Exception:  # noqa: BLE001 - 알림 발행 실패가 이미 끝난 선적재 결과를 무효화하면 안 된다
             logger.warning("스냅샷 선적재 실패 알림 발행 중 오류", exc_info=True)
 

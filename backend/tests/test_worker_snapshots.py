@@ -7,38 +7,6 @@ from app.services.data.errors import SourceUnavailableError
 from worker import tasks
 
 
-def test_전날_확정분을_적재한다(monkeypatch):
-    called: list[str] = []
-    monkeypatch.setattr(tasks, "_snapshot_target_date", lambda: date(2026, 8, 5))
-    monkeypatch.setattr(
-        tasks, "_snapshot_steps",
-        lambda ymd: [("펀더멘털", lambda: called.append("fund")),
-                     ("시가총액", lambda: called.append("cap"))],
-    )
-
-    out = tasks.ingest_daily_snapshots()
-
-    assert called == ["fund", "cap"]
-    assert out == {"date": "20260805", "ok": 2, "failed": 0}
-
-
-def test_일부_실패해도_나머지를_계속한다(monkeypatch):
-    """한 종류가 막혔다고 나머지 선적재를 포기하면 다음 백테스트가 그만큼 더 조회한다."""
-
-    def _boom():
-        raise SourceUnavailableError("krx", "차단")
-
-    monkeypatch.setattr(tasks, "_snapshot_target_date", lambda: date(2026, 8, 5))
-    monkeypatch.setattr(
-        tasks, "_snapshot_steps",
-        lambda ymd: [("펀더멘털", _boom), ("시가총액", lambda: None)],
-    )
-
-    out = tasks.ingest_daily_snapshots()
-
-    assert out == {"date": "20260805", "ok": 1, "failed": 1}
-
-
 class _FakeRedis:
     """Redis.from_url 대역 — aclose 호출 여부만 기록한다(실제 접속 없음)."""
 
@@ -73,7 +41,56 @@ def _patch_publish_alert(monkeypatch):
     return calls
 
 
-def test_전량_실패시_알림을_발행한다(monkeypatch):
+@pytest.fixture(autouse=True)
+def _isolate_alert_publishing(monkeypatch):
+    """이 파일의 모든 테스트를 실 Redis·`publish_alert`(따라서 실 DB)로부터 격리한다.
+
+    `ingest_daily_snapshots` 는 실패율이 임계(10%)를 넘으면 `_publish_snapshot_alert`
+    로 Redis 접속을 열고 `engine.alerts.publish_alert` 를 거쳐 `alerts` 테이블에 행을
+    남긴다. 실패 시나리오를 다루는 테스트(예: 1/2 실패)는 이 임계를 쉽게 넘기는데,
+    개별 테스트마다 대역을 붙이면 새 테스트가 추가될 때 또 샌다 — 실제로 기존
+    `test_일부_실패해도_나머지를_계속한다` 가 대역 없이 이 경로를 타 실 개발 DB 에
+    알림 행을 남긴 사고가 있었다. 그래서 파일 전체에 기본 차단을 걸고, 알림 발행을
+    검증하는 테스트는 이 픽스처가 돌려주는 `calls` 로 단언한다.
+    """
+    fake_redis = _patch_redis(monkeypatch)
+    calls = _patch_publish_alert(monkeypatch)
+    return {"redis": fake_redis, "calls": calls}
+
+
+def test_전날_확정분을_적재한다(monkeypatch):
+    called: list[str] = []
+    monkeypatch.setattr(tasks, "_snapshot_target_date", lambda: date(2026, 8, 5))
+    monkeypatch.setattr(
+        tasks, "_snapshot_steps",
+        lambda ymd: [("펀더멘털", lambda: called.append("fund")),
+                     ("시가총액", lambda: called.append("cap"))],
+    )
+
+    out = tasks.ingest_daily_snapshots()
+
+    assert called == ["fund", "cap"]
+    assert out == {"date": "20260805", "ok": 2, "failed": 0}
+
+
+def test_일부_실패해도_나머지를_계속한다(monkeypatch):
+    """한 종류가 막혔다고 나머지 선적재를 포기하면 다음 백테스트가 그만큼 더 조회한다."""
+
+    def _boom():
+        raise SourceUnavailableError("krx", "차단")
+
+    monkeypatch.setattr(tasks, "_snapshot_target_date", lambda: date(2026, 8, 5))
+    monkeypatch.setattr(
+        tasks, "_snapshot_steps",
+        lambda ymd: [("펀더멘털", _boom), ("시가총액", lambda: None)],
+    )
+
+    out = tasks.ingest_daily_snapshots()
+
+    assert out == {"date": "20260805", "ok": 1, "failed": 1}
+
+
+def test_전량_실패시_알림을_발행한다(monkeypatch, _isolate_alert_publishing):
     """§44-1 재발 시나리오: 6단계 전부 DataSourceError 로 실패해도 조용히 넘어가지 않는다."""
 
     def _boom():
@@ -84,11 +101,10 @@ def test_전량_실패시_알림을_발행한다(monkeypatch):
         tasks, "_snapshot_steps",
         lambda ymd: [(f"단계{i}", _boom) for i in range(6)],
     )
-    _patch_redis(monkeypatch)
-    calls = _patch_publish_alert(monkeypatch)
 
     out = tasks.ingest_daily_snapshots()
 
+    calls = _isolate_alert_publishing["calls"]
     assert out == {"date": "20260805", "ok": 0, "failed": 6}
     assert len(calls) == 1
     assert calls[0]["code"] == "snapshot_ingest_failure_rate"
@@ -97,7 +113,7 @@ def test_전량_실패시_알림을_발행한다(monkeypatch):
     assert calls[0]["user_id"] is None
 
 
-def test_한_단계만_실패해도_임계를_넘어_알림을_발행한다(monkeypatch):
+def test_한_단계만_실패해도_임계를_넘어_알림을_발행한다(monkeypatch, _isolate_alert_publishing):
     """6단계 중 1건(약 17%)만 실패해도 10% 임계를 넘는다 — 한 단계가 하루치 데이터
     종류 하나 전체를 뜻하므로, 종목별 집계와 달리 1건 실패도 무시할 잡음이 아니다."""
 
@@ -109,28 +125,54 @@ def test_한_단계만_실패해도_임계를_넘어_알림을_발행한다(monk
         tasks, "_snapshot_steps",
         lambda ymd: [("펀더멘털", _boom)] + [(f"단계{i}", lambda: None) for i in range(5)],
     )
-    _patch_redis(monkeypatch)
-    calls = _patch_publish_alert(monkeypatch)
 
     out = tasks.ingest_daily_snapshots()
 
+    calls = _isolate_alert_publishing["calls"]
     assert out == {"date": "20260805", "ok": 5, "failed": 1}
     assert len(calls) == 1
 
 
-def test_전부_성공하면_알림이_없다(monkeypatch):
+def test_알림_발행은_run_async_를_거친다(monkeypatch, _isolate_alert_publishing):
+    """asyncio.run 으로 직접 감싸면 그 루프에서 연 전역 DB 커넥션이 풀에 반환된 채
+    루프가 닫혀, 같은 워커 프로세스의 다음 태스크가 재사용하다 교차 루프 오류로
+    죽는다 — 알림 발행은 반드시 `_run_async`(종료 전 전역 엔진 dispose)를 거쳐야
+    한다. 실제 교차 루프 재현은 컨테이너에서 별도로 확인한다(단위테스트로는 잡기
+    어려움)."""
+    calls: list = []
+    original = tasks._run_async
+
+    def _spy(coro):
+        calls.append(coro)
+        return original(coro)
+
+    monkeypatch.setattr(tasks, "_run_async", _spy)
+
+    def _boom():
+        raise SourceUnavailableError("krx", "차단")
+
+    monkeypatch.setattr(tasks, "_snapshot_target_date", lambda: date(2026, 8, 5))
+    monkeypatch.setattr(
+        tasks, "_snapshot_steps",
+        lambda ymd: [(f"단계{i}", _boom) for i in range(6)],
+    )
+
+    tasks.ingest_daily_snapshots()
+
+    assert len(calls) == 1
+
+
+def test_전부_성공하면_알림이_없다(monkeypatch, _isolate_alert_publishing):
     monkeypatch.setattr(tasks, "_snapshot_target_date", lambda: date(2026, 8, 5))
     monkeypatch.setattr(
         tasks, "_snapshot_steps",
         lambda ymd: [(f"단계{i}", lambda: None) for i in range(6)],
     )
-    _patch_redis(monkeypatch)
-    calls = _patch_publish_alert(monkeypatch)
 
     out = tasks.ingest_daily_snapshots()
 
     assert out == {"date": "20260805", "ok": 6, "failed": 0}
-    assert calls == []
+    assert _isolate_alert_publishing["calls"] == []
 
 
 def test_snapshot_steps_는_올바른_함수를_올바른_인자로_배선한다(monkeypatch):
