@@ -465,6 +465,33 @@ class TestCachedAccountsLedger:
     이 클래스의 테스트들은 그 픽스처가 돌려주는 `.ledger`/`.accounts` 를 그대로 쓴다.
     """
 
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        """이 클래스는 'DART 가 설정된 상태'를 전제한다.
+
+        conftest 가 OPENDART_API_KEY 를 비우므로 기본값은 is_enabled()=False 인데,
+        그 상태에서 single_company_accounts 를 목킹해 None 을 돌려주는 것은 현실에
+        없는 조합이다 — 실제로 미설정이면 _get 이 013 에 도달하기도 전에 None 을
+        반환한다. 무자료(013)를 흉내 내려면 설정된 상태여야 한다.
+        미설정 자체의 거동은 test_not_configured_records_nothing 이 따로 본다.
+        """
+        monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+
+    def test_not_configured_records_nothing(self, monkeypatch, _fake_dart_store):
+        """미설정(API 키 없음)은 무자료가 아니다 — 원장에 아무것도 남기지 않는다.
+
+        _get 은 미설정과 무자료(013)를 똑같이 None 으로 돌려준다. 이 둘을 뭉개면
+        '키가 잠깐 비어 있었다'가 '이 회사는 그 해 재무제표가 영구히 없다'로 굳어,
+        키를 다시 붙여도 영영 조회하지 않게 된다(§48 위반).
+        """
+        monkeypatch.setattr(opendart, "is_enabled", lambda: False)
+        monkeypatch.setattr(opendart, "single_company_accounts", lambda *a: None)
+
+        args = ("00012345", 2020, opendart.REPORT_ANNUAL, opendart.FS_CONSOLIDATED)
+        assert opendart.cached_accounts(*args) is None
+
+        assert _fake_dart_store.ledger.get("dart_accounts", make_cache_key(*args)) is None
+
     def test_no_data_recorded_final_when_year_confirmed(self, monkeypatch, _fake_dart_store):
         """확정된 과거 사업연도의 무자료(status 013)는 원장에 final=True 로 굳고,
         다음 호출은 single_company_accounts 를 다시 부르지 않는다(핵심 회귀)."""
