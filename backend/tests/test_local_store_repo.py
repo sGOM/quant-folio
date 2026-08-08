@@ -73,6 +73,28 @@ def test_행이_없으면_요청한_컬럼의_빈_프레임을_준다():
     assert list(out.columns) == ["PER"]
 
 
+def test_B1_market_필터_없으면_전_시장이_섞이고_필터를_걸면_격리된다():
+    """PK 가 (trade_date, symbol) 라 KOSPI/KOSDAQ 행이 같은 키공간에 섞여 저장된다.
+    markets 필터가 그 오염을 막는지 실제 DB 로 검증한다.
+    """
+    df = pd.DataFrame(
+        {"per": [10.0, 20.0], "market": ["KOSPI", "KOSDAQ"]},
+        index=["005930", "900001"],
+    )
+    daily.write_daily(_DAY, df, columns={"per": "per", "market": "market"})
+
+    kospi_only = daily.read_daily(
+        _DAY, ["per", "market"], out_columns={"per": "PER", "market": "market"},
+        markets=["KOSPI"],
+    )
+    assert sorted(kospi_only.index) == ["005930"]
+
+    unfiltered = daily.read_daily(
+        _DAY, ["per", "market"], out_columns={"per": "PER", "market": "market"},
+    )
+    assert sorted(unfiltered.index) == ["005930", "900001"]  # markets=None 은 기존과 동일(하위호환)
+
+
 from app.services.data.store import periods  # noqa: E402
 
 _START = date(1990, 1, 2)
@@ -118,6 +140,37 @@ def test_투자자군이_다르면_다른_행이다():
     )
     assert float(pc.loc["005930", "등락률"]) == pytest.approx(5.5)
     assert float(npv.loc["005930", "net_buy_value"]) == pytest.approx(1e9)
+
+
+def test_B1_기간통계_market_필터_없으면_전_시장이_섞이고_필터를_걸면_격리된다():
+    """stock_period_stats 도 PK 에 시장 구분이 없어 같은 오염이 가능하다."""
+    df = pd.DataFrame(
+        {"change_pct": [5.5, -3.0], "market": ["KOSPI", "KOSDAQ"]},
+        index=["005930", "900001"],
+    )
+    periods.write_periods(_START, _END, "", df, columns={"change_pct": "change_pct", "market": "market"})
+
+    kospi_only = periods.read_periods(
+        _START, _END, "", ["change_pct", "market"],
+        out_columns={"change_pct": "등락률", "market": "market"},
+        markets=["KOSPI"],
+    )
+    assert sorted(kospi_only.index) == ["005930"]
+
+
+def test_I1_기간통계_종목명_컬럼이_왕복된다():
+    """I1: name 컬럼이 없으면 로컬 히트에서 종목명이 조용히 사라진다."""
+    df = pd.DataFrame({"change_pct": [5.5], "name": ["삼성전자"]}, index=["005930"])
+    periods.write_periods(
+        _START, _END, "", df, columns={"change_pct": "change_pct", "name": "name"}
+    )
+
+    out = periods.read_periods(
+        _START, _END, "", ["change_pct", "name"],
+        out_columns={"change_pct": "등락률", "name": "종목명"},
+    )
+    assert out.loc["005930", "종목명"] == "삼성전자"
+    assert float(out.loc["005930", "등락률"]) == pytest.approx(5.5)  # name 이 숫자변환을 오염시키지 않는다
 
 
 from app.services.data.store import indexes  # noqa: E402

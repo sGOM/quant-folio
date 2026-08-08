@@ -18,7 +18,13 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.local_store_db import LocalStoreSession, run_sync
 from app.models.store import StockPeriodStat
-from app.services.data.store.coerce import INTEGER, NUMERIC, TEXT, coerce_value
+from app.services.data.store.coerce import (
+    INTEGER,
+    NUMERIC,
+    TEXT,
+    _TEXT_COLUMNS,
+    coerce_value,
+)
 
 logger = logging.getLogger("app.services.data.store")
 
@@ -27,7 +33,7 @@ _KINDS = {
     "change_pct": NUMERIC, "open": NUMERIC, "close": NUMERIC,
     "net_buy_value": NUMERIC,
     "volume": INTEGER, "trading_value": INTEGER,
-    "market": TEXT,
+    "market": TEXT, "name": TEXT,
 }
 
 
@@ -74,9 +80,15 @@ async def _upsert(rows: list[dict], target_cols: list[str]) -> None:
 def read_periods(
     start: date, end: date, investors: str,
     table_columns: list[str], *, out_columns: dict[str, str],
+    markets: list[str] | None = None,
 ) -> pd.DataFrame:
-    """그 기간·투자자군의 지정 컬럼을 티커 인덱스 DataFrame 으로 읽는다."""
-    records = run_sync(_select(start, end, investors, table_columns))
+    """그 기간·투자자군의 지정 컬럼을 티커 인덱스 DataFrame 으로 읽는다.
+
+    :param markets: None 이 아니면 이 시장 목록으로만 필터링한다. PK 가
+        (start_date, end_date, investors, symbol) 라 KOSPI 행과 KOSDAQ 행이 같은
+        키공간에 섞여 저장되므로, 단일시장 조회는 반드시 이 필터를 걸어야 한다.
+    """
+    records = run_sync(_select(start, end, investors, table_columns, markets))
     names = [out_columns[c] for c in table_columns]
     if not records:
         empty = pd.DataFrame(columns=names)
@@ -91,23 +103,28 @@ def read_periods(
     out.index.name = "티커"
     for c in table_columns:
         name = out_columns[c]
-        if c != "market":
+        if c not in _TEXT_COLUMNS:
             out[name] = pd.to_numeric(out[name], errors="coerce")
     return out
 
 
 async def _select(
-    start: date, end: date, investors: str, table_columns: list[str]
+    start: date,
+    end: date,
+    investors: str,
+    table_columns: list[str],
+    markets: list[str] | None = None,
 ) -> list[tuple]:
     cols = [StockPeriodStat.symbol] + [getattr(StockPeriodStat, c) for c in table_columns]
     async with LocalStoreSession() as db:
-        result = await db.execute(
-            select(*cols).where(
-                StockPeriodStat.start_date == start,
-                StockPeriodStat.end_date == end,
-                StockPeriodStat.investors == investors,
-            )
+        stmt = select(*cols).where(
+            StockPeriodStat.start_date == start,
+            StockPeriodStat.end_date == end,
+            StockPeriodStat.investors == investors,
         )
+        if markets:
+            stmt = stmt.where(StockPeriodStat.market.in_(markets))
+        result = await db.execute(stmt)
         return [tuple(r) for r in result.all()]
 
 

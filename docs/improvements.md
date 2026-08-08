@@ -1281,6 +1281,17 @@ VKOSPI 96.94(2009년 집계 이후 최고)·이틀 연속 서킷브레이커(사
 구간의 백테스트가 `DataSourceError` 로 멈춘다 — 의도한 동작이며, 조용히 빈 값으로
 완주하던 이전보다 낫다.
 
+**주의(B1, 2026-08-08 통합 리뷰)**: `stock_daily_snapshots`/`stock_period_stats` 는
+PK 에 시장 구분이 없어(`(trade_date, symbol)`/`(start_date, end_date, investors,
+symbol)`) KOSPI 행과 KOSDAQ 행이 같은 키공간에 섞인다. 초기 구현은 쓰기 시점에
+`market` 컬럼을 채우는 곳이 `_fetch_fundamentals` 뿐이었고 읽기(`read_daily`/
+`read_periods`)에 시장 필터가 없어, 전 시장을 먼저 적재한 뒤 단일시장을 조회하면
+2회차(로컬 히트)부터 전 시장 결과가 섞여 나오는 회귀가 있었다(재현·수정: 같은 날
+커밋). **이 저장소는 빈 상태에서 시작해야 한다** — 그 이전 스키마(시장 태깅 누락)로
+이미 적재된 행이 있다면 `stock_daily_snapshots`·`stock_period_stats` 와 해당
+`external_fetches` 원장 행을 지우고 재적재할 것(부분 마이그레이션 스크립트는 만들지
+않았다 — 개발 DB 는 이 수정 시점에 6테이블 전부 0행이었다).
+
 **호출자 저하 계약 정리(Task 11)**: `fetch.py` 계열이 예외를 던지게 되면서, 이를
 소비하는 호출부를 세 갈래로 확정했다 — 백테스트·리밸런싱 경로(그대로 전파),
 조회 화면 라우트(그대로 전파, `app/main.py` 가 500/502/503 으로 변환), 보조 지표

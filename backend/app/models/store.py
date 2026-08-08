@@ -80,6 +80,7 @@ class StockPeriodStat(Base):
     symbol: Mapped[str] = mapped_column(String(20), primary_key=True, nullable=False)
 
     market: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     change_pct: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
     open: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
     close: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)

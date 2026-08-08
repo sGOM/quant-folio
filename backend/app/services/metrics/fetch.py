@@ -57,16 +57,18 @@ def _store_write_daily(day, df, columns):
     _daily.write_daily(day, df, columns=columns)
 
 
-def _store_read_daily(day, cols, out_columns):
-    return _daily.read_daily(day, cols, out_columns=out_columns)
+def _store_read_daily(day, cols, out_columns, markets=None):
+    return _daily.read_daily(day, cols, out_columns=out_columns, markets=markets)
 
 
 def _store_write_periods(start, end, investors, df, columns):
     _periods.write_periods(start, end, investors, df, columns=columns)
 
 
-def _store_read_periods(start, end, investors, cols, out_columns):
-    return _periods.read_periods(start, end, investors, cols, out_columns=out_columns)
+def _store_read_periods(start, end, investors, cols, out_columns, markets=None):
+    return _periods.read_periods(
+        start, end, investors, cols, out_columns=out_columns, markets=markets
+    )
 
 
 def _store_write_index_ohlcv(code, df, name):
@@ -189,7 +191,7 @@ def _fetch_fundamentals(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
     result = cached_frame(
         "fundamentals",
         make_cache_key(as_of_ymd, mkts),
-        read_local=lambda: _store_read_daily(day, list(out_cols), out_cols),
+        read_local=lambda: _store_read_daily(day, list(out_cols), out_cols, markets=mkts),
         fetch_remote=_remote,
         write_local=lambda df: _store_write_daily(day, df, cols),
         # 부분 실패는 확정으로 굳히지 않는다 — 다음 호출에서 빠진 시장을 보완해야 한다.
@@ -219,10 +221,12 @@ def _fetch_market_cap(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
     cols = {
         "시가총액": "market_cap", "거래량": "volume",
         "거래대금": "trading_value", "상장주식수": "shares",
+        "market": "market",
     }
     out_cols = {
         "market_cap": "시가총액", "volume": "거래량",
         "trading_value": "거래대금", "shares": "상장주식수",
+        "market": "market",
     }
     complete = True
 
@@ -232,7 +236,11 @@ def _fetch_market_cap(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
             return None
         # 필요 컬럼만 선택 (pykrx 버전 차이 대비)
         keep = [c for c in ["시가총액", "거래량", "거래대금", "상장주식수"] if c in df.columns]
-        return df[keep]
+        df = df[keep].copy()
+        # KOSPI/KOSDAQ 이 (trade_date, symbol) 같은 키공간에 함께 저장되므로 태깅
+        # 없이는 단일시장 로컬 재조회가 전 시장 결과를 돌려준다(B1).
+        df["market"] = mkt
+        return df
 
     def _remote() -> pd.DataFrame:
         nonlocal complete
@@ -244,7 +252,7 @@ def _fetch_market_cap(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
     return cached_frame(
         "market_cap",
         make_cache_key(as_of_ymd, mkts),
-        read_local=lambda: _store_read_daily(day, list(out_cols), out_cols),
+        read_local=lambda: _store_read_daily(day, list(out_cols), out_cols, markets=mkts),
         fetch_remote=_remote,
         write_local=lambda df: _store_write_daily(day, df, cols),
         is_final=lambda: is_final_date(day) and complete,
@@ -264,12 +272,20 @@ def _fetch_price_change(start_ymd: str, end_ymd: str, mkts: list[str]) -> pd.Dat
     cols = {
         "시가": "open", "종가": "close", "등락률": "change_pct",
         "거래량": "volume", "거래대금": "trading_value",
+        "종목명": "name", "market": "market",
     }
     out_cols = {v: k for k, v in cols.items()}
     complete = True
 
     def _one(stock, mkt: str) -> pd.DataFrame | None:
-        return stock.get_market_price_change(start_ymd, end_ymd, market=mkt)
+        df = stock.get_market_price_change(start_ymd, end_ymd, market=mkt)
+        if df is None or df.empty:
+            return None
+        df = df.copy()
+        # KOSPI/KOSDAQ 이 (start,end,investors,symbol) 같은 키공간에 함께 저장되므로
+        # 태깅 없이는 단일시장 로컬 재조회가 전 시장 결과를 돌려준다(B1).
+        df["market"] = mkt
+        return df
 
     def _remote() -> pd.DataFrame:
         nonlocal complete
@@ -281,7 +297,9 @@ def _fetch_price_change(start_ymd: str, end_ymd: str, mkts: list[str]) -> pd.Dat
     return cached_frame(
         "price_change",
         make_cache_key(start_ymd, end_ymd, mkts),
-        read_local=lambda: _store_read_periods(start_d, end_d, "", list(out_cols), out_cols),
+        read_local=lambda: _store_read_periods(
+            start_d, end_d, "", list(out_cols), out_cols, markets=mkts
+        ),
         fetch_remote=_remote,
         write_local=lambda df: _store_write_periods(start_d, end_d, "", df, cols),
         is_final=lambda: is_final_date(end_d) and complete,
@@ -324,6 +342,11 @@ def _fetch_net_purchases(
         nonlocal complete
         stock = _pykrx_stock()
         accum: dict[str, float] = {}
+        # 티커 → 시장. 한 티커는 한 시장에만 속하므로 mkt 루프를 도는 동안 계속
+        # 덮어써도 충돌이 없다. accum 이 시장 구분 없이 합산되므로(B1) 결과
+        # 프레임에 market 컬럼으로 별도로 붙여야 저장소가 KOSPI/KOSDAQ 을
+        # 구분할 수 있다.
+        owner: dict[str, str] = {}
         errors: list[DataSourceError] = []
         ok = 0
         for mkt in mkts:
@@ -344,6 +367,7 @@ def _fetch_net_purchases(
                             continue
                         k = str(ticker).zfill(6)
                         accum[k] = accum.get(k, 0.0) + float(v)
+                        owner[k] = mkt
                 except DataSourceError as e:
                     logger.warning("투자자별 순매수 조회 실패 (%s %s): %s", mkt, investor, e)
                     note_failure(e)
@@ -369,6 +393,7 @@ def _fetch_net_purchases(
             return out
         out = pd.DataFrame.from_dict(accum, orient="index", columns=["net_buy_value"])
         out.index.name = "티커"
+        out["market"] = out.index.map(owner)
         return out
 
     return cached_frame(
@@ -377,10 +402,12 @@ def _fetch_net_purchases(
         read_local=lambda: _store_read_periods(
             start_d, end_d, investors_key, ["net_buy_value"],
             out_columns={"net_buy_value": "net_buy_value"},
+            markets=mkts,
         ),
         fetch_remote=_remote,
         write_local=lambda df: _store_write_periods(
-            start_d, end_d, investors_key, df, {"net_buy_value": "net_buy_value"}
+            start_d, end_d, investors_key, df,
+            {"net_buy_value": "net_buy_value", "market": "market"},
         ),
         is_final=lambda: is_final_date(end_d) and complete,
         ledger=_store_ledger(),
@@ -399,6 +426,7 @@ def _fetch_market_ohlcv_snapshot(date_ymd: str, mkt: str) -> pd.DataFrame | None
     cols = {
         "시가": "open", "고가": "high", "저가": "low", "종가": "close",
         "거래량": "volume", "거래대금": "trading_value", "등락률": "change_pct",
+        "market": "market",
     }
     out_cols = {v: k for k, v in cols.items()}
 
@@ -416,12 +444,18 @@ def _fetch_market_ohlcv_snapshot(date_ymd: str, mkt: str) -> pd.DataFrame | None
             )
             note_failure(wrapped)
             raise wrapped from e
-        return df if df is not None else pd.DataFrame()
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.copy()
+        # 이 테이블은 펀더멘털·시총과 (trade_date, symbol) 키공간을 공유한다.
+        # 태깅 없이는 단일시장 로컬 재조회가 전 시장 결과를 돌려준다(B1).
+        df["market"] = mkt
+        return df
 
     out = cached_frame(
         "market_ohlcv",
         make_cache_key(date_ymd, mkt),
-        read_local=lambda: _store_read_daily(day, list(out_cols), out_cols),
+        read_local=lambda: _store_read_daily(day, list(out_cols), out_cols, markets=[mkt]),
         fetch_remote=_remote,
         write_local=lambda df: _store_write_daily(day, df, cols),
         is_final=is_final_date(day),

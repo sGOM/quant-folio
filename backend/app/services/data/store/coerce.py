@@ -14,6 +14,11 @@ NUMERIC = "numeric"
 INTEGER = "integer"
 TEXT = "text"
 
+#: 테이블 컬럼 중 텍스트로 저장되는 컬럼 이름 집합 — daily.py/periods.py 의 읽기 경로가
+#: 공유한다. pd.to_numeric 강제변환 루프에서 이 집합을 건너뛰지 않으면 "market"·
+#: "name" 같은 문자열 컬럼이 전부 NaN 이 된다.
+_TEXT_COLUMNS = frozenset({"market", "name"})
+
 
 def coerce_value(value: object, kind: str) -> object | None:
     """DataFrame 셀 값을 저장 타입으로 변환한다. 결측·변환 불가는 None.
