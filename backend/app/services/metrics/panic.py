@@ -47,6 +47,7 @@ import numpy as np
 import pandas as pd
 
 from app.schemas.metrics import PanicMarket, PanicOut, PanicSignal
+from app.services.data.errors import DataSourceError
 from app.services.data.loader import bounded_socket_timeout  # pykrx 무응답 행 방지
 from app.services.metrics.common import (
     _approx_start,
@@ -242,7 +243,13 @@ def _new_low_signal(mkt: str, as_of_ymd: str, cache_dir: str | None = None) -> f
     """
     cache = _load_breadth_cache(f"{mkt}_closes", cache_dir)
     if as_of_ymd not in cache:
-        snap = _fetch_market_ohlcv_snapshot(as_of_ymd, mkt)
+        try:
+            snap = _fetch_market_ohlcv_snapshot(as_of_ymd, mkt)
+        except DataSourceError as e:
+            # S9 는 여러 날짜의 누적으로 계산하므로 하루가 빠져도 나머지로 굴러간다.
+            # 다만 전량 실패는 아래 "유효 표본 부족" 가드가 잡아 신호를 내지 않는다.
+            logger.warning("S9 스냅샷 건너뜀 (%s %s): %s", mkt, as_of_ymd, e)
+            snap = None
         if snap is None or snap.empty or "종가" not in snap.columns:
             logger.warning("패닉 지표: S9 스냅샷 조회 실패 (market=%s %s)", mkt, as_of_ymd)
             return None

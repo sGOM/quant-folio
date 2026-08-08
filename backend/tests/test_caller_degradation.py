@@ -420,3 +420,68 @@ class TestScreenerDegradationIsVisibleInResponse:
 
         assert out.scanned == 1
         assert out.financial_filter_applied is True
+
+
+# ───── panic.py/sectors.py/backtests.py/factors.py: 로컬 저장소 도입 이월 항목(Task 11) ─────
+
+
+def test_업종_하나가_막혀도_로테이션은_계속한다(monkeypatch):
+    """개별 업종 실패로 전체 섹터 로테이션이 죽으면 안 된다."""
+    from app.services.metrics import sectors
+
+    monkeypatch.setattr(
+        sectors, "_fetch_index_ohlcv",
+        lambda *a, **kw: (_ for _ in ()).throw(SourceUnavailableError("krx", "일시장애")),
+    )
+    got = sectors._compute_one_sector(
+        "1001", "KOSPI", "20260806", "20260101", ref_return=0.01
+    )
+    assert got is None
+
+
+class TestProviderWithFlowDegradation:
+    """이월 항목 (1): `_provider_with_flow` 가 flow 조회 실패를 flow=None 으로 삼키지
+    않고 그대로 전파하는지(예전 `except Exception: flow = None` 은 §47 사고 패턴을
+    이 진입 경로에 재현했다)."""
+
+    def test_flow_조회_실패는_전파된다(self, monkeypatch):
+        import app.services.metrics as metrics_mod
+
+        def _boom(codes, as_of, window, denom):
+            raise SourceUnavailableError("krx", "타임아웃")
+
+        monkeypatch.setattr(metrics_mod, "compute_flow_norm", _boom)
+        provider = bt_mod._provider_with_flow(None, window=90, denom="mcap")
+
+        with pytest.raises(SourceUnavailableError):
+            provider(date(2024, 4, 1), ["005930"])
+
+
+class TestComputeFlowNormDenomShortCircuit:
+    """이월 항목 (2): 순매수 조회 결과가 비면 분모(시총/거래대금) 조회를 아예 하지
+    않는지 — 순매수가 없으면 분모는 어차피 쓰이지 않는데 조회하던 낭비를 없앴다."""
+
+    def test_순매수가_비면_분모_조회를_하지_않는다(self, monkeypatch):
+        calls = {"market_cap": 0, "price_change": 0}
+
+        monkeypatch.setattr(
+            factors_mod, "_fetch_net_purchases",
+            lambda s, e, m: pd.DataFrame(columns=["net_buy_value"]),
+        )
+
+        def _mcap_spy(*a, **kw):
+            calls["market_cap"] += 1
+            return pd.DataFrame()
+
+        def _pc_spy(*a, **kw):
+            calls["price_change"] += 1
+            return pd.DataFrame()
+
+        monkeypatch.setattr(factors_mod, "_fetch_market_cap", _mcap_spy)
+        monkeypatch.setattr(factors_mod, "_fetch_price_change", _pc_spy)
+
+        out = factors_mod.compute_flow_norm(["005930"], date(2024, 4, 1))
+
+        assert out.empty
+        assert calls["market_cap"] == 0
+        assert calls["price_change"] == 0

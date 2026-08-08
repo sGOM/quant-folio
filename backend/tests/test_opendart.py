@@ -25,6 +25,63 @@ from app.services.data.errors import (
     cooldown_remaining,
     note_failure,
 )
+from app.services.data.store.frame import make_cache_key
+from app.services.data.store.ledger import InMemoryLedger
+
+
+class _FakeDartStore:
+    """dart_financials(정규화 테이블) + dart_accounts 원장 대역을 함께 담는 컨테이너.
+
+    :param accounts: corp_code 등 4튜플 키 → 원계정 리스트(정규화 테이블 대역)
+    :param ledger: cached_accounts 가 쓰는 페치 원장 대역(InMemoryLedger)
+    """
+
+    def __init__(self, accounts: dict[tuple, list[dict]], ledger: InMemoryLedger) -> None:
+        self.accounts = accounts
+        self.ledger = ledger
+
+    # 기존 테스트가 `_fake_dart_store[key] = accounts` 형태(dict-like)로 쓰던 관례를
+    # 유지한다 — 원장 검증이 필요 없는 테스트는 여전히 이렇게만 쓰면 된다.
+    def __setitem__(self, key: tuple, value: list[dict]) -> None:
+        self.accounts[key] = value
+
+    def __getitem__(self, key: tuple) -> list[dict]:
+        return self.accounts[key]
+
+
+@pytest.fixture(autouse=True)
+def _fake_dart_store(monkeypatch):
+    """dart_financials 로컬 스토어와 dart_accounts 원장을 함께 인메모리로 대역한다.
+
+    cached_accounts() 가 opendart._store_read_accounts/_store_write_accounts/
+    _store_ledger 를 거쳐 로컬 DB 를 두드리므로, 네트워크 없이 도는 이 단위테스트
+    스위트가 실 DB 를 타지 않도록(그리고 이전 테스트가 남긴 레코드에 캐시가 선점당하지
+    않도록) 매 테스트마다 새로 갈아끼운다. 참고: tests/test_krx_index.py 의 _clear_cache.
+
+    원장까지 여기서 autouse 로 갈아끼우는 이유: cached_accounts 가 무자료를 원장에
+    기록하는 경로(§ TestCachedAccountsLedger)를 추가하면서, 원장을 전혀 의식하지 않는
+    기존 테스트(TTM 등)도 cached_accounts 를 경유해 원장을 건드리게 됐다 — 개별
+    테스트마다 원장을 대역하게 하면 하나라도 빠뜨렸을 때 조용히 실 DB 를 오염시킨다.
+    """
+    store: dict[tuple, list[dict]] = {}
+
+    def fake_read(corp_code, bsns_year, reprt_code, fs_div):
+        key = (corp_code, bsns_year, reprt_code, fs_div)
+        if key not in store:
+            return None
+        return store[key], True  # 확정 여부 자체는 이 모듈의 관심사가 아니다
+
+    def fake_write(corp_code, bsns_year, reprt_code, fs_div, accounts):
+        store[(corp_code, bsns_year, reprt_code, fs_div)] = accounts
+
+    monkeypatch.setattr(opendart, "_store_read_accounts", fake_read)
+    monkeypatch.setattr(opendart, "_store_write_accounts", fake_write)
+
+    ledger = InMemoryLedger()
+    monkeypatch.setattr(opendart, "_store_ledger", lambda: ledger)
+    opendart._ACCOUNTS_CACHE.clear()
+    yield _FakeDartStore(accounts=store, ledger=ledger)
+    opendart._ACCOUNTS_CACHE.clear()
 
 
 def _row(sj, aid, nm, amt):
@@ -396,6 +453,127 @@ def test_metrics_by_symbol_use_ttm_false_uses_annual_path(monkeypatch):
     out = opendart.metrics_by_symbol(["000000"], date(2025, 5, 20), use_ttm=False)
     assert "000000" in out
     assert set(calls) == {2024, 2023, 2022}  # announcement_lagged_year 기반 연간만
+
+
+# ─────────────────── cached_accounts 의 dart_accounts 원장 배선 ───────────────────
+
+
+class TestCachedAccountsLedger:
+    """cached_accounts() 의 dart_accounts 원장 배선(무자료 확정/미확정, 실패 전파).
+
+    원장 대역(InMemoryLedger)은 autouse `_fake_dart_store` 가 이미 갈아끼워 주므로,
+    이 클래스의 테스트들은 그 픽스처가 돌려주는 `.ledger`/`.accounts` 를 그대로 쓴다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        """이 클래스는 'DART 가 설정된 상태'를 전제한다.
+
+        conftest 가 OPENDART_API_KEY 를 비우므로 기본값은 is_enabled()=False 인데,
+        그 상태에서 single_company_accounts 를 목킹해 None 을 돌려주는 것은 현실에
+        없는 조합이다 — 실제로 미설정이면 _get 이 013 에 도달하기도 전에 None 을
+        반환한다. 무자료(013)를 흉내 내려면 설정된 상태여야 한다.
+        미설정 자체의 거동은 test_not_configured_records_nothing 이 따로 본다.
+        """
+        monkeypatch.setattr(opendart, "is_enabled", lambda: True)
+
+    def test_not_configured_records_nothing(self, monkeypatch, _fake_dart_store):
+        """미설정(API 키 없음)은 무자료가 아니다 — 원장에 아무것도 남기지 않는다.
+
+        _get 은 미설정과 무자료(013)를 똑같이 None 으로 돌려준다. 이 둘을 뭉개면
+        '키가 잠깐 비어 있었다'가 '이 회사는 그 해 재무제표가 영구히 없다'로 굳어,
+        키를 다시 붙여도 영영 조회하지 않게 된다(§48 위반).
+        """
+        monkeypatch.setattr(opendart, "is_enabled", lambda: False)
+        monkeypatch.setattr(opendart, "single_company_accounts", lambda *a: None)
+
+        args = ("00012345", 2020, opendart.REPORT_ANNUAL, opendart.FS_CONSOLIDATED)
+        assert opendart.cached_accounts(*args) is None
+
+        assert _fake_dart_store.ledger.get("dart_accounts", make_cache_key(*args)) is None
+
+    def test_no_data_recorded_final_when_year_confirmed(self, monkeypatch, _fake_dart_store):
+        """확정된 과거 사업연도의 무자료(status 013)는 원장에 final=True 로 굳고,
+        다음 호출은 single_company_accounts 를 다시 부르지 않는다(핵심 회귀)."""
+        calls = []
+
+        def fake_accounts(corp, year, reprt, fs):
+            calls.append((corp, year, reprt, fs))
+            return None  # status 013 무자료
+
+        monkeypatch.setattr(opendart, "single_company_accounts", fake_accounts)
+
+        bsns_year = 2020  # confirmed_date(None, 2020) = 2021-12-31 → 이미 지남
+        args = ("00012345", bsns_year, opendart.REPORT_ANNUAL, opendart.FS_CONSOLIDATED)
+
+        first = opendart.cached_accounts(*args)
+        second = opendart.cached_accounts(*args)
+
+        assert first is None
+        assert second is None
+        assert len(calls) == 1  # 두 번째 호출은 원장만 보고 망을 타지 않는다
+
+        entry = _fake_dart_store.ledger.get("dart_accounts", make_cache_key(*args))
+        assert entry is not None
+        assert entry.row_count == 0
+        assert entry.final is True
+
+    def test_no_data_not_final_when_year_unconfirmed_retries(self, monkeypatch, _fake_dart_store):
+        """당해/최근 사업연도의 무자료는 확정 기록되지 않고, 호출마다 재조회한다
+        (나중에 제출되는 재무제표를 놓치지 않기 위한 보수성)."""
+        calls = []
+
+        def fake_accounts(corp, year, reprt, fs):
+            calls.append((corp, year, reprt, fs))
+            return None
+
+        monkeypatch.setattr(opendart, "single_company_accounts", fake_accounts)
+
+        bsns_year = date.today().year  # confirmed_date 가 미래 → final=False
+        args = ("00012345", bsns_year, opendart.REPORT_ANNUAL, opendart.FS_CONSOLIDATED)
+
+        opendart.cached_accounts(*args)
+        opendart.cached_accounts(*args)
+
+        assert len(calls) == 2  # 매 호출 재조회
+
+        entry = _fake_dart_store.ledger.get("dart_accounts", make_cache_key(*args))
+        assert entry is not None
+        assert entry.row_count == 0
+        assert entry.final is False
+
+    def test_confirmed_local_store_skips_network(self, monkeypatch, _fake_dart_store):
+        """dart_financials 에 확정 적재분이 있으면 single_company_accounts 를 부르지
+        않는다(기존 2단 캐시 동작 — 원장 배선 추가로 깨지지 않았음을 확인)."""
+        args = ("00012345", 2022, opendart.REPORT_ANNUAL, opendart.FS_CONSOLIDATED)
+        sample = [_row("BS", "ifrs-full_Assets", "자산총계", "1,000")]
+        _fake_dart_store[args] = sample
+
+        def fail_if_called(*a, **k):
+            raise AssertionError("확정 적재분이 있으면 network 를 타면 안 된다")
+
+        monkeypatch.setattr(opendart, "single_company_accounts", fail_if_called)
+
+        result = opendart.cached_accounts(*args)
+
+        assert result == sample
+        # 로컬 히트는 원장을 안 건드린다.
+        assert _fake_dart_store.ledger.get("dart_accounts", make_cache_key(*args)) is None
+
+    def test_fetch_failure_propagates_without_ledger_write(self, monkeypatch, _fake_dart_store):
+        """조회 실패(DataSourceError)는 원장에 아무것도 남기지 않고 그대로 전파된다
+        (실패를 '무자료'로 뭉개지 않는다)."""
+
+        def boom(corp, year, reprt, fs):
+            raise SourceUnavailableError("dart", "시스템 점검")
+
+        monkeypatch.setattr(opendart, "single_company_accounts", boom)
+
+        args = ("00012345", 2020, opendart.REPORT_ANNUAL, opendart.FS_CONSOLIDATED)
+        with pytest.raises(SourceUnavailableError):
+            opendart.cached_accounts(*args)
+
+        assert _fake_dart_store.ledger.get("dart_accounts", make_cache_key(*args)) is None
 
 
 # ─────────────────── 전송 계층 status 코드 원인 분류 ───────────────────
@@ -833,3 +1011,15 @@ class TestAggregateSystemicSchemaShortCircuit:
         assert "000000" in out  # 성공한 종목의 부분 결과가 살아 있다
         # 첫 종목만 성공(3회 호출) → 나머지 11종목도 각각 시도됐다
         assert len({c for c in calls}) == len(codes)
+
+
+from app.services.data.store.dart_store import confirmed_date  # noqa: E402
+
+
+def test_확정일은_접수일_90일_후다():
+    assert confirmed_date(date(2026, 3, 20), 2025) == date(2026, 6, 18)
+
+
+def test_접수일_미상이면_사업연도_말_1년_후다():
+    """보수적으로 잡는다 — 확정을 앞당기는 것보다 늦추는 쪽이 안전하다."""
+    assert confirmed_date(None, 2025) == date(2026, 12, 31)

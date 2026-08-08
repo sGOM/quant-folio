@@ -18,6 +18,9 @@ from app.services.data.errors import (
     cooldown_remaining,
     note_failure,
 )
+from app.services.data.store import indexes as store_indexes
+from app.services.data.store.frame import make_cache_key
+from app.services.data.store.ledger import InMemoryLedger
 
 
 class _FakeResp:
@@ -52,8 +55,24 @@ def _clear_cache(monkeypatch):
     # "스냅샷 없음"(빈 dict)으로 목 처리해 실제 DB 접속을 타지 않게 한다. 스냅샷 동작
     # 자체를 검증하는 테스트는 개별적으로 이 목을 덮어쓴다.
     monkeypatch.setattr(krx_index, "_lookup_pit_snapshot_sync", lambda as_of: {})
+    # index_members 의 로컬 스토어 2차 캐시(원장 + PIT 지수구성)도 실제 DB 대신
+    # 테스트마다 새 인메모리 대역으로 갈아끼운다. 실제 DB 로 대역하면 한 테스트가 쓴
+    # (index, base_date) 조합이 이후 테스트에서 final=True 로 남아, _session 을 어떻게
+    # 목해도 로컬 스토어가 먼저 응답해버려 세션 목이 무의미해진다(실제로 재현: 실 DB
+    # 대역 없이 돌리면 이전 테스트의 잔존 레코드 때문에 unauthenticated 테스트가 깨졌다).
+    fake_ledger = InMemoryLedger()
+    monkeypatch.setattr("app.services.data.store.ledger.default_ledger", lambda: fake_ledger)
+    fake_constituents: dict[tuple[str, object], list[str]] = {}
+    monkeypatch.setattr(
+        store_indexes, "write_constituents",
+        lambda code, day, codes: fake_constituents.__setitem__((code, day), list(codes)),
+    )
+    monkeypatch.setattr(
+        store_indexes, "read_constituents",
+        lambda code, day: fake_constituents.get((code, day), []),
+    )
     clear_cooldown("krx")
-    yield
+    yield fake_ledger  # 원장 내용을 직접 단언해야 하는 테스트가 이 값을 받아쓴다.
     krx_index._MEMBERS_CACHE.clear()
     krx_index._STOCKS_CACHE = None
     krx_index._MKTCAP_CACHE.clear()
@@ -105,6 +124,57 @@ def test_index_members_cached(monkeypatch):
     n_first = len(fake.calls)
     krx_index.index_members(date(2025, 6, 30))  # 캐시 히트 → 추가 호출 없음
     assert len(fake.calls) == n_first
+
+
+def test_index_members_normal_result_finalized_in_ledger(monkeypatch, _clear_cache):
+    """codes 가 있으면(정상 경로) 원장에 확정(final=True) 기록된다 — 아래 빈 결과
+    가드를 넣기 전의 기존 동작을 보존하는지 확인한다."""
+    fake_ledger = _clear_cache
+    fake = _FakeSession({"20250630": _rows("005930")})
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+
+    out = krx_index.index_members(date(2025, 6, 30), "KOSPI200")
+
+    assert out == ["005930"]
+    key = make_cache_key("KOSPI200", date(2025, 6, 30))
+    entry = fake_ledger.get("index_members", key)
+    assert entry is not None
+    assert entry.final is True
+    assert entry.row_count == 1
+
+
+def test_index_members_empty_codes_not_finalized_in_ledger(monkeypatch, _clear_cache):
+    """§47 재발 결함: KRX 응답 스키마가 바뀌어 ISU_SRT_CD 키가 사라지면 `_krx_rows` 는
+    "dict 리스트"까지만 검증하므로 예외 없이 통과하고(ok=True), codes 는 빈 채로
+    끝난다. 이 빈 결과를 원장에 final=True 로 남기면, 이후 모든 호출이 KRX 세션조차
+    만들지 않고 영구히 []를 반환한다(수동 DB 삭제 전까지 회복 불가) — 원장 기록은
+    codes 가 있을 때만 남아야 한다."""
+    fake_ledger = _clear_cache
+    rows_without_code = [{"ISU_ABBRV": "삼성전자"}]  # ISU_SRT_CD 키 없음(스키마 변경 시뮬레이션)
+    fake = _FakeSession({"20250630": rows_without_code})
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+
+    out = krx_index.index_members(date(2025, 6, 30), "KOSPI200")
+
+    assert out == []
+    key = make_cache_key("KOSPI200", date(2025, 6, 30))
+    entry = fake_ledger.get("index_members", key)
+    assert entry is None or entry.final is not True
+
+
+def test_index_members_empty_codes_retried_on_next_call(monkeypatch, _clear_cache):
+    """빈 결과를 원장에 확정 기록하지 않았으면, 다음 호출은 2차 캐시(로컬 스토어)에
+    선점되지 않고 KRX 를 다시 조회해야 한다 — 일시적 스키마 문제·장애가 풀리면
+    스스로 회복되는지를 증명하는 테스트."""
+    rows_without_code = [{"ISU_ABBRV": "삼성전자"}]
+    fake = _FakeSession({"20250630": rows_without_code})
+    monkeypatch.setattr(krx_index, "_session", lambda: fake)
+
+    krx_index.index_members(date(2025, 6, 30), "KOSPI200")
+    n_first = len(fake.calls)
+    krx_index.index_members(date(2025, 6, 30), "KOSPI200")  # 2차 캐시가 선점하면 여기서 호출이 안 나간다.
+
+    assert len(fake.calls) > n_first
 
 
 def test_unknown_index_raises(monkeypatch):

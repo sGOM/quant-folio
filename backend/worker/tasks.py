@@ -9,6 +9,7 @@ import gzip
 import logging
 import os
 import subprocess
+from collections.abc import Callable
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -591,3 +592,135 @@ def ingest_news() -> dict:
     기사를 정리하고, 전체 피드 실패 시 전역 warning 알림을 발행한다.
     """
     return _run_async(_ingest_news_async())
+
+
+# ─────────────────────────── 로컬 영구 저장소 야간 선적재 ───────────────────────────
+def _snapshot_target_date() -> date:
+    """선적재 대상 일자 — 전날(확정된 마지막 날).
+
+    당일분은 장중 값이 계속 바뀌어 확정으로 굳힐 수 없으므로(스토어 설계 §6)
+    배치는 전날까지만 다룬다.
+
+    `date.today()` 대신 KST 로 명시 계산한다 — KRX 거래일은 KST 기준인데, 컨테이너
+    TZ 는 UTC 이고 celery_app.timezone(="Asia/Seoul")은 beat 스케줄 표시에만
+    적용될 뿐 태스크 본문의 `date.today()`에는 영향을 주지 않는다. 현재 beat 시각
+    (18:50 KST = 09:50 UTC)에서는 우연히 날짜가 맞아떨어지지만, 스케줄을 KST
+    새벽대로 옮기거나 컨테이너 TZ 가 바뀌면 에러 없이 대상일이 하루 어긋나는
+    조용한 회귀가 난다.
+    """
+    from app.services.market import now_kst
+
+    return now_kst().date() - timedelta(days=1)
+
+
+def _snapshot_steps(ymd: str) -> list[tuple[str, Callable[[], object]]]:
+    """선적재 단계 목록 — (이름, 호출) 쌍.
+
+    별도 함수로 뽑은 이유는 테스트가 실제 pykrx 를 부르지 않고 갈아끼우기 위함이다.
+
+    **지수 OHLCV 는 일부러 넣지 않는다.** `cached_frame` 의 캐시키가 `(start, end)`
+    문자열이라 요청 범위가 **정확히 일치**해야만 로컬 히트한다. 여기서 하루치
+    (`_fetch_index_ohlcv(ymd, ymd, code)`)를 적재해봐야 실제 소비자는 전부 넓은
+    범위(패닉≈90영업일, 섹터 252영업일, 레짐 ma_period+10)라 키가 절대 겹치지
+    않는다 — 행은 쌓이지만 게이팅에 관여하지 못해 소비자는 매번 원격을 다시 타고
+    같은 행을 덮어쓴다. 이득 없이 실패율 분모(단계 수)만 늘려 알림 임계를 왜곡했다.
+    구간 커버리지 기반 조회는 별도 과제다(§49 의 남은 한계).
+    """
+    from app.services.metrics.fetch import (
+        _fetch_fundamentals,
+        _fetch_market_cap,
+        _fetch_market_ohlcv_snapshot,
+    )
+
+    mkts = ["KOSPI", "KOSDAQ"]
+    steps: list[tuple[str, Callable[[], object]]] = [
+        ("펀더멘털", lambda: _fetch_fundamentals(ymd, mkts)),
+        ("시가총액", lambda: _fetch_market_cap(ymd, mkts)),
+    ]
+    for mkt in mkts:
+        steps.append((f"전종목OHLCV({mkt})", lambda m=mkt: _fetch_market_ohlcv_snapshot(ymd, m)))
+    return steps
+
+
+async def _publish_snapshot_alert(ymd: str, failed_names: list[str], total: int) -> None:
+    """스냅샷 선적재 실패율 초과 알림을 발행한다.
+
+    `engine.alerts.publish_alert` 는 Redis 뿐 아니라 전역 `AsyncSessionLocal`(풀링
+    엔진)로 dedup 조회·`Alert` 영속화도 한다 — 이 함수를 단순 `asyncio.run` 으로
+    감싸면 그 루프에서 연 커넥션이 풀에 반환된 채 루프가 닫혀, 같은 워커 프로세스의
+    다음 태스크가 그 커넥션을 재사용하다 "Future attached to a different loop" 로
+    죽는다. 그래서 호출부는 반드시 `_run_async`(종료 전 전역 엔진 dispose)를 써야
+    한다.
+    """
+    from redis.asyncio import Redis
+
+    from app.core.config import settings
+    from engine.alerts import publish_alert
+
+    redis = Redis.from_url(settings.REDIS_URL)
+    try:
+        await publish_alert(
+            redis, user_id=None, strategy_id=0, severity="warning",
+            message=(
+                f"야간 스냅샷 선적재 실패율 {len(failed_names)}/{total}"
+                f"({len(failed_names) / total:.0%})가 임계치를 초과했습니다: "
+                f"{', '.join(failed_names)}"
+            ),
+            code="snapshot_ingest_failure_rate",
+            dedup_window_hours=20.0,  # §21: 원인 해소 전까지 매일 배치마다 반복 발행 억제
+        )
+    finally:
+        await redis.aclose()
+
+
+@celery_app.task(name="worker.ingest_daily_snapshots")
+def ingest_daily_snapshots() -> dict:
+    """전날 확정분을 로컬 저장소에 선적재한다.
+
+    온디맨드 write-through 만으로도 저장소는 채워지지만, 그러면 그 날짜를 처음 밟는
+    백테스트가 대기 비용을 전부 문다. 배치가 미리 채워두면 장중 조회가 사라진다 —
+    단, 이는 **날짜 단위 키를 쓰는 소스**(펀더멘털·시가총액·전종목 OHLCV)에만
+    해당한다. 범위 키 소스(지수 OHLCV·기간 통계)는 요청 범위가 정확히 일치할 때만
+    로컬 히트하므로 선적재로 채울 수 없다(`_snapshot_steps` docstring 참고).
+
+    한 종류가 실패해도 나머지를 계속한다 — 부분 선적재라도 다음 백테스트의 외부
+    조회를 그만큼 줄인다. 실패는 집계하고, 실패율이 임계(`_INGEST_FAILURE_ALERT_RATIO`,
+    ingest_daily_ohlcv 와 동일 상수 재사용)를 넘으면 warning 알림을 발행한다 —
+    §44-1(KRX 로그인 차단)이 재발하면 전 단계가 실패해도 태스크 자체는 SUCCESS 로
+    끝나 아무 알림 없이 넘어갈 수 있기 때문이다.
+
+    단계가 4개뿐이라 형제(ingest_daily_ohlcv, 종목 단위)와 달리 **1건만 실패해도**
+    (1/4=25%) 이 10% 임계를 넘는다 — 여기서는 의도된 동작이다. 종목별 적재에서
+    몇 종목 실패는 흔한 잡음이지만, 여기 한 단계는 "하루치 데이터 종류 하나 전체"
+    (예: 전체 시장 시가총액)이므로 그 하나의 실패도 무시할 잡음이 아니다.
+    """
+    from app.services.data.errors import DataSourceError
+
+    target = _snapshot_target_date()
+    ymd = target.strftime("%Y%m%d")
+    ok = failed = 0
+    failed_names: list[str] = []
+
+    for name, call in _snapshot_steps(ymd):
+        try:
+            call()
+            ok += 1
+        except DataSourceError as e:
+            failed += 1
+            failed_names.append(name)
+            logger.warning("선적재 실패 [%s] %s: %s", ymd, name, e)
+        except Exception:  # noqa: BLE001 - 한 단계 실패가 배치 전체를 멈추면 안 된다
+            failed += 1
+            failed_names.append(name)
+            logger.warning("선적재 실패 [%s] %s", ymd, name, exc_info=True)
+
+    logger.info("일별 스냅샷 선적재 완료 [%s] ok=%d failed=%d", ymd, ok, failed)
+
+    total = ok + failed
+    if total and failed / total > _INGEST_FAILURE_ALERT_RATIO:
+        try:
+            _run_async(_publish_snapshot_alert(ymd, failed_names, total))
+        except Exception:  # noqa: BLE001 - 알림 발행 실패가 이미 끝난 선적재 결과를 무효화하면 안 된다
+            logger.warning("스냅샷 선적재 실패 알림 발행 중 오류", exc_info=True)
+
+    return {"date": ymd, "ok": ok, "failed": failed}

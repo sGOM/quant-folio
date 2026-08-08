@@ -29,6 +29,19 @@ for _krx_field in ("KRX_ID", "KRX_PW"):
     os.environ.pop(f"{_krx_field}_FILE", None)
     os.environ[_krx_field] = ""
 
+# ── OpenDART API 키도 같은 이유로 비운다 ────────────────────────────────────
+# 개발 컨테이너에는 secrets/opendart_api_key.txt 가 OPENDART_API_KEY_FILE 로 마운트돼
+# 있어(docker-compose.yml), 비우지 않으면 `opendart.is_enabled()` 가 True 가 되어
+# 일부 테스트가 **진짜 OpenDART 를 호출한다**. 실제로 test_caller_degradation 의
+# 중립화 테스트들이 삼성전자 2020~2023 연간 원계정을 매 실행마다 망으로 받아오고
+# 있었다(일 20,000건 한도 소모 + 비결정적 테스트). 로컬 스토어 배선(dart_financials)
+# 이후로는 그 결과가 실 DB 에까지 적재돼 드러났다. CI 는 키를 주입하지 않으므로,
+# 비워야 로컬 스위트가 CI 와 같은 조건에서 검증된다.
+# 활성 상태를 검증해야 하는 테스트는 `opendart.is_enabled` 를 개별적으로 목 처리한다
+# (test_opendart.py 가 이미 그렇게 한다).
+os.environ.pop("OPENDART_API_KEY_FILE", None)
+os.environ["OPENDART_API_KEY"] = ""
+
 # ── 앱 모듈 import 는 반드시 위 환경변수 주입 이후에 한다 ──────────────────────
 import json  # noqa: E402
 import operator as _pyop  # noqa: E402

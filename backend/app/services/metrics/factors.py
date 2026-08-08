@@ -186,8 +186,13 @@ def compute_residual_momentum(
 
     각 종목 종가 이력(reg_window+2 개월 버퍼)과 시장 지수(market_ticker, 기본 KOSPI200
     =1028) 종가를 조회해 compute_residual_momentum_panel 로 위임한다. 외부 데이터는
-    종가+지수뿐이며(벤치마크·레짐이 이미 쓰는 소스 재사용), 조회 실패 종목·전량 실패는
-    빈/부분 Series 로 반환한다(호출자가 중립 폴백/스킵 판단).
+    종가+지수뿐이며(벤치마크·레짐이 이미 쓰는 소스 재사용), 두 조회는 저하 방식이 다르다:
+
+    - 시장 지수(_fetch_index_ohlcv)는 잔차 계산의 기준선이라 조회 실패는 그대로
+      전파한다(리밸런싱 경로 기준). 조회는 성공했지만 실제로 데이터가 없는 경우만
+      빈 Series 를 반환한다(전량 계산 불가 신호, 호출자가 스킵 판단).
+    - 개별 종목 종가(load_ohlcv)는 실패한 종목만 결과에서 빠지고(중립 폴백 대상)
+      나머지 종목으로 계산을 이어간다 — try/except 로 흡수한다.
 
     미래참조 방지: as_of 이하 종가만 조회·사용한다.
     """
@@ -247,8 +252,12 @@ def compute_flow_norm(
     나눠 스케일-프리하게 만든다. 회전율 억제를 위해 단기 반전이 아닌 수개월 누적을 본다.
 
     미래참조 방지: as_of 이하 확정 데이터만 사용한다(호출자가 직전 확정 영업일로 넘긴다).
-    조회 실패 종목은 결과에서 빠져(중립 폴백 대상), 전량 실패면 빈 Series 를 반환한다
-    (호출자가 리밸런싱 스킵 판단). window 는 거래일 수 → _approx_start 로 달력일 근사.
+    조회 실패(전량이든 부분이든)는 예외로 전파한다(호출자가 리밸런싱 스킵 판단) —
+    flow 는 factor_weights 로 명시 요청된 팩터라 조용히 빠지면 §47 사고 패턴이
+    재현된다. 빈 Series 가 반환되는 경우는 조회 자체는 성공했는데 순매수 실적이 없는
+    경우다(원격 조회에서 누적이 비었거나, 로컬에 0행이 있는 경우 모두 해당) — 이때는
+    분모(시총/거래대금) 조회를 아예 하지 않는다(순매수가 없으면 분모도 쓰이지 않으므로
+    불필요한 외부 조회를 피한다). window 는 거래일 수 → _approx_start 로 달력일 근사.
 
     :return: index=종목코드(6자리), 값=flow_norm(float). 계산 불가 종목은 제외.
     """
@@ -261,13 +270,12 @@ def compute_flow_norm(
 
     with bounded_socket_timeout(30):
         npf = _fetch_net_purchases(start_ymd, as_of_ymd, mkts)
+        if npf is None or npf.empty:
+            return pd.Series(dtype="float64")  # 순매수 실적 없음 — 분모 조회 불필요
         if denom == "value":
             denom_df = _fetch_price_change(start_ymd, as_of_ymd, mkts)  # 거래대금=구간 누적
         else:
             denom_df = _fetch_market_cap(as_of_ymd, mkts)  # 시가총액=시점값
-
-    if npf is None or npf.empty:
-        return pd.Series(dtype="float64")  # 전량 실패 — 호출자가 스킵 판단
 
     npf = npf.copy()
     npf.index = npf.index.astype(str).str.zfill(6)

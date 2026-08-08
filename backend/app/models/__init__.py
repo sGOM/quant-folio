@@ -18,6 +18,14 @@ from app.models.models import (
     StrategyStatus,
     User,
 )
+from app.models.store import (
+    DartFinancial,
+    ExternalFetch,
+    IndexConstituent,
+    IndexOhlcv,
+    StockDailySnapshot,
+    StockPeriodStat,
+)
 
 __all__ = [
     "Base",
@@ -37,4 +45,10 @@ __all__ = [
     "Alert",
     "NewsArticle",
     "NewsArticleSymbol",
+    "StockDailySnapshot",
+    "StockPeriodStat",
+    "IndexOhlcv",
+    "IndexConstituent",
+    "DartFinancial",
+    "ExternalFetch",
 ]

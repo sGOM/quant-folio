@@ -239,11 +239,20 @@ def _krx_rows(sess, payload: dict, key: str, label: str, timeout: float = 20) ->
 def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
     """as_of 시점에 index 를 구성하던 종목코드(6자리) 목록.
 
-    전량 실패 시 DataSourceError. 미인증 시 빈 값. 7일 소급 루프 중 정상 응답을 한 번도
-    받지 못했으면(전량 실패) 대표 예외를 raise 하고, 정상 응답이 있었는데 전부 빈
-    리스트였으면(휴장일·미상장) 빈 리스트를 그대로 반환한다. `_session()` 자체가 던지는
-    `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 호출자에게 그대로 전파한다 —
-    호출자 정리는 별도 작업.
+    조회 순서: (1) 인메모리 캐시(_MEMBERS_CACHE, 프로세스 수명), (2) 로컬 영구 저장소
+    (원장이 해당 (index, as_of) 조합을 final=True 로 확정 기록했으면 KRX 세션조차
+    만들지 않고 그 저장분을 반환 — §44-1 차단 시에도 백테스트가 살아남는다), (3) 그래도
+    없으면 KRX MDC 를 직접 조회한다.
+
+    전량 실패 시 DataSourceError. **원장에 확정 기록이 없는 한** 미인증 시 빈 값을
+    반환한다(원장에 final=True 로 남아 있으면 미인증이어도 (2)에서 저장분을 반환한다).
+    7일 소급 루프 중 정상 응답을 한 번도 받지 못했으면(전량 실패) 대표 예외를 raise 하고,
+    정상 응답이 있었는데 전부 빈 리스트였으면(휴장일·미상장) 빈 리스트를 그대로
+    반환한다 — 단, 이 **빈 결과는 원장·로컬 저장소에 확정 기록하지 않는다**(codes 가
+    있을 때만 기록). 빈 결과를 굳히면 다음 호출부터 KRX 세션조차 만들지 않고 영구히
+    []를 반환하게 되기 때문이다(수동 DB 삭제 전까지 회복 불가 — §47). `_session()`
+    자체가 던지는 `SourceAuthError`(로그인 실패·쿨다운 중)는 잡지 않고 호출자에게 그대로
+    전파한다 — 호출자 정리는 별도 작업.
 
     :param as_of: 조회 기준일. 주말·휴장일이면 KRX 가 빈 응답을 주므로, 최대 6일 전까지
         직전 영업일로 스냅해 그 시점 구성을 반환한다(PIT 안전 — 미래일로는 가지 않음).
@@ -255,6 +264,19 @@ def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
     key = (index, as_of.strftime("%Y%m%d"))
     if key in _MEMBERS_CACHE:
         return _MEMBERS_CACHE[key]
+
+    # 2차 캐시: 로컬 영구 저장소. PIT 지수구성은 확정 후 불변이므로 한 번 적재되면
+    # KRX 로그인 없이도 조회된다(§44-1 차단 시 백테스트가 살아남는다).
+    from app.services.data.store import indexes as _indexes
+    from app.services.data.store.frame import is_final_date, make_cache_key
+    from app.services.data.store.ledger import default_ledger
+
+    _store_key = make_cache_key(index, as_of)
+    _entry = default_ledger().get("index_members", _store_key)
+    if _entry is not None and _entry.final:
+        codes = _indexes.read_constituents(index, as_of)
+        _MEMBERS_CACHE[key] = codes
+        return codes
 
     sess = _session()
     if sess is None:
@@ -293,6 +315,25 @@ def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
     # 쿨다운은 _krx_rows 가 이미 걸었다 — 여기서 또 걸지 않는다.
     if not ok and errors:
         raise representative(errors)
+
+    # codes 가 있을 때만 로컬 스토어(원장 + PIT 지수구성)에 확정 기록한다 — 아래
+    # 인메모리 캐시와 동일한 원칙이다. 정상 JSON 이면서 codes 만 빈 경우(예: KRX 응답
+    # 스키마가 미세하게 바뀌어 `ISU_SRT_CD` 키가 사라짐)는 `_krx_rows` 가 "dict 리스트"
+    # 까지만 검증하므로 예외 없이 통과한다(ok=True). 이 빈 결과를 원장에 final=True 로
+    # 굳히면, 이후 모든 호출이 259행의 2차 캐시에서 `final==True` 를 보고 **KRX 세션조차
+    # 만들지 않고** [] 를 반환한다 — 인메모리 캐시와 달리 프로세스 재시작으로도 회복되지
+    # 않고 수동 DB 삭제 전까지 영구히 0종목으로 고착된다(§47 재발 형태).
+    # 트레이드오프: 지수 개설 이전 날짜 등 "진짜 0종목"인 시점은 매 호출마다 재조회하게
+    # 되지만(KRX 세션 확보 비용), 잘못 굳혀 영구 0종목이 되는 쪽이 비교할 수 없이 위험하다.
+    # 이 함수는 cached_frame 을 쓰지 않아(별도 2차 캐시 구조) 여기서 직접 가드하지만,
+    # 원칙 자체는 코어 `cached_frame`(app.services.data.store.frame)도 §49 로 동일하게
+    # 따른다 — "빈 결과는 소스가 명시적으로 없다고 선언한 경우에만 확정"이 이 저장소
+    # 전체의 공통 규칙이다.
+    if codes:
+        _indexes.write_constituents(index, as_of, codes)
+        default_ledger().put(
+            "index_members", _store_key, row_count=len(codes), final=is_final_date(as_of)
+        )
 
     # 성공 결과만 캐시한다(실패/미인증/일시 장애의 빈 응답을 캐시하면 프로세스 수명
     # 내내 해당 시점 구성이 []로 고착 → 조용히 고정 유니버스로 폴백하는 생존편향 재유입).

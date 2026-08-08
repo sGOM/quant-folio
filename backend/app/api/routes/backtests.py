@@ -209,19 +209,22 @@ def _provider_with_flow(base_provider, window: int, denom: str):
     """base_provider 결과에 수급(flow) 팩터 컬럼(flow_norm)을 덧붙이는 provider 를 만든다.
 
     factor_weights.flow>0 인 score 전략 백테스트에서만 쓴다. metrics.compute_flow_norm
-    (외국인+기관 누적 순매수/정규화 분모)을 as_of 시점으로 조회한다. 조회 실패/부재면
-    flow_norm 컬럼을 붙이지 않으므로 스코어러가 자연히 중립(0) 처리한다.
+    (외국인+기관 누적 순매수/정규화 분모)을 as_of 시점으로 조회한다.
+
+    부재(순매수 자체가 빈 결과)와 실패는 다르게 갈린다: 조회가 성공했지만 결과가 빈
+    Series 이면 flow_norm 컬럼을 붙이지 않아 스코어러가 자연히 중립(0) 처리하지만,
+    조회 자체가 실패하면(``DataSourceError``) 그대로 전파한다. flow 는 사용자가
+    factor_weights 로 명시 요청한 팩터라, 실패를 삼켜 그 팩터가 빠진 채 백테스트가
+    조용히 완주하면 §47 사고 패턴(빈 입력 위의 조용한 "성공")이 이 진입 경로에
+    재현된다.
     """
     from app.services.metrics import compute_flow_norm
 
     def _p(as_of_date, codes):
         norm_codes = [str(c).zfill(6) for c in codes]
         fdf = base_provider(as_of_date, codes) if base_provider is not None else None
-        try:
-            flow = compute_flow_norm(norm_codes, as_of_date, window=window, denom=denom)
-        except Exception:  # noqa: BLE001
-            flow = None
-        if flow is None or flow.empty:
+        flow = compute_flow_norm(norm_codes, as_of_date, window=window, denom=denom)
+        if flow.empty:  # 실패는 위에서 이미 raise — 여기 오면 항상 Series 다
             return fdf
         s = flow.reindex(norm_codes)
         if fdf is None:

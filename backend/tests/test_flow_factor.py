@@ -15,6 +15,8 @@ import pandas as pd
 import pytest
 
 from app.services import metrics
+from app.services.data.errors import DataSourceError
+from app.services.data.store.ledger import InMemoryLedger
 from app.services.metrics import factors, fetch
 
 
@@ -78,6 +80,18 @@ def _np_df(rows):
     return pd.DataFrame({"순매수거래대금": rows})
 
 
+@pytest.fixture(autouse=True)
+def _fake_period_store(monkeypatch):
+    """실제 DB 대신 인메모리 원장 + no-op 쓰기로 대역한다(로컬 저장소 미배선 검증용).
+
+    이 파일의 _fetch_net_purchases 직접 호출 테스트는 매 호출이 새 계약을 검증하므로
+    원장이 비어 있어야(=매번 fetch_remote 경로) 한다.
+    """
+    monkeypatch.setattr(fetch, "_store_ledger", lambda: InMemoryLedger())
+    monkeypatch.setattr(fetch, "_store_write_periods", lambda *a, **kw: None)
+    monkeypatch.setattr(fetch, "_store_read_periods", lambda *a, **kw: pd.DataFrame())
+
+
 def test_fetch_net_purchases_sums_markets_and_investors(monkeypatch):
     """외국인+기관합계를 종목별로 합산한다(시장 교차 합산 포함)."""
     table = {
@@ -104,16 +118,18 @@ def test_fetch_net_purchases_partial_failure_is_skipped(monkeypatch):
     assert out.loc["005930", "net_buy_value"] == 100.0  # 외국인분만 반영
 
 
-def test_fetch_net_purchases_all_fail_returns_empty(monkeypatch):
-    """전량 실패면 빈 프레임 반환(호출자가 리밸런싱 스킵 판단)."""
+def test_fetch_net_purchases_all_fail_raises(monkeypatch):
+    """전량 실패는 예외로 전파된다(호출자가 조용히 중립 처리하지 못하도록).
+
+    이전 판은 빈 프레임을 반환해 수급 팩터가 조용히 중립이 됐다(§47 류 사고).
+    """
     table = {
         ("KOSPI", "외국인"): RuntimeError("x"),
         ("KOSPI", "기관합계"): RuntimeError("x"),
     }
     monkeypatch.setattr(fetch, "_pykrx_stock", lambda: _FakeStock(table))
-    out = fetch._fetch_net_purchases("20240101", "20240401", ["KOSPI"])
-    assert out.empty
-    assert list(out.columns) == ["net_buy_value"]
+    with pytest.raises(DataSourceError):
+        fetch._fetch_net_purchases("20240101", "20240401", ["KOSPI"])
 
 
 # ───────────────────── compute_flow_norm (정규화) ─────────────────────
@@ -149,10 +165,19 @@ def test_compute_flow_norm_value_denominator(monkeypatch):
 
 
 def test_compute_flow_norm_empty_when_all_fail(monkeypatch):
-    """순매수 전량 실패면 빈 Series(호출자 스킵 판단)."""
+    """순매수 전량 실패면 빈 Series(호출자 스킵 판단).
+
+    compute_flow_norm 은 npf.empty 를 확인하기 전에 정규화 분모(_fetch_market_cap)도
+    함께 조회한다. 여기선 net_purchases 실패 경로만 검증하는 것이 목적이라, 무관한
+    market_cap 호출이 (지금은 예외를 던지는) 실제 pykrx 를 타지 않도록 함께 대역한다.
+    """
     monkeypatch.setattr(
         factors, "_fetch_net_purchases",
         lambda s, e, m: pd.DataFrame(columns=["net_buy_value"]),
+    )
+    monkeypatch.setattr(
+        factors, "_fetch_market_cap",
+        lambda ymd, m: pd.DataFrame(columns=["시가총액"]),
     )
     out = factors.compute_flow_norm(["005930"], date(2024, 4, 1))
     assert out.empty
