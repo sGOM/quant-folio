@@ -3,7 +3,7 @@
 pykrx 는 호출하지 않는다 — _pykrx_stock 을 대역으로 갈아끼운다.
 스토어도 인메모리 원장 + dict 저장소로 대역해 실제 DB 를 쓰지 않는다.
 """
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
@@ -269,3 +269,112 @@ def test_B1_순매수_1회차와_2회차_결과가_같다(_store, monkeypatch):
     assert "900001" not in second.index
     assert sorted(first.columns) == sorted(second.columns)
     assert first.loc["005930", "net_buy_value"] == second.loc["005930", "net_buy_value"]
+
+
+# ───────────────── 지수 OHLCV 구간 커버리지 배선 (Task 4) ─────────────────
+
+
+class _IndexOhlcvFakeStock:
+    """get_index_ohlcv 대역 — 호출 횟수를 센다."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str, str]] = []
+
+    def get_index_ohlcv(self, start_ymd, end_ymd, ticker):
+        self.calls.append((start_ymd, end_ymd, ticker))
+        idx = pd.to_datetime([start_ymd, end_ymd])
+        return pd.DataFrame(
+            {"시가": [1.0, 1.0], "고가": [2.0, 2.0], "저가": [0.5, 0.5],
+             "종가": [1.5, 1.5], "거래량": [10, 10], "거래대금": [100, 100]},
+            index=idx,
+        )
+
+
+@pytest.fixture
+def _index_ohlcv_store(monkeypatch) -> dict[str, pd.DataFrame]:
+    """지수 OHLCV 로컬 저장 대역 — write/read 를 인메모리로 흉내 낸다.
+
+    브리프 원안은 `_store_write_index_ohlcv`/`_store_read_index_ohlcv` 를 패치하지
+    않는다. 그러면 이 테스트들이 실제로 `app.services.data.store.indexes` 를 거쳐
+    실 DB(index_ohlcv 테이블)에 쓰기·읽기를 그대로 내보낸다 — 이 스위트는 실 DB 를
+    쓰지 않는다는 불변(`test_local_store_repo.py` 헤더 참고, "기본 스위트는 실제
+    DB 를 쓰지 않는다")을 어긴다. 특히 원격-미스 테스트는 실제로 index_ohlcv 행을
+    쓴다. 커버리지 대역과 대칭으로 이 함수도 인메모리로 갈아끼운다.
+    """
+    store: dict[str, pd.DataFrame] = {}
+
+    def _write(code, df, name):
+        if df is not None and not df.empty:
+            store[code] = df
+
+    def _read(code, start, end):
+        return store.get(code, pd.DataFrame())
+
+    monkeypatch.setattr(F, "_store_write_index_ohlcv", _write)
+    monkeypatch.setattr(F, "_store_read_index_ohlcv", _read)
+    return store
+
+
+@pytest.fixture
+def _coverage(monkeypatch) -> dict[str, list[tuple[date, date]]]:
+    """지수 커버리지 인메모리 대역 — 기록과 조회만 한다.
+
+    실제 병합 규칙(겹침·±1일 인접)은 여기서 재구현하지 않는다. 재구현하면 프로덕션과
+    갈릴 수 있고, 그 규칙은 Task 2 의 실 DB 테스트가 이미 지킨다. 이 파일의 관심사는
+    fetch.py 가 커버리지 조회·기록을 제대로 배선했는가뿐이다.
+    """
+    store: dict[str, list[tuple[date, date]]] = {}
+
+    monkeypatch.setattr(F, "_store_read_coverage", lambda code: list(store.get(code, [])))
+    monkeypatch.setattr(
+        F,
+        "_store_merge_coverage",
+        lambda code, start, end: store.setdefault(code, []).append((start, end)),
+    )
+    return store
+
+
+def test_확보구간에_포함되면_원격을_안_탄다(_store, monkeypatch, _coverage, _index_ohlcv_store):
+    """워크포워드 시나리오 — [A,D] 를 확보해 두면 그 안의 [B,C] 는 이미 가진 데이터다.
+
+    구간 커버리지 이전에는 캐시키가 정확히 일치해야 해서 이 요청이 매번 원격을 탔다.
+    이 테스트의 책임은 **fetch.py 가 커버리지 조회를 제대로 배선했는가**다. 병합 규칙
+    자체는 Task 2 의 실 DB 테스트가 본다 — 여기서 병합을 재구현하면 두 곳이 갈린다.
+    """
+    fake = _IndexOhlcvFakeStock()
+    monkeypatch.setattr(F, "_pykrx_stock", lambda: fake)
+    _coverage["1001"] = [(date(2018, 1, 1), date(2023, 4, 1))]  # [A, D]
+
+    F._fetch_index_ohlcv("20180401", "20230101", "1001")  # [B, C] ⊂ [A, D]
+
+    assert fake.calls == []
+
+
+def test_확보구간_밖이면_원격을_타고_구간이_기록된다(_store, monkeypatch, _coverage, _index_ohlcv_store):
+    fake = _IndexOhlcvFakeStock()
+    monkeypatch.setattr(F, "_pykrx_stock", lambda: fake)
+
+    F._fetch_index_ohlcv("20180401", "20230101", "1001")
+
+    assert len(fake.calls) == 1
+    assert _coverage["1001"] == [(date(2018, 4, 1), date(2023, 1, 1))]
+
+
+def test_확보구간을_하루라도_못_미치면_원격을_탄다(_store, monkeypatch, _coverage, _index_ohlcv_store):
+    """경계 이빨 검증 — 확보구간이 요청을 '거의' 덮어도 하루라도 못 미치면 미스다.
+
+    Step 5 가 지정한 이빨 검증(`read_coverage=lambda: []`)은 커버리지를 아예
+    비웠을 때만 실패를 잡는다. `_covers()` 의 부등호(`t >= end`)가 배선 과정에서
+    뒤집히거나(예: `t > end`) start/end 인자가 바뀌는 회귀는 "완전 포함"과 "완전
+    부재" 두 극단만 보는 테스트로는 안 잡힌다 — 경계에서 하루 못 미치는 케이스로
+    확인해야 그 부등호가 그대로 통과됐는지 드러난다.
+    """
+    fake = _IndexOhlcvFakeStock()
+    monkeypatch.setattr(F, "_pykrx_stock", lambda: fake)
+    covered_to = date(2023, 1, 1)
+    _coverage["1001"] = [(date(2018, 1, 1), covered_to)]
+    end_ymd = (covered_to + timedelta(days=1)).strftime("%Y%m%d")
+
+    F._fetch_index_ohlcv("20180401", end_ymd, "1001")
+
+    assert len(fake.calls) == 1

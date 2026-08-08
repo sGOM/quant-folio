@@ -31,7 +31,12 @@ from app.services.data.loader import bounded_socket_timeout  # pykrx 무응답 �
 from app.services.data.store import daily as _daily
 from app.services.data.store import indexes as _indexes
 from app.services.data.store import periods as _periods
-from app.services.data.store.frame import cached_frame, is_final_date, make_cache_key
+from app.services.data.store.frame import (
+    cached_frame,
+    cached_range,
+    is_final_date,
+    make_cache_key,
+)
 from app.services.data.store.ledger import default_ledger
 
 logger = logging.getLogger("app.services.metrics")
@@ -77,6 +82,18 @@ def _store_write_index_ohlcv(code, df, name):
 
 def _store_read_index_ohlcv(code, start, end):
     return _indexes.read_index_ohlcv(code, start, end)
+
+
+def _store_read_coverage(code):
+    from app.services.data.store import indexes
+
+    return indexes.read_coverage(code)
+
+
+def _store_merge_coverage(code, start, end):
+    from app.services.data.store import indexes
+
+    indexes.merge_coverage(code, start, end)
 
 
 def _ymd_to_date(ymd: str) -> date:
@@ -507,14 +524,15 @@ def _fetch_index_ohlcv(start_ymd: str, end_ymd: str, ticker: str) -> pd.DataFram
             "거래량": "volume", "거래대금": "trading_value",
         })
 
-    out = cached_frame(
-        "index_ohlcv",
-        make_cache_key(ticker, start_ymd, end_ymd),
+    out = cached_range(
+        ticker,
+        start_d,
+        end_d,
         read_local=lambda: _store_read_index_ohlcv(ticker, start_d, end_d),
         fetch_remote=_remote,
         write_local=lambda df: _store_write_index_ohlcv(ticker, df, None),
-        is_final=is_final_date(end_d),
-        ledger=_store_ledger(),
+        read_coverage=lambda: _store_read_coverage(ticker),
+        merge_coverage=lambda f, t: _store_merge_coverage(ticker, f, t),
     )
     return out if not out.empty else None
 
