@@ -224,7 +224,7 @@ def _provider_with_flow(base_provider, window: int, denom: str):
         norm_codes = [str(c).zfill(6) for c in codes]
         fdf = base_provider(as_of_date, codes) if base_provider is not None else None
         flow = compute_flow_norm(norm_codes, as_of_date, window=window, denom=denom)
-        if flow is None or flow.empty:
+        if flow.empty:  # 실패는 위에서 이미 raise — 여기 오면 항상 Series 다
             return fdf
         s = flow.reindex(norm_codes)
         if fdf is None:

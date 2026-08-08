@@ -7,7 +7,7 @@
   docker compose exec -T -e QF_DB_TESTS=1 web pytest tests/test_local_store_repo.py -v
 """
 import os
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
@@ -227,6 +227,7 @@ _CORP = "00000000"  # 실제 corp_code 와 겹치지 않는 시험값
 def _cleanup_dart():
     yield
     dart_store.delete_accounts(_CORP, 1990, "11011", "CFS")
+    dart_store.delete_accounts(_CORP, date.today().year - 2, "11011", "CFS")
 
 
 def test_원계정을_쓰고_읽는다():
@@ -242,3 +243,37 @@ def test_원계정을_쓰고_읽는다():
 
 def test_미적재는_None_이다():
     assert dart_store.read_accounts(_CORP, 1989, "11011", "CFS") is None
+
+
+def test_I5_재조회에_접수번호가_없어도_기존_접수일이_지워지지_않는다():
+    """I5: dart_financials 만 NULL 보존 upsert(COALESCE)를 안 써서 생기던 함정.
+
+    정정공시 재조회분에서 rcept_no 파싱이 실패하면 새 rcept_dt 가 None 이 된다.
+    그대로 덮으면 confirmed_at 이 폴백(사업연도말 + 1년)으로 다시 계산되는데, 늦은
+    정정(접수일 + 90일이 아직 미래)인 경우 그 폴백은 **더 이른** 날짜라 아직 유예
+    중인 보고서를 확정으로 굳혀버린다 — 정정 전 값이 영구히 박히는 방향이다.
+
+    날짜는 오늘 기준 상대값으로 잡아 시간이 지나도 테스트가 썩지 않게 한다.
+    """
+    today = date.today()
+    bsns_year = today.year - 2          # 폴백 confirmed_at = (today.year-1)-12-31 → 과거
+    recent = today - timedelta(days=30)  # 접수일 + 90일 → 미래(아직 유예 중)
+    rcept_no = f"{recent:%Y%m%d}000001"
+
+    with_rcept = [{"account_nm": "자산총계", "thstrm_amount": "1000", "rcept_no": rcept_no}]
+    dart_store.write_accounts(_CORP, bsns_year, "11011", "CFS", with_rcept)
+
+    got = dart_store.read_accounts(_CORP, bsns_year, "11011", "CFS")
+    assert got is not None and got[1] is False  # 유예 중 = 미확정
+
+    # 재조회분에 rcept_no 가 없다(파싱 실패 상황).
+    without_rcept = [{"account_nm": "자산총계", "thstrm_amount": "2000"}]
+    dart_store.write_accounts(_CORP, bsns_year, "11011", "CFS", without_rcept)
+
+    got = dart_store.read_accounts(_CORP, bsns_year, "11011", "CFS")
+    assert got is not None
+    rows, final = got
+    # 본문(accounts)은 정정 반영을 위해 새 값으로 덮인다.
+    assert rows[0]["thstrm_amount"] == "2000"
+    # 확정 판정은 기존 접수일을 유지해 여전히 미확정이어야 한다.
+    assert final is False

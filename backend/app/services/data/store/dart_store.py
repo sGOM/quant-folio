@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.local_store_db import LocalStoreSession, run_sync
@@ -89,10 +89,26 @@ async def _upsert(row: dict) -> None:
         stmt = stmt.on_conflict_do_update(
             index_elements=["corp_code", "bsns_year", "reprt_code", "fs_div"],
             set_={
+                # accounts 만 무조건 덮는다 — 정정공시의 요점이 원계정 본문 갱신이라,
+                # 새 값을 기존 값으로 되돌리면 정정을 반영하지 못한다.
                 "accounts": stmt.excluded.accounts,
-                "rcept_no": stmt.excluded.rcept_no,
-                "rcept_dt": stmt.excluded.rcept_dt,
-                "confirmed_at": stmt.excluded.confirmed_at,
+                # 접수번호·접수일은 나머지 리포지토리(daily/periods/indexes)와 같은
+                # NULL 보존 upsert 를 쓴다 — 재조회분의 rcept_no 파싱이 실패하면 새
+                # 값이 NULL 인데, 그대로 덮으면 이미 확보한 접수일이 지워진다.
+                "rcept_no": func.coalesce(stmt.excluded.rcept_no, DartFinancial.rcept_no),
+                "rcept_dt": func.coalesce(stmt.excluded.rcept_dt, DartFinancial.rcept_dt),
+                # confirmed_at 에는 COALESCE 가 듣지 않는다 — confirmed_date() 가 접수일을
+                # 모를 때도 폴백(사업연도말+1년)을 채워 돌려주므로 NULL 이 아예 도달하지
+                # 않는다. 대신 **늦은 쪽**을 남긴다. 접수일을 잃은 재조회의 폴백이 원
+                # 접수일+90일보다 이른 조합(예: 유예 중인 늦은 정정)에서 그대로 덮으면
+                # 아직 정정 유예 중인 보고서를 확정으로 굳혀 정정 전 값이 영구히 박힌다.
+                # confirmed_date() docstring 의 원칙("확정을 앞당기면 정정 전 값이 영구히
+                # 굳으므로 늦추는 쪽이 안전하다")을 upsert 에서도 그대로 지키는 것이고,
+                # 90일 규칙을 SQL 로 다시 구현하지 않아도 된다(그 규칙은 confirmed_date
+                # 한 곳에만 있어야 한다).
+                "confirmed_at": func.greatest(
+                    stmt.excluded.confirmed_at, DartFinancial.confirmed_at
+                ),
                 "fetched_at": stmt.excluded.fetched_at,
             },
         )
