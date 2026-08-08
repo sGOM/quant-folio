@@ -124,6 +124,9 @@ async def _select(
         )
         if row is None:
             return None
+        # date.today()(컨테이너 TZ=UTC)를 그대로 쓴다 — cached_frame.is_final_date 와
+        # 달리 여기서는 TZ 가 무관하다. confirmed_at 은 접수일+90일 또는 사업연도말+1년
+        # 이라는 수개월 단위 지평이라, KST/UTC 하루 미만의 차이가 판정을 바꾸지 않는다.
         final = row.confirmed_at is not None and date.today() >= row.confirmed_at
         return list(row.accounts or []), final
 

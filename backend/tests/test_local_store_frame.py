@@ -216,6 +216,35 @@ def test_is_final_date_는_전일까지만_확정으로_본다():
     assert is_final_date(date(2026, 8, 7), today=today) is False
 
 
+def test_is_final_date_는_today_생략시_KST_기준으로_판정한다(monkeypatch):
+    """I2: date.today()(컨테이너 TZ=UTC)가 아니라 KST 로 '오늘'을 계산해야 한다.
+
+    worker.tasks._snapshot_target_date 의 검증(test_worker_snapshots.py)과 같은
+    _FixedDateTime 패턴 — UTC 15:30 = KST 익일 00:30 경계에서 KST 날짜 기준으로
+    전날까지만 확정되는지 본다. date.today() 를 그대로 썼다면 이 시각의 UTC 날짜는
+    아직 8/4 라 8/4 도 "당일"로 미확정 처리됐을 것이다.
+    """
+    from datetime import datetime, timezone
+
+    from app.services import market as market_mod
+
+    # UTC 2026-08-04 15:30 = KST 2026-08-05 00:30 → KST 날짜는 08-05, UTC 날짜는 08-04.
+    fixed_utc = datetime(2026, 8, 4, 15, 30, tzinfo=timezone.utc)
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_utc.replace(tzinfo=None)
+            return fixed_utc.astimezone(tz)
+
+    monkeypatch.setattr(market_mod, "datetime", _FixedDateTime)
+
+    # KST 기준 오늘(08-05)의 전날(08-04)은 확정, 오늘(08-05) 이후는 미확정.
+    assert is_final_date(date(2026, 8, 4)) is True
+    assert is_final_date(date(2026, 8, 5)) is False
+
+
 def test_make_cache_key_는_결정적이다():
     assert make_cache_key("20190312", "KOSPI") == "20190312|KOSPI"
     assert make_cache_key("20190312", ["KOSDAQ", "KOSPI"]) == "20190312|KOSDAQ,KOSPI"

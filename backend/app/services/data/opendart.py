@@ -675,6 +675,8 @@ def cached_accounts(
     # 남기고, 그 전 연도는 앞으로도 안 바뀌므로 확정한다.
     from app.services.data.store import dart_store
 
+    # date.today()(UTC)를 그대로 쓴다 — confirmed_date 는 사업연도말+1년이라는 연 단위
+    # 지평과 비교하므로(dart_store._select 와 동일 근거) TZ 하루 미만의 차이는 무관하다.
     final = date.today() >= dart_store.confirmed_date(None, bsns_year)
     ledger.put(_LEDGER_SOURCE, cache_key, row_count=0, final=final)
     return None

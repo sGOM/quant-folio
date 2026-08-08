@@ -67,9 +67,28 @@ def is_final_date(last_day: date, *, today: date | None = None) -> bool:
     """그 날짜의 시장데이터를 영구 확정으로 봐도 되는가.
 
     전일까지만 확정으로 본다. 당일분은 장중 값이 계속 바뀌므로 굳히면 안 된다.
+
+    기준 '오늘'은 KST 로 계산한다(`app.services.market.now_kst`). KRX 거래일은 KST
+    기준인데, 컨테이너 TZ 는 UTC 이고 celery_app.timezone(="Asia/Seoul")은 beat
+    스케줄 표시에만 적용될 뿐 `date.today()`에는 영향을 주지 않는다
+    (`worker.tasks._snapshot_target_date` 의 docstring 과 같은 취지). UTC 로 뒀다면
+    ① 00:00-09:00 KST 사이의 "어제" 조회가 전부 미확정으로 남아 매번 재조회되고,
+    ② 야간 배치를 KST 새벽대로 옮기면 UTC 날짜가 아직 전날이라 `is_final_date` 가
+    전부 False 를 돌려줘 배치가 에러 없이 아무것도 확정하지 못하는 조용한 회귀가
+    난다. UTC 날짜는 KST 날짜보다 항상 같거나 이르므로(반대는 없음) 이 함수가
+    과확정(미래를 확정으로 굳힘)할 위험은 없다 — 잘못돼도 항상 "미확정" 쪽으로만
+    틀린다.
     """
-    ref = today or date.today()
+    ref = today or _now_kst_date()
     return last_day < ref
+
+
+def _now_kst_date() -> date:
+    """KST 오늘 날짜. 지연 임포트 — 이 모듈이 app.services.market 에 의존하지
+    않아도 되는 다른 호출자(테스트 등)의 임포트 그래프를 가볍게 유지하기 위함."""
+    from app.services.market import now_kst
+
+    return now_kst().date()
 
 
 def cached_frame(
