@@ -11,6 +11,27 @@
 | 기록 없음/final=False| fetch_remote() 1회 → write_local() + 원장 기록  |
 | fetch_remote() 실패  | DataSourceError 그대로 raise(값으로 삼키지 않음) |
 | 소스 미설정          | 여기 오기 전에 통과(§48 미설정 경로 불변)        |
+
+## 빈 결과를 확정으로 굳히는 조건(원칙, §49)
+
+**빈 결과는 "소스가 명시적으로 없다고 선언한 경우"에만 확정으로 굳힌다.** 그 외에는
+호출자가 `is_final=True`(또는 그렇게 평가되는 콜러블)를 넘겨도 `row_count==0`이면
+`final=False`로 내려 다음 호출이 재조회하게 한다.
+
+이유: 이 함수의 호출자(pykrx 기반 5종 — 펀더멘털·시가총액·기간등락률·순매수·
+전종목/지수 OHLCV)는 "정상 응답인데 스키마가 바뀌어 값이 빈 경우"와 "진짜 휴장일/
+무자료"를 구분할 채널이 없다(`krx_index.index_members`의 27번째 줄 주석과 같은
+문제). 전자를 `final=True`로 굳히면 프로세스 재시작으로도 회복되지 않고 수동 DB
+삭제 전까지 영구히 0행으로 고착된다(§47 재발 형태) — Task 8 리뷰가 blocking 으로
+지적한 것과 정확히 같은 형태가 코어에도 있었다.
+
+유일한 예외는 소스가 상태 코드 등으로 "무자료"를 **명시적으로 선언**하는 경우다
+(OpenDART status 013). 그 경로는 이 함수(`cached_frame`)를 쓰지 않고 자체 저장소
+(`dart_store`)에서 별도로 확정 기록한다 — 여기서 예외 처리를 두지 않는다.
+
+트레이드오프: 진짜 휴장일·무실적 구간도 매 호출마다 재조회하게 되지만(pykrx 왕복
+비용), 잘못 굳혀 영구 0행이 되는 쪽이 비교할 수 없이 위험하다. 백테스트는 거래일만
+순회하므로 실비용은 작다.
 """
 from __future__ import annotations
 
@@ -68,6 +89,9 @@ def cached_frame(
     :param is_final: 이 결과를 영구 확정으로 굳혀도 되는가(당일분·미확정 DART 는 False).
         콜러블을 넘기면 `fetch_remote()` 가 끝난 **뒤에** 평가한다 — 확정 여부가 조회
         결과(부분 실패 여부)에 달린 호출자가 있어, 값으로 미리 평가하면 항상 틀린다.
+        단, 결과가 0행이면 이 값과 무관하게 항상 `final=False`로 내린다(모듈 docstring
+        "빈 결과를 확정으로 굳히는 조건" 참고) — 이 함수의 호출자들에게는 무자료를
+        명시적으로 선언하는 채널이 없다.
     :raises DataSourceError: 외부 조회가 실패했을 때. **빈 프레임으로 삼키지 않는다.**
     """
     led = ledger if ledger is not None else default_ledger()
@@ -83,7 +107,17 @@ def cached_frame(
     write_local(df)
     # 확정 여부는 조회가 끝난 지금 평가한다 — 부분 실패 여부에 달린 호출자가 있다.
     final = is_final() if callable(is_final) else is_final
-    led.put(source, cache_key, row_count=len(df), final=final)
+    row_count = len(df)
+    if row_count == 0:
+        # §49: 빈 결과는 "소스가 명시적으로 없다고 선언한 경우"에만 확정으로 굳힌다.
+        # 이 함수의 호출자(펀더멘털·시가총액·기간등락률/순매수·OHLCV)는 그런 명시적
+        # 선언 채널이 없어, 예외 없이 빈 프레임이 오면 "진짜 무자료"인지 "스키마
+        # 변경으로 값을 잃음"인지 구분할 수 없다. 잘못 굳히면 다음 호출부터 이
+        # cache_key 를 영구히 0행으로 취급해 수동 DB 삭제 전까지 회복되지 않는다
+        # (index_members 의 §47 재발 형태와 동일). 트레이드오프: 진짜 휴장일·무실적
+        # 구간도 매 호출 재조회하지만, 백테스트는 거래일만 순회하므로 실비용은 작다.
+        final = False
+    led.put(source, cache_key, row_count=row_count, final=final)
     logger.debug(
         "로컬 적재: %s %s rows=%d final=%s", source, cache_key, len(df), final
     )

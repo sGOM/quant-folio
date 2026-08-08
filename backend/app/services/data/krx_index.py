@@ -325,6 +325,10 @@ def index_members(as_of: date, index: str = "KOSPI200") -> list[str]:
     # 않고 수동 DB 삭제 전까지 영구히 0종목으로 고착된다(§47 재발 형태).
     # 트레이드오프: 지수 개설 이전 날짜 등 "진짜 0종목"인 시점은 매 호출마다 재조회하게
     # 되지만(KRX 세션 확보 비용), 잘못 굳혀 영구 0종목이 되는 쪽이 비교할 수 없이 위험하다.
+    # 이 함수는 cached_frame 을 쓰지 않아(별도 2차 캐시 구조) 여기서 직접 가드하지만,
+    # 원칙 자체는 코어 `cached_frame`(app.services.data.store.frame)도 §49 로 동일하게
+    # 따른다 — "빈 결과는 소스가 명시적으로 없다고 선언한 경우에만 확정"이 이 저장소
+    # 전체의 공통 규칙이다.
     if codes:
         _indexes.write_constituents(index, as_of, codes)
         default_ledger().put(

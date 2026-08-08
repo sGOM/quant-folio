@@ -102,8 +102,16 @@ def test_확정_적재분은_외부를_호출하지_않는다():
     assert len(out) == 3
 
 
-def test_확정된_0행은_빈_결과를_주되_재조회하지_않는다():
-    """휴장일이 매번 외부를 두드리면 저장소의 목적이 무너진다."""
+def test_빈_결과는_is_final이_True여도_확정으로_굳지_않는다():
+    """§49: 빈 결과는 "소스가 명시적으로 없다고 선언한 경우"에만 확정으로 굳힌다.
+
+    이 함수의 호출자(pykrx 기반 5종)는 그런 명시적 선언 채널이 없어, "진짜 휴장일"
+    과 "스키마 변경으로 값을 잃음"을 구분할 수 없다. 과거엔(이 테스트가 원래
+    검증하던 계약) 호출자가 넘긴 is_final=True 를 그대로 믿어 0행을 영구 확정했는데,
+    이게 Task 8 리뷰가 blocking 으로 지적한 index_members 재발 형태와 같은 함정이라
+    계약을 바꿨다 — 이제 row_count==0 이면 is_final 인자와 무관하게 항상 False 로
+    내려 다음 호출이 재조회하게 한다.
+    """
     ledger = InMemoryLedger()
     spy = _Spy(pd.DataFrame())
     kwargs = dict(
@@ -114,8 +122,11 @@ def test_확정된_0행은_빈_결과를_주되_재조회하지_않는다():
     cached_frame("fundamentals", "20190101|KOSPI", **kwargs)
     out = cached_frame("fundamentals", "20190101|KOSPI", **kwargs)
 
-    assert spy.calls == 1
+    assert spy.calls == 2  # 재조회된다 — 예전엔 1(확정으로 굳혀 재조회 안 함)이었다
     assert out.empty
+    entry = ledger.get("fundamentals", "20190101|KOSPI")
+    assert entry.final is False
+    assert entry.row_count == 0
 
 
 def test_외부_실패는_빈_프레임이_아니라_예외로_전파된다():
