@@ -50,17 +50,23 @@ def _fund_frame() -> pd.DataFrame:
 
 
 def _price_change_frame() -> pd.DataFrame:
+    """`_fetch_price_change` 반환 형태.
+
+    247540(KOSDAQ)까지 담아둔다 — 시장 라벨 테스트가 cap 프레임에 KOSDAQ 종목을
+    더할 때 여기에도 있어야 유동성 필터(avg_value_20)를 통과한다. cap 인덱스 기준
+    정렬이라 이 종목을 안 쓰는 테스트에는 영향이 없다.
+    """
     df = pd.DataFrame(
         {
-            "시가": [70000, 180000],
-            "종가": [71000, 182000],
-            "등락률": [1.4, 1.1],
-            "거래량": [1_000_000, 500_000],
-            "거래대금": [2.0e12, 1.6e12],
-            "종목명": ["삼성전자", "SK하이닉스"],
-            "market": ["KOSPI", "KOSPI"],
+            "시가": [70000, 180000, 45000],
+            "종가": [71000, 182000, 46000],
+            "등락률": [1.4, 1.1, 2.2],
+            "거래량": [1_000_000, 500_000, 200_000],
+            "거래대금": [2.0e12, 1.6e12, 9.0e11],
+            "종목명": ["삼성전자", "SK하이닉스", "에코프로비엠"],
+            "market": ["KOSPI", "KOSPI", "KOSDAQ"],
         },
-        index=["005930", "000660"],
+        index=["005930", "000660", "247540"],
     )
     df.index.name = "티커"
     return df
@@ -103,8 +109,26 @@ def test_시총과_펀더멘털에_market_이_모두_있어도_병합이_죽지_
     per_by_code = {i.code: i.per for i in out.items}
     assert per_by_code["005930"] == pytest.approx(12.0)
     assert per_by_code["000660"] == pytest.approx(9.0)
-    # 시장 태그는 cap_df 것을 그대로 쓴다.
-    assert {i.market for i in out.items} == {"KOSPI"}
+
+
+def test_시장_라벨은_요청_인자가_아니라_시총_프레임의_태그를_쓴다(monkeypatch, _stub_sources):
+    """market="ALL" + 혼합 시장으로 요청해야 라벨의 출처가 갈린다.
+
+    요청 인자가 "KOSPI" 인 케이스로 단언하면 폴백 경로로도 그대로 통과해 아무것도
+    변별하지 못한다. 예전 판은 `_is_nan(row.get("market"))` 으로 결측을 걸렀는데
+    `_is_nan` 은 문자열이면 무조건 True 라(`safe_float("KOSPI") is None`) 조건이 항상
+    else 로 떨어져, ALL 요청 시 전 종목 라벨이 "ALL" 로 나왔다.
+    """
+    cap = _cap_frame()
+    cap.loc["247540", :] = [3.0e12, 200_000, 1.0e10, 100_000_000, "KOSDAQ"]
+    monkeypatch.setattr(stocks_mod, "_fetch_market_cap", lambda *a, **kw: cap)
+
+    out = stocks_mod.compute_stocks("ALL", _AS_OF)
+
+    market_by_code = {i.code: i.market for i in out.items}
+    assert market_by_code["005930"] == "KOSPI"
+    assert market_by_code["247540"] == "KOSDAQ"
+    assert "ALL" not in set(market_by_code.values())
 
 
 def test_펀더멘털이_비어도_시장태그와_결측_펀더멘털로_계속한다(monkeypatch, _stub_sources):

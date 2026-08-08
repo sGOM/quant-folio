@@ -237,3 +237,35 @@ def test_B1_가격변동_1회차와_2회차_결과가_같다(_store, monkeypatch
     assert "900001" not in second.index
     # I1: 로컬 히트에도 종목명이 살아있어야 한다(_build_krx_name_map 이 재활용).
     assert second.loc["005930", "종목명"] == "삼성전자"
+
+
+class _NetPurchaseFakeStock:
+    """get_market_net_purchases_of_equities 대역 — 시장별로 다른 티커를 반환한다."""
+
+    def __init__(self, per_market: dict[str, str]):
+        self.per_market = per_market
+
+    def get_market_net_purchases_of_equities(self, start_ymd, end_ymd, market, investor):
+        ticker = self.per_market[market]
+        return pd.DataFrame({"순매수거래대금": [1_000_000.0]}, index=[ticker])
+
+
+def test_B1_순매수_1회차와_2회차_결과가_같다(_store, monkeypatch):
+    """순매수도 다른 4종과 같은 계약이어야 한다 — 시장 격리 + 컬럼 집합 대칭.
+
+    이 소스만 회귀 테스트가 없어서, 원격 경로는 market 을 싣고 로컬 경로는 안 싣는
+    비대칭이 리뷰에서야 드러났다(§49 I1 의 잠복 형태 — 1회차와 2회차의 컬럼이 달라
+    소비자가 조용히 다르게 동작하는 것).
+    """
+    fake = _NetPurchaseFakeStock({"KOSPI": "005930", "KOSDAQ": "900001"})
+    monkeypatch.setattr(F, "_pykrx_stock", lambda: fake)
+
+    F._fetch_net_purchases("20190301", "20190312", ["KOSPI", "KOSDAQ"])  # 야간 배치 적재
+
+    first = F._fetch_net_purchases("20190301", "20190312", ["KOSPI"])
+    second = F._fetch_net_purchases("20190301", "20190312", ["KOSPI"])
+
+    assert sorted(first.index) == sorted(second.index) == ["005930"]
+    assert "900001" not in second.index
+    assert sorted(first.columns) == sorted(second.columns)
+    assert first.loc["005930", "net_buy_value"] == second.loc["005930", "net_buy_value"]

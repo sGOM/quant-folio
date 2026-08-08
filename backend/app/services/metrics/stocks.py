@@ -207,7 +207,16 @@ def compute_stocks(market: str, as_of: date) -> StocksOut:
     items: list[StockMetric] = []
     for code, row in candidates.iterrows():
         code_str = str(code).zfill(6)
-        mkt_label = str(row.get("market", "")) if not _is_nan(row.get("market")) else market
+        # 시장 라벨은 cap_df 가 실어온 태그를 쓴다. 예전에는 `_is_nan(row.get("market"))`
+        # 으로 결측을 걸렀는데, `_is_nan` 은 `safe_float(v) is None` 이라 **문자열이면
+        # 무조건 True** 다("KOSPI" 도 결측 취급) — 그래서 조건이 항상 else 로 떨어져
+        # 요청 인자가 라벨이 됐고, market="ALL" 이면 전 종목이 "ALL" 로 나왔다.
+        raw_market = row.get("market")
+        mkt_label = (
+            raw_market.strip()
+            if isinstance(raw_market, str) and raw_market.strip()
+            else market
+        )
 
         items.append(StockMetric(
             code=code_str,

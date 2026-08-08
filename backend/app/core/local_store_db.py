@@ -37,10 +37,21 @@ T = TypeVar("T")
 #: 워커 스레드 폴백 경고를 프로세스당 1회로 제한하는 플래그(run_sync docstring 참고).
 _fallback_warned = False
 
+#: 스토어 질의 상한(초). asyncpg 는 기본값이 없어(command_timeout=None) 명시하지
+#: 않으면 **무제한**이다 — `bounded_socket_timeout` 은 `socket.setdefaulttimeout`
+#: 기반인데 asyncio 트랜스포트가 소켓을 논블로킹으로 만들어 그 값을 무시하고,
+#: Postgres 쪽 statement_timeout 도 0(무제한)이다. 상한이 없으면 DB 가 멈췄을 때
+#: `run_sync` 의 `thread.join()` 이 호출 스레드를 영구히 잡고, 그 스레드가
+#: `asyncio.to_thread` 워커라면 반복 시 풀이 고갈돼 모든 라우트가 정지한다.
+#: 실제 스토어 질의(단일 upsert·날짜 1건 select)는 전 종목 벌크라도 1초 미만이라
+#: 30초는 "정상 질의는 절대 안 걸리고 멈춘 것만 잡는" 값이다.
+_STORE_COMMAND_TIMEOUT_SEC = 30
+
 local_store_engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
     poolclass=NullPool,
+    connect_args={"command_timeout": _STORE_COMMAND_TIMEOUT_SEC},
 )
 
 LocalStoreSession = async_sessionmaker(
@@ -109,9 +120,12 @@ def _run_in_worker_thread(coro: Coroutine[Any, Any, T]) -> T:
         except BaseException as exc:  # noqa: BLE001 - 호출자에게 그대로 재전파한다
             box["error"] = exc
 
-    # daemon=True: 코루틴이 걸려도 인터프리터 종료를 막지 않는다. join 은 타임아웃 없이
-    # 기다린다 — 여기서 중도 포기하면 호출자에게 돌려줄 값이 없고, 스토어 질의는
-    # asyncpg 자체 타임아웃과 상위의 bounded_socket_timeout 이 이미 상한을 건다.
+    # join 은 타임아웃 없이 기다린다 — 중도 포기하면 호출자에게 돌려줄 값이 없다.
+    # 무한 대기를 막는 실제 상한은 엔진의 `command_timeout`(_STORE_COMMAND_TIMEOUT_SEC)
+    # 하나뿐이다. `bounded_socket_timeout` 은 asyncio 트랜스포트가 소켓을 논블로킹으로
+    # 만들어 여기에 적용되지 않는다(설정해도 무시된다).
+    # daemon=True 는 이 스레드 한 겹이 인터프리터 종료를 붙잡지 않게 할 뿐이다 —
+    # 호출 스레드가 join 에 잠겨 있으면 그쪽이 여전히 종료를 막을 수 있다.
     thread = threading.Thread(target=_runner, name="local-store-run-sync", daemon=True)
     thread.start()
     thread.join()
