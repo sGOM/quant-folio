@@ -102,16 +102,26 @@ def compute_stocks(market: str, as_of: date) -> StocksOut:
         return StocksOut(as_of=as_of, count=0, items=[])
 
     # ── 데이터 병합 ──
-    # market tag는 fund_df에서 가져옴
     merged = cap_df.copy()
 
-    # 시장 태그: fund_df.market 컬럼 병합
-    if not fund_df.empty and "market" in fund_df.columns:
-        merged = merged.join(fund_df[["PER", "PBR", "DIV", "market"]], how="left")
-    else:
-        merged["market"] = market if market != "ALL" else "KOSPI"
-        for col in ["PER", "PBR", "DIV"]:
+    # 시장 태그는 cap_df 가 이미 싣는다 — 로컬 저장소 도입(§49 B1) 이후
+    # _fetch_market_cap 도 시장별로 market 을 태깅한다. 예전에는 fund_df 에서만 왔기에
+    # join 할 때 market 을 함께 끌어왔는데, 지금 그대로 두면 양쪽에 같은 컬럼이 있어
+    # pandas join 이 "columns overlap but no suffix specified" 로 죽는다. 여기서는
+    # 펀더멘털 3종만 붙이고, 시장 태그는 cap_df 것을 쓴다.
+    fund_cols = [c for c in ("PER", "PBR", "DIV") if c in fund_df.columns]
+    if not fund_df.empty and fund_cols:
+        merged = merged.join(fund_df[fund_cols], how="left")
+    for col in ("PER", "PBR", "DIV"):
+        if col not in merged.columns:
             merged[col] = np.nan
+
+    # 시장 태그가 없거나(구 스키마 잔재) 비어 있으면 요청 시장으로 채운다.
+    fallback_market = market if market != "ALL" else "KOSPI"
+    if "market" not in merged.columns:
+        merged["market"] = fallback_market
+    else:
+        merged["market"] = merged["market"].fillna(fallback_market)
 
     # 1-day 종가 및 등락률
     if not pc_1d.empty:

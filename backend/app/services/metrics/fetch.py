@@ -213,7 +213,9 @@ def _fetch_fundamentals(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
 def _fetch_market_cap(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
     """전 종목 시가총액·상장주식수·거래대금을 조회한다 — 로컬 우선.
 
-    컬럼: 시가총액, 거래량, 거래대금, 상장주식수. 티커 인덱스.
+    컬럼: 시가총액, 거래량, 거래대금, 상장주식수 + market. 티커 인덱스.
+    `market` 은 로컬 읽기 시 시장을 갈라내기 위한 태그다(§49 B1) — 소비자가
+    `join` 으로 다른 프레임을 붙일 때 컬럼이 겹칠 수 있으니 주의.
 
     :raises DataSourceError: 전 시장 조회가 실패했을 때.
     """
@@ -263,8 +265,10 @@ def _fetch_market_cap(as_of_ymd: str, mkts: list[str]) -> pd.DataFrame:
 def _fetch_price_change(start_ymd: str, end_ymd: str, mkts: list[str]) -> pd.DataFrame:
     """기간 등락률·거래대금을 전 종목 일괄 조회한다 — 로컬 우선.
 
-    컬럼: 시가, 종가, 등락률, 거래량, 거래대금. 티커 인덱스.
+    컬럼: 시가, 종가, 등락률, 거래량, 거래대금 + 종목명, market. 티커 인덱스.
     등락률은 pykrx 원값 그대로(%) — 호출자가 /100 으로 변환한다.
+    `종목명` 은 `names._build_krx_name_map` 이 재활용하고(§49 I1), `market` 은 로컬
+    읽기 시 시장을 갈라내기 위한 태그다(§49 B1).
 
     :raises DataSourceError: 전 시장 조회가 실패했을 때.
     """
@@ -324,7 +328,8 @@ def _fetch_net_purchases(
     반환한다(get_market_price_change 와 같은 '시장당 1회' 급 비용). 외국인+기관합계 두
     투자자군을 합산해 종목별 순매수 '대금'(원)만 남긴다.
 
-    반환: 티커 인덱스, 컬럼 ["net_buy_value"](외국인+기관 순매수거래대금 합, 원).
+    반환: 티커 인덱스, 컬럼 ["net_buy_value"](외국인+기관 순매수거래대금 합, 원)
+    + market(로컬 읽기 시 시장을 갈라내기 위한 태그, §49 B1).
     개별 (시장, 투자자) 조회 실패는 경고 후 건너뛰고(그 부분만 결측 → 호출자가 중립
     처리), 전량(모든 시장×투자자) 조회가 실패하면 예외를 던진다(아래 :raises: 참고).
     빈 프레임이 반환되는 경우는 조회 자체는 성공했지만 순매수 실적이 없는(0행 확정)
@@ -400,8 +405,11 @@ def _fetch_net_purchases(
         "net_purchases",
         make_cache_key(start_ymd, end_ymd, mkts, investors),
         read_local=lambda: _store_read_periods(
-            start_d, end_d, investors_key, ["net_buy_value"],
-            out_columns={"net_buy_value": "net_buy_value"},
+            # market 도 함께 읽어 원격 경로와 컬럼 집합을 맞춘다 — 1회차(원격)와
+            # 2회차(로컬)의 컬럼이 달라지면 소비자가 조용히 다르게 동작한다(§49 I1 이
+            # 정확히 그 형태였다).
+            start_d, end_d, investors_key, ["net_buy_value", "market"],
+            out_columns={"net_buy_value": "net_buy_value", "market": "market"},
             markets=mkts,
         ),
         fetch_remote=_remote,
@@ -417,7 +425,8 @@ def _fetch_net_purchases(
 def _fetch_market_ohlcv_snapshot(date_ymd: str, mkt: str) -> pd.DataFrame | None:
     """단일 거래일의 전 종목 OHLCV 스냅샷을 조회한다 — 로컬 우선.
 
-    컬럼: 시가/고가/저가/종가/거래량/거래대금/등락률. 티커 인덱스.
+    컬럼: 시가/고가/저가/종가/거래량/거래대금/등락률 + market. 티커 인덱스.
+    `market` 은 로컬 읽기 시 시장을 갈라내기 위한 태그다(§49 B1).
     패닉셀 S9(신저가 브레드스)가 날짜를 훑으며 부르므로 로컬 적재 효과가 가장 크다.
 
     :raises DataSourceError: 조회가 실패했을 때(이전 판은 None 을 돌려줬다).
