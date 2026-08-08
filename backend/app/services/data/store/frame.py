@@ -44,10 +44,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 
+from app.services.data.errors import DataSourceError
 from app.services.data.store.ledger import Ledger, default_ledger
 
 logger = logging.getLogger("app.services.data.store")
@@ -87,7 +88,7 @@ def is_final_date(last_day: date, *, today: date | None = None) -> bool:
     틀린다.
     """
     ref = today or _now_kst_date()
-    return last_day < ref
+    return last_day <= last_final_date(today=ref)
 
 
 def _now_kst_date() -> date:
@@ -96,6 +97,17 @@ def _now_kst_date() -> date:
     from app.services.market import now_kst
 
     return now_kst().date()
+
+
+def last_final_date(*, today: date | None = None) -> date:
+    """확정으로 봐도 되는 마지막 날짜 — KST 기준 전날.
+
+    `is_final_date` 와 같은 기준을 두 곳에서 따로 계산하면 언젠가 어긋난다. 범위형
+    조회(`cached_range`)는 "어디까지 확정인가"를 **값으로** 필요로 하므로(커버 구간을
+    거기서 자른다) 여기 한 곳에 두고 `is_final_date` 도 이것을 쓴다.
+    """
+    ref = today or _now_kst_date()
+    return ref - timedelta(days=1)
 
 
 def cached_frame(
@@ -147,4 +159,90 @@ def cached_frame(
     logger.debug(
         "로컬 적재: %s %s rows=%d final=%s", source, cache_key, len(df), final
     )
+    return df
+
+
+def _covers(intervals: list[tuple[date, date]], start: date, end: date) -> bool:
+    """확보 구간 중 [start, end] 를 통째로 포함하는 것이 있는가.
+
+    구간들의 합집합이 아니라 **개별 구간**을 본다. 합집합으로 판정하려면 사이의
+    빈틈이 휴장일인지 미적재인지 알아야 하는데, 그 판단에는 거래일 달력이 필요하다.
+    """
+    return any(f <= start and t >= end for f, t in intervals)
+
+
+def _with_coverage_hint(
+    exc: DataSourceError, intervals: list[tuple[date, date]]
+) -> DataSourceError:
+    """실패 예외에 로컬 확보 구간을 덧붙여 **같은 클래스로** 다시 만든다.
+
+    사용자가 기간을 좁혀 재시도할 근거를 응답 본문(`app/main.py` 가 502/503 으로
+    변환한다)에서 바로 보게 하려는 것이다. 기간을 대신 축소하지는 않는다 — 구간이
+    바뀐 성과를 같은 것으로 착각하는 함정은 이 저장소가 이미 데인 적이 있다.
+
+    `errors.py` 의 예외 계층이 전부 `(source, message, retry_after=)` 시그니처를
+    공유하는 것에 기댄다. 쿨다운·실패 집계는 `fetch_remote()` 안에서 이미 기록됐으므로
+    인스턴스를 바꿔도 영향이 없다.
+    """
+    if intervals:
+        newest = sorted(intervals, key=lambda iv: iv[1], reverse=True)
+        shown = ", ".join(f"{f:%Y-%m-%d}~{t:%Y-%m-%d}" for f, t in newest[:3])
+        if len(newest) > 3:
+            shown += f" …외 {len(newest) - 3}건"
+    else:
+        shown = "없음"
+    return type(exc)(
+        exc.source,
+        f"{exc.detail} — 로컬 확보 구간: {shown}",
+        retry_after=exc.retry_after,
+    )
+
+
+def cached_range(
+    key: str,
+    start: date,
+    end: date,
+    *,
+    read_local: Callable[[], pd.DataFrame],
+    fetch_remote: Callable[[], pd.DataFrame],
+    write_local: Callable[[pd.DataFrame], None],
+    read_coverage: Callable[[], list[tuple[date, date]]],
+    merge_coverage: Callable[[date, date], None],
+) -> pd.DataFrame:
+    """범위 조회의 로컬 우선 진입점 — 확보 구간이 요청을 덮으면 외부를 타지 않는다.
+
+    `cached_frame` 의 형제다. 차이는 게이트가 캐시키 정확일치가 아니라 **구간 포함**
+    이라는 점 하나다. 범위 키 소스(지수 OHLCV)는 요청 범위가 조금만 달라도 원장
+    키가 어긋나 이미 가진 행을 못 쓰는 문제가 있었다.
+
+    커버 구간으로 기록하는 것은 **요청 범위**이지 받아온 행의 범위가 아니다 —
+    `[start, end]` 에 대해 소스가 정상 응답했으면 그 창 안은 전부 받은 것이므로,
+    거래일 달력 없이도 갭 없음을 말할 수 있다.
+
+    :param key: 로그·디버깅용 식별자(지수코드). 게이트 판정에는 쓰지 않는다 —
+        커버 구간 조회 자체가 `read_coverage` 콜러블에 이미 묶여 있다.
+    :raises DataSourceError: 외부 조회가 실패했을 때. `detail` 에 로컬 확보 구간을
+        덧붙여 올린다. **빈 프레임으로 삼키지 않는다.**
+    """
+    final_through = last_final_date()
+
+    if end <= final_through and _covers(read_coverage(), start, end):
+        logger.debug("로컬 커버 히트: %s %s~%s", key, start, end)
+        return read_local()
+
+    try:
+        df = fetch_remote()
+    except DataSourceError as e:
+        raise _with_coverage_hint(e, read_coverage()) from e
+
+    if df is None:
+        df = pd.DataFrame()
+    write_local(df)
+
+    if not df.empty:
+        # 빈 결과는 커버리지로 기록하지 않는다 — "없다는 명시적 선언"이 아니라
+        # 스키마 변동으로 값을 잃은 것일 수도 있다(cached_frame 의 0행 가드와 같은 판단).
+        merge_coverage(start, min(end, final_through))
+
+    logger.debug("원격 조회: %s %s~%s rows=%d", key, start, end, len(df))
     return df
