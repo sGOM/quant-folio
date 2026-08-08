@@ -128,7 +128,12 @@ def screen_turnaround(
         surge_v = _safe_float(liquid.loc[code, "turnover_surge"])
         mcap = int(liquid.loc[code, "시가총액"]) if not is_nan(liquid.loc[code, "시가총액"]) else 0
         avgv = _safe_float(liquid.loc[code, "avg_value_20"]) or 0.0
-        mkt = str(liquid.loc[code].get("시장", "")) if "시장" in liquid.columns else market
+        # 시장 라벨은 시총 프레임이 실어온 `market` 태그를 쓴다(§49 B1 이후
+        # `_fetch_market_cap` 이 시장별로 태깅한다). 예전에는 pykrx 가 낸 적 없는
+        # `"시장"` 컬럼을 찾다가 항상 요청 인자로 떨어져, market="ALL" 조회 시 전
+        # 종목 라벨이 "ALL" 이었다.
+        raw_mkt = liquid.loc[code].get("market")
+        mkt = raw_mkt.strip() if isinstance(raw_mkt, str) and raw_mkt.strip() else market
 
         fin = qmetrics.get(code, {})
         debt = fin.get("debt_ratio")

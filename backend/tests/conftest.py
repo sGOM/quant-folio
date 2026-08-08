@@ -47,6 +47,8 @@ import json  # noqa: E402
 import operator as _pyop  # noqa: E402
 from decimal import Decimal  # noqa: E402
 
+import pytest  # noqa: E402
+
 from sqlalchemy.sql.operators import and_ as _and_op  # noqa: E402
 from sqlalchemy.sql.operators import in_op as _in_op  # noqa: E402
 
@@ -242,6 +244,10 @@ class _ExecResult:
     def scalars(self) -> _ScalarResult:
         return _ScalarResult(self._rows)
 
+    def scalar_one_or_none(self):
+        """engine.alerts.publish_alert 의 dedup 조회가 쓰는 형태."""
+        return self._rows[0] if self._rows else None
+
 
 def _extract_predicates(clause) -> list[tuple[str, object, object]]:
     """WHERE 절에서 (컬럼명, 연산자, 값) 등가/부등/IN 조건을 뽑는다(AND 만, best-effort).
@@ -350,3 +356,26 @@ class FakeDB:
 def make_session_factory(store: _Store):
     """AsyncSessionLocal 대체용 팩토리. 호출 시 store 를 공유하는 FakeDB 를 돌려준다."""
     return lambda: FakeDB(store)
+
+
+@pytest.fixture(autouse=True)
+def _block_alert_db_writes(monkeypatch):
+    """모든 테스트에서 `engine.alerts.publish_alert` 의 DB 영속화를 차단한다.
+
+    `publish_alert` 는 전역 `AsyncSessionLocal` 로 dedup 조회 + `Alert` 적재를 하는데,
+    개발 컨테이너의 테스트는 **실 개발 DB** 를 보고 있다. 알림 경로를 타는 테스트가
+    대역을 빠뜨리면 매 실행 실 `alerts` 테이블에 행이 쌓였다(실제로 그렇게 수백 행이
+    쌓였고, `test_engine_health.py` 는 docstring 에 "DB 는 타지 않는다"고 적어 둔 채로
+    타고 있었다). 게다가 실 DB 에 같은 (user, strategy, code) 미확인 알림이 이미 있으면
+    dedup 이 걸려 테스트 결과가 **DB 이력에 따라 달라진다** — 비결정성까지 생긴다.
+
+    개별 테스트마다 대역을 붙이는 방식은 새 테스트가 추가될 때 또 새므로(§CONVENTIONS
+    "테스트 격리") 여기서 기본 차단한다. WS(Redis) 발송·텔레그램 분기는 그대로 두므로
+    알림 동작을 검증하는 테스트는 영향을 받지 않는다.
+
+    DB 조회 결과 자체를 통제해야 하는 테스트(`test_alerts_dedup.py`)는 테스트 본문에서
+    다시 `monkeypatch.setattr(alerts, "AsyncSessionLocal", ...)` 하면 그쪽이 이긴다.
+    """
+    from engine import alerts as _alerts
+
+    monkeypatch.setattr(_alerts, "AsyncSessionLocal", make_session_factory(_Store()))

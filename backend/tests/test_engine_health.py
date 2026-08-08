@@ -3,6 +3,10 @@
 BaseRunner 의 헬스 추적(마지막 성공 틱·연속 실패)과 알림 dedup(임계 처음 넘을 때만 1회
 발행, 성공 리셋 후 재발화 가능)을 mock Redis 로 검증한다. 외부 I/O(브로커·DB·pykrx)는
 타지 않고 상태기계만 본다.
+
+단, DB 차단은 이 파일이 아니라 `conftest._block_alert_db_writes`(autouse)가 건다 —
+`publish_alert` 가 전역 `AsyncSessionLocal` 로 `Alert` 를 적재하기 때문이다. 그 픽스처가
+없으면 이 파일은 위 서술과 달리 **실 개발 DB 에 알림 행을 남긴다**(실제로 그랬다).
 """
 import json
 
