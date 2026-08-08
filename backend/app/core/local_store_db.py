@@ -16,6 +16,8 @@ worker 의 해법(실행 끝에 engine.dispose())은 여기서 못 쓴다 — �
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 from collections.abc import Coroutine
 from typing import Any, TypeVar
 
@@ -27,6 +29,8 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -47,16 +51,58 @@ LocalStoreSession = async_sessionmaker(
 def run_sync(coro: Coroutine[Any, Any, T]) -> T:
     """동기 컨텍스트(워커 스레드)에서 스토어 코루틴을 실행한다.
 
-    이벤트루프 안에서 부르면 asyncio.run 이 어차피 터지지만, 그 예외는 스토어 내부
-    깊은 곳에서 나와 원인이 흐려진다. 진입점에서 무엇이 잘못됐는지 말하고 막는다.
+    정상 경로(실행 중인 이벤트루프 없음)는 asyncio.run 으로 바로 돈다.
+
+    이미 루프 안(async 컨텍스트)에서 불렸다면 asyncio.run 을 그대로 쓰면
+    "asyncio.run() cannot be called from a running event loop" 로 죽는다 — 이전
+    판의 raise 가드가 원래 하려던 일은 그 예외를 진입점에서 명확히 하는 것뿐이었다
+    (가드가 없어도 크래시는 났다. 가드는 원인만 밝혔지 문제를 만들지 않았다).
+
+    이제는 raise 대신 전용 워커 스레드에서 새 루프를 열어 실행한다.
+    `local_store_engine` 이 NullPool 이라(이 모듈 상단 docstring 참고) 워커 스레드가
+    연 커넥션이 그 스레드의 루프에 묶인 채 풀에 남는 일이 없다 — 이 모듈이 막으려던
+    교차 루프(asyncpg "Future attached to a different loop") 문제가 재발하지 않는
+    이유가 이것이다. 워커 스레드의 루프는 호출자 루프와 독립적이라 교착도 없다.
+    대가는 호출자 루프가 그동안 블로킹된다는 점뿐이다.
+
+    다만 서버 코드(FastAPI 라우트·engine 데몬)에서 이 폴백을 타는 것은 여전히
+    잘못이다 — 그쪽은 `asyncio.to_thread`/`run_in_threadpool` 로 감싸 애초에 실행
+    중인 루프 밖에서 불러야 한다. 그래서 폴백 진입 시 경고 로그를 남긴다. 정상
+    배선된 서버 경로는 전부 이미 스레드에서 호출되므로 이 경고가 뜨지 않는다.
+    `backend/scripts/` 의 검증 스크립트처럼 `async def main()` 안에서 직접 부르는
+    코드가 이 경고의 정상적인 대상이다.
     """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        pass  # 실행 중인 루프 없음 = 정상 경로
-    else:
-        raise RuntimeError(
-            "run_sync 는 이벤트루프 안에서 호출할 수 없다. "
-            "async 컨텍스트라면 코루틴을 직접 await 하라."
-        )
-    return asyncio.run(coro)
+        return asyncio.run(coro)  # 실행 중인 루프 없음 = 정상 경로
+
+    logger.warning(
+        "run_sync 가 실행 중인 이벤트루프 안에서 호출됐다 — 전용 워커 스레드로 "
+        "폴백한다. 서버 코드(FastAPI 라우트·engine 데몬)라면 asyncio.to_thread 로 "
+        "감싸 애초에 실행 중인 루프 밖에서 불러야 한다."
+    )
+    return _run_in_worker_thread(coro)
+
+
+def _run_in_worker_thread(coro: Coroutine[Any, Any, T]) -> T:
+    """coro 를 전용 스레드에서 새 이벤트루프(asyncio.run)로 돌리고 결과를 되돌린다.
+
+    예외도 그대로 재전파한다 — 호출자가 DataSourceError 등을 잡아 처리하는 계약이
+    깨지지 않아야 한다.
+    """
+    box: dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            box["result"] = asyncio.run(coro)
+        except BaseException as exc:  # noqa: BLE001 - 호출자에게 그대로 재전파한다
+            box["error"] = exc
+
+    thread = threading.Thread(target=_runner, name="local-store-run-sync")
+    thread.start()
+    thread.join()
+
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
