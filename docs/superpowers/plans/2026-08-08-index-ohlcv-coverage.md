@@ -747,47 +747,53 @@ class _IndexOhlcvFakeStock:
         )
 
 
-def test_워크포워드처럼_창이_밀려도_포함되면_원격을_안_탄다(_store, monkeypatch):
-    """[A,C] 와 [B,D] 를 받아 두면 그 안의 [B,C] 는 이미 가진 데이터다.
+def test_확보구간에_포함되면_원격을_안_탄다(_store, monkeypatch, _coverage):
+    """워크포워드 시나리오 — [A,D] 를 확보해 두면 그 안의 [B,C] 는 이미 가진 데이터다.
 
     구간 커버리지 이전에는 캐시키가 정확히 일치해야 해서 이 요청이 매번 원격을 탔다.
+    이 테스트의 책임은 **fetch.py 가 커버리지 조회를 제대로 배선했는가**다. 병합 규칙
+    자체는 Task 2 의 실 DB 테스트가 본다 — 여기서 병합을 재구현하면 두 곳이 갈린다.
     """
     fake = _IndexOhlcvFakeStock()
     monkeypatch.setattr(F, "_pykrx_stock", lambda: fake)
-
-    F._fetch_index_ohlcv("20180101", "20230101", "1001")  # [A, C]
-    F._fetch_index_ohlcv("20180401", "20230401", "1001")  # [B, D] — 크게 겹친다
-    before = len(fake.calls)
+    _coverage["1001"] = [(date(2018, 1, 1), date(2023, 4, 1))]  # [A, D]
 
     F._fetch_index_ohlcv("20180401", "20230101", "1001")  # [B, C] ⊂ [A, D]
 
-    assert len(fake.calls) == before  # 원격 0회
+    assert fake.calls == []
+
+
+def test_확보구간_밖이면_원격을_타고_구간이_기록된다(_store, monkeypatch, _coverage):
+    fake = _IndexOhlcvFakeStock()
+    monkeypatch.setattr(F, "_pykrx_stock", lambda: fake)
+
+    F._fetch_index_ohlcv("20180401", "20230101", "1001")
+
+    assert len(fake.calls) == 1
+    assert _coverage["1001"] == [(date(2018, 4, 1), date(2023, 1, 1))]
 ```
 
-`_store` 픽스처가 `indexes.read_coverage`/`merge_coverage`/`read_index_ohlcv`/`write_index_ohlcv` 를 인메모리로 대역하도록 확장해야 한다. 픽스처 안에 다음을 추가한다(기존 대역 방식과 같은 자리):
+이 두 테스트가 쓰는 `_coverage` 픽스처를 같은 파일에 추가한다. **병합 규칙을 흉내 내지
+않는다** — 기록만 하고, 히트 케이스는 테스트가 구간을 직접 심는다:
 
 ```python
-    # 지수 커버리지 인메모리 대역 — 실제 병합 규칙(겹침·±1일 인접)을 그대로 흉내 낸다.
-    coverage: dict[str, list[tuple[date, date]]] = {}
+@pytest.fixture
+def _coverage(monkeypatch) -> dict[str, list[tuple[date, date]]]:
+    """지수 커버리지 인메모리 대역 — 기록과 조회만 한다.
 
-    def fake_read_coverage(code):
-        return list(coverage.get(code, []))
+    실제 병합 규칙(겹침·±1일 인접)은 여기서 재구현하지 않는다. 재구현하면 프로덕션과
+    갈릴 수 있고, 그 규칙은 Task 2 의 실 DB 테스트가 이미 지킨다. 이 파일의 관심사는
+    fetch.py 가 커버리지 조회·기록을 제대로 배선했는가뿐이다.
+    """
+    store: dict[str, list[tuple[date, date]]] = {}
 
-    def fake_merge_coverage(code, start, end):
-        if end < start:
-            return
-        one = timedelta(days=1)
-        keep, hit = [], [(start, end)]
-        for f, t in coverage.get(code, []):
-            if t >= start - one and f <= end + one:
-                hit.append((f, t))
-            else:
-                keep.append((f, t))
-        keep.append((min(f for f, _ in hit), max(t for _, t in hit)))
-        coverage[code] = sorted(keep)
-
-    monkeypatch.setattr(F, "_store_read_coverage", fake_read_coverage)
-    monkeypatch.setattr(F, "_store_merge_coverage", fake_merge_coverage)
+    monkeypatch.setattr(F, "_store_read_coverage", lambda code: list(store.get(code, [])))
+    monkeypatch.setattr(
+        F,
+        "_store_merge_coverage",
+        lambda code, start, end: store.setdefault(code, []).append((start, end)),
+    )
+    return store
 ```
 
 `test_fetch_store_wiring.py` 6행은 현재 `from datetime import date` 다(확인함). **`timedelta` 를 더해** `from datetime import date, timedelta` 로 바꾼다.
@@ -795,7 +801,7 @@ def test_워크포워드처럼_창이_밀려도_포함되면_원격을_안_탄�
 - [ ] **Step 2: 실패를 확인한다**
 
 ```bash
-docker compose exec -T web pytest tests/test_fetch_store_wiring.py -q -k 워크포워드
+docker compose exec -T web pytest tests/test_fetch_store_wiring.py -q -k 확보구간
 ```
 
 Expected: FAIL — `AttributeError: ... has no attribute '_store_read_coverage'`
@@ -841,14 +847,14 @@ def _store_merge_coverage(code, start, end):
 docker compose exec -T web pytest -q
 ```
 
-Expected: `839 passed, 23 skipped`
+Expected: `840 passed, 23 skipped` (Task 4 가 테스트 2건을 더한다)
 
 - [ ] **Step 5: 이빨 검증 — 커버리지 주입을 끊는다**
 
 `_fetch_index_ohlcv` 의 `read_coverage=` 를 `lambda: []` 로 잠시 바꾸고 실행한다:
 
 ```bash
-docker compose exec -T web pytest tests/test_fetch_store_wiring.py -q -k 워크포워드
+docker compose exec -T web pytest tests/test_fetch_store_wiring.py -q -k 확보구간
 ```
 
 Expected: FAIL(원격 1회 추가). 확인 후 **Edit 로 원복**하고 `git diff` 무출력을 확인한다.
@@ -940,9 +946,14 @@ def test_snapshot_steps_는_올바른_함수를_올바른_인자로_배선한다
 
     assert [t for _s, _e, t in calls["index_ohlcv"]] == ["1001", "2001", "1028"]
     # 끝은 대상일, 시작은 400 거래일 근사만큼 과거 — 하루치가 아니다.
+    # 경계 상수(_SNAPSHOT_INDEX_BDAYS·buffer)가 조금 바뀌어도 안 깨지도록, 고정 날짜
+    # 대신 "최소 1년 이상 과거"라는 성질로 단언한다(하루치 퇴행은 확실히 잡힌다).
+    from datetime import datetime as _dt
+
     for start_ymd, end_ymd, _t in calls["index_ohlcv"]:
         assert end_ymd == "20260805"
-        assert start_ymd < "20250101"
+        span = (_dt.strptime(end_ymd, "%Y%m%d") - _dt.strptime(start_ymd, "%Y%m%d")).days
+        assert span > 365
 ```
 
 - [ ] **Step 2: 실패를 확인한다**
@@ -1015,7 +1026,7 @@ docker compose exec -T web pytest tests/test_worker_snapshots.py -q
 docker compose exec -T web pytest -q
 ```
 
-Expected: `test_worker_snapshots.py` 전부 통과. 전체 `839 passed, 23 skipped`.
+Expected: `test_worker_snapshots.py` 전부 통과. 전체 `840 passed, 23 skipped`.
 
 - [ ] **Step 5: 이빨 검증 — 하루치로 퇴행시킨다**
 
@@ -1121,7 +1132,7 @@ docker compose exec -T db psql -U quant -d quant -c "select 'coverage' t, count(
 docker compose exec -T web alembic current
 ```
 
-Expected: `839 passed, 23 skipped` / 실 DB 포함 전부 통과 / 두 카운트 모두 `0` / `0016 (head)`
+Expected: `840 passed, 23 skipped` (Task 4 가 테스트 2건을 더한다) / 실 DB 포함 전부 통과 / 두 카운트 모두 `0` / `0016 (head)`
 
 - [ ] **Step 5: 커밋**
 
@@ -1172,4 +1183,4 @@ cached_range(구간 포함). 커버 구간이 '요청 범위'이지 '받아온 �
 - `cached_range(key, start, end, *, ...)` — Task 3 정의, Task 4 호출과 인자 순서·이름 일치
 - `_snapshot_steps(ymd: str)` — 시그니처 불변, 단계 수만 4 → 7
 
-**4. 검증 수치 추적**: 831(현재) → Task 2 후 831 passed/23 skipped(실 DB 7건 추가) → Task 3 후 838 → Task 4 후 839 → Task 5·6 후 839 유지. 각 태스크의 Expected 와 일치한다.
+**4. 검증 수치 추적**: 831(현재) → Task 2 후 831 passed/23 skipped(실 DB 7건 추가) → Task 3 후 838 → Task 4 후 840 → Task 5·6 후 840 유지. 각 태스크의 Expected 와 일치한다.
