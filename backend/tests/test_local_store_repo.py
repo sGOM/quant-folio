@@ -277,3 +277,91 @@ def test_I5_재조회에_접수번호가_없어도_기존_접수일이_지워지
     assert rows[0]["thstrm_amount"] == "2000"
     # 확정 판정은 기존 접수일을 유지해 여전히 미확정이어야 한다.
     assert final is False
+
+
+# ───── 지수 OHLCV 확보 구간(커버리지) ─────
+
+_COV_CODE = "9999"  # 실제 지수코드와 겹치지 않는 시험값
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_coverage():
+    yield
+    indexes.delete_index_ohlcv(_COV_CODE)
+
+
+def test_확보구간을_쓰고_읽는다():
+    indexes.merge_coverage(_COV_CODE, date(2020, 1, 1), date(2020, 6, 30))
+
+    assert indexes.read_coverage(_COV_CODE) == [(date(2020, 1, 1), date(2020, 6, 30))]
+
+
+def test_겹치는_구간은_하나로_병합된다():
+    indexes.merge_coverage(_COV_CODE, date(2020, 1, 1), date(2020, 6, 30))
+    indexes.merge_coverage(_COV_CODE, date(2020, 4, 1), date(2020, 9, 30))
+
+    assert indexes.read_coverage(_COV_CODE) == [(date(2020, 1, 1), date(2020, 9, 30))]
+
+
+def test_새_구간이_기존보다_앞서도_병합된다():
+    """병합 조건을 한쪽만 보면(새.from <= 기존.to+1) 이 케이스가 누락된다."""
+    indexes.merge_coverage(_COV_CODE, date(2020, 6, 1), date(2020, 9, 30))
+    indexes.merge_coverage(_COV_CODE, date(2020, 1, 1), date(2020, 7, 31))
+
+    assert indexes.read_coverage(_COV_CODE) == [(date(2020, 1, 1), date(2020, 9, 30))]
+
+
+def test_새_구간이_기존보다_한참_앞서면_병합하지_않는다():
+    """양방향 조건 중 `기존.from <= 새.to + 1일` 쪽이 빠지면 이 케이스가 잘못 병합된다.
+
+    위 '앞서도' 테스트는 새 구간이 기존과 겹칠 때만 검증해 한쪽 조건만으로도
+    우연히 통과한다. 이 테스트는 겹치지 않고 확실히 떨어진(갭 2개월) 경우를 써서
+    두 조건이 실제로 각자 필요함을 고정한다.
+    """
+    indexes.merge_coverage(_COV_CODE, date(2020, 6, 1), date(2020, 9, 30))
+    indexes.merge_coverage(_COV_CODE, date(2020, 1, 1), date(2020, 3, 31))
+
+    assert indexes.read_coverage(_COV_CODE) == [
+        (date(2020, 1, 1), date(2020, 3, 31)),
+        (date(2020, 6, 1), date(2020, 9, 30)),
+    ]
+
+
+def test_하루_맞닿은_구간은_병합된다():
+    indexes.merge_coverage(_COV_CODE, date(2020, 1, 1), date(2020, 6, 30))
+    indexes.merge_coverage(_COV_CODE, date(2020, 7, 1), date(2020, 9, 30))
+
+    assert indexes.read_coverage(_COV_CODE) == [(date(2020, 1, 1), date(2020, 9, 30))]
+
+
+def test_주말만큼_벌어진_구간은_병합하지_않는다():
+    """그 사이에 거래일이 있었는지 달력 없이 단정할 수 없다 — 보수적으로 둘로 남긴다."""
+    indexes.merge_coverage(_COV_CODE, date(2020, 1, 1), date(2020, 6, 26))  # 금
+    indexes.merge_coverage(_COV_CODE, date(2020, 6, 29), date(2020, 9, 30))  # 월
+
+    assert indexes.read_coverage(_COV_CODE) == [
+        (date(2020, 1, 1), date(2020, 6, 26)),
+        (date(2020, 6, 29), date(2020, 9, 30)),
+    ]
+
+
+def test_역전된_구간은_기록하지_않는다():
+    indexes.merge_coverage(_COV_CODE, date(2020, 6, 30), date(2020, 1, 1))
+
+    assert indexes.read_coverage(_COV_CODE) == []
+
+
+def test_일봉_삭제는_커버리지도_함께_지운다():
+    """행만 지우고 커버리지가 남으면 '커버됐다는데 행이 없는' 영구 빈 결과가 된다."""
+    df = pd.DataFrame(
+        {"open": [1.0], "high": [2.0], "low": [0.5], "close": [1.5],
+         "volume": [10], "trading_value": [100]},
+        index=pd.to_datetime(["2020-01-02"]),
+    )
+    indexes.write_index_ohlcv(_COV_CODE, df, index_name=None)
+    indexes.merge_coverage(_COV_CODE, date(2020, 1, 1), date(2020, 6, 30))
+
+    indexes.delete_index_ohlcv(_COV_CODE)
+
+    assert indexes.read_coverage(_COV_CODE) == []
+    assert indexes.read_index_ohlcv(_COV_CODE, date(2020, 1, 1), date(2020, 6, 30)).empty
