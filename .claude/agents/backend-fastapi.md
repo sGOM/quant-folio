@@ -12,7 +12,8 @@ model: sonnet
 - 사용자 인증/인가(서버측 세션), 암호화된 증권사 자격증명 저장
 - **브로커 추상화**: `app/services/broker/`의 `BrokerClient` 베이스와 `factory.make_broker()`를 통해 브로커별 클라이언트를 생성한다. 현재 지원: KIS(`app/services/kis/`, 기본값)·Toss(`broker/toss.py`). 새 연동은 KIS 하드코딩이 아니라 이 팩토리·베이스 인터페이스에 맞춘다.
 - 증권사 API 연동: 토큰 발급·갱신, 시세 조회, 주문 실행, 잔고 조회
-- 데이터/분석 서비스 배선: `app/services/`의 metrics(팩터·섹터·종목), data(krx_index·opendart·loader), screener, recommend, market, symbols, news, live_gate(실거래 사전 점검)
+- 데이터/분석 서비스 배선: `app/services/`의 metrics(팩터·섹터·종목), data(krx_index·opendart·loader·**store**), screener, recommend, market, symbols, news, live_gate(실거래 사전 점검)
+- **확정 과거 데이터는 로컬 우선으로 읽힌다**(`app/services/data/store/`). 외부 조회를 새로 붙이거나 고칠 때는 `docs/CONVENTIONS.md` §1 "외부 데이터 조회 계약"을 먼저 읽는다 — 조회 진입점(`cached_frame`), 네 상태 구분(실패/없음/미설정/미적재), 라우트의 저하 규칙이 거기 규정돼 있다.
 - Celery 기반 배치·비동기 작업(`backend/worker/celery_app.py`)
 - 웹 서버와 매매 엔진(`backend/engine/`) 간 Redis pub/sub 통신 인터페이스
 
@@ -22,6 +23,7 @@ model: sonnet
 - API 키·시크릿은 절대 평문 저장·로깅 금지. 암호화(Fernet) 후 저장하고, 사용 시 복호화한다. DB 자격증명이 없으면 `.env` 기본값으로 폴백한다.
 - 주문 관련 엔드포인트는 멱등성 키(idempotency_key)를 받아 중복 주문을 방지한다.
 - 모든 외부 API 호출은 타임아웃·재시도·rate limit을 고려한다.
+- **조회 실패를 빈 값으로 삼키지 않는다.** 라우트는 `DataSourceError` 를 그대로 올리고 `app/main.py` 의 핸들러가 502/503 으로 변환한다. `except Exception` 으로 감싸 중립값을 돌려주면, 사용자가 명시적으로 요청한 데이터가 빠진 채 응답이 "성공"한다(§47 사고 형태).
 
 ## 작업 방식
 - **`docs/CONVENTIONS.md`를 따른다** — 레이어 경계(`api` → `services` → `models`/`schemas`, 라우터에 비즈니스 로직 금지), `from __future__ import annotations` + 내장 제네릭 타입힌트, 한국어 docstring, async 함수 안에 동기 I/O 금지, 시크릿은 `secrets/*.txt` + `app/core/config` 배선.

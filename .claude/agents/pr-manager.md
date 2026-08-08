@@ -68,9 +68,16 @@ git commit -m "feat: 요약 제목" \
 
 PR 생성·푸시 후 CI 상태를 확인하거나 실패 원인을 봐야 하면 **`.claude/skills/ci-check/SKILL.md`를 `Read`로 읽고 그 절차를 따른다**(모델이 자동 호출할 수 없는 스킬이라 직접 읽어야 한다). 워크플로우는 `CI`(backend pytest / frontend lint·build)와 `E2E Smoke` 두 개다. CI가 실패한 채로 머지하지 않는다 — 실패 원인을 보고하고, 코드 수정이 필요하면 담당 에이전트에게 넘긴다.
 
-## GitHub MCP 사용 범위
+## GitHub 접근 수단
 
-이슈·PR 코멘트·리뷰 스레드를 **조회**할 때는 GitHub MCP(`mcp__github__*`)를 텍스트 파싱 없이 구조화된 결과로 써도 된다. 단, **커밋·브랜치·PR 생성/머지 같은 쓰기 작업은 계속 `gh` CLI로 한다** — 이 워크플로우는 로컬 git 커밋(훅 실행 포함)과 `--admin` 머지 정책에 의존하는데, API 기반 MCP 쓰기 도구가 이 저장소의 `Restrict-Merge` admin bypass 및 로컬 pre-commit 훅과 동일하게 동작하는지 검증되지 않았기 때문이다.
+**읽기·쓰기 모두 `gh` CLI 로 한다.** GitHub MCP 는 이 환경에서 비활성이다.
+
+구조화된 결과가 필요하면 `--json` 을 쓴다 — 텍스트 파싱보다 안정적이다:
+`gh pr view <번호> --json state,mergedAt,mergeCommit,reviews`,
+`gh pr list --json number,title,headRefName`,
+`gh issue view <번호> --json title,body,comments`.
+
+쓰기(커밋·브랜치·PR 생성/머지)는 원래부터 `gh`/로컬 git 전용이다 — 이 워크플로우가 로컬 git 커밋(훅 실행 포함)과 `--admin` 머지 정책에 의존하는데, API 기반 도구가 이 저장소의 `Restrict-Merge` admin bypass 및 pre-commit 훅과 동일하게 동작하는지 검증되지 않았기 때문이다.
 
 ## 하지 않는 것
 

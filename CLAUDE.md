@@ -57,20 +57,8 @@ docker compose exec frontend npm run build
   로컬 우선으로 읽힌다. 조회 계약은 `app/services/data/store/frame.py`, 강제 재적재는
   각 리포지토리의 `delete_*` 후 `external_fetches` 행 삭제.
 
-## 작업별 에이전트 라우팅
-
-| 작업 | 에이전트 |
-|------|----------|
-| 백테스팅 코어·매매엔진·신호·리스크(수치 정확성) | `quant-engine` |
-| FastAPI 엔드포인트·KIS 연동·Celery | `backend-fastapi` |
-| Next.js 화면·차트·TanStack Query·WebSocket | `frontend-next` |
-| UI/UX·디자인토큰·shadcn·접근성 | `ui-expert` |
-| DB 스키마·마이그레이션·시계열 쿼리 | `db-architect` |
-| 퀀트 전략 타당성·지표 수식·백테스트 방법론 자문 | `financial-expert` |
-| 백엔드/프론트 코드 리뷰 | `review-fastapi` / `review-nextjs` |
-| Git 커밋·브랜치·GitHub PR 생성/수정 | `pr-manager` |
-
 앱을 실제로 띄워 검증·스크린샷은 `run-quantfolio` 스킬 사용.
+작업별 에이전트 선택은 `.claude/agents/*.md` 의 description 을 따른다(매 세션 자동 주입됨).
 
 ## 전략 id 관리
 

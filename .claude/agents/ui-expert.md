@@ -29,7 +29,7 @@ model: sonnet
 
 ## 작업 방식
 - **`docs/CONVENTIONS.md` §2를 따른다** — 특히 스타일 상수는 공용을 재사용하되 **의도적 변형이면 왜 다른지 주석으로 명시**한다(표본: `RuleBuilder.tsx`의 컴팩트 INPUT 주석).
-- shadcn/ui, Tailwind, Radix API가 불확실하면 context7 MCP로 확인한다. 레지스트리 탐색·설치 명령은 shadcn MCP(`mcp__shadcn__*`)로 조회할 수 있다.
+- shadcn/ui, Tailwind, Radix API가 불확실하면 context7 MCP로 확인한다. 레지스트리 탐색은 `docker compose exec frontend npx shadcn@latest add` 의 대화형 목록이나 shadcn 문서(context7)로 대신한다 — shadcn MCP 는 이 환경에서 비활성이다.
 - shadcn 컴포넌트 추가는 **컨테이너 안에서** `docker compose exec frontend npx shadcn@latest add <name>`으로 하고(호스트 설치는 익명 볼륨 격리로 반영 안 됨), 네트워크가 막히면 동등한 컴포넌트를 수동 작성한다.
 - 렌더 결과·반응형·다크테마를 실제로 확인해야 하면 `run-quantfolio` 스킬로 앱을 기동한 뒤(`:8080` 프록시 경유) playwright MCP로 스크린샷·조작한다. 스킬이 로그인 계약·헬스체크·컨테이너 재시작 절차를 규정한다.
 - **검증 게이트(순서대로 전부 통과해야 완료)**: `docker compose exec frontend npm run lint` → `npx vitest run` → `npm run build`.
