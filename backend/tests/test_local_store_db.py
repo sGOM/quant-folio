@@ -11,6 +11,7 @@ import logging
 
 import pytest
 
+from app.core import local_store_db
 from app.core.local_store_db import run_sync
 
 
@@ -51,9 +52,15 @@ def test_run_sync_는_워커_스레드에서도_동작한다():
     assert result == [42]
 
 
-def test_run_sync_경고는_이벤트루프_안에서_호출될_때만_뜬다(caplog):
+def test_run_sync_경고는_이벤트루프_안에서_호출될_때만_뜬다(caplog, monkeypatch):
     """서버 경로(스레드에서 호출)는 이미 안전해 경고가 뜨면 안 된다 — 눈에 띄어야 하는
-    쪽은 async def 안에서 직접 부르는 스크립트다."""
+    쪽은 async def 안에서 직접 부르는 스크립트다.
+
+    경고는 프로세스당 1회만 뜨므로(스크립트 출력이 경고에 덮이지 않게 하려는 제한),
+    같은 프로세스의 앞선 테스트가 이미 플래그를 올렸을 수 있다. 이 테스트만 플래그를
+    되돌려 "첫 폴백"을 재현한다 — monkeypatch 라 테스트가 끝나면 원복된다.
+    """
+    monkeypatch.setattr(local_store_db, "_fallback_warned", False)
     caplog.set_level(logging.WARNING, logger="app.core.local_store_db")
 
     async def _outer():

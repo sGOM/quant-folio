@@ -181,6 +181,19 @@ blocking 으로 지적). 그래서 계약을 좁혔다: **`row_count==0`이면 �
 동기 진입점은 `asyncio.get_running_loop()` 이 잡히면 즉시 `RuntimeError` 를 던진다.
 async 컨텍스트에서 오용하면 조용히 막히는 대신 터지게 한다.
 
+**개정(2026-08-08, 통합 리뷰 B2)**: raise 하지 않고 **전용 워커 스레드에서 새 루프로
+실행**하도록 완화했다. 위 서술은 `backend/scripts/` 의 검증 스크립트 22개를 하드
+크래시시켰다 — 그것들은 `_build_pit_pool`(→ `krx_index.index_members` → 원장 조회)을
+`async def main()` 안에서 직접 부르는데, main 브랜치에서는 순수 블로킹 HTTP 라 돌던
+코드다. 특히 §11 이 완료 판정 기준으로 지목한 `validate_id23_crash_2026.py` 가 여기
+포함돼, 문서가 약속한 검증 절차를 코드가 막는 상태가 됐다. 가드는 원래 "어차피 터질
+`asyncio.run` 의 예외를 진입점에서 명확히 하는" 역할뿐이었으므로(가드가 없어도 크래시는
+났다), 실제로 실행 가능하게 만드는 편이 호출자 22곳을 고치는 것보다 낫고 잠복 재발도
+막는다. `local_store_engine` 이 NullPool 이라 워커 스레드가 연 커넥션이 그 스레드의
+루프에 묶인 채 풀에 남지 않는다는 점이 이 완화의 안전 근거다. 서버 코드(FastAPI
+라우트·engine 데몬)가 이 폴백을 타는 것은 여전히 잘못이므로 폴백 진입 시 경고를
+남긴다(프로세스당 1회).
+
 ## 9. 기존 프로세스 내 캐시
 
 `_FUND_CACHE`(LRU 64)·`krx_index._MEMBERS_CACHE`/`_MKTCAP_CACHE`·

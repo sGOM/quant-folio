@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+#: 워커 스레드 폴백 경고를 프로세스당 1회로 제한하는 플래그(run_sync docstring 참고).
+_fallback_warned = False
+
 local_store_engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
@@ -70,18 +73,25 @@ def run_sync(coro: Coroutine[Any, Any, T]) -> T:
     중인 루프 밖에서 불러야 한다. 그래서 폴백 진입 시 경고 로그를 남긴다. 정상
     배선된 서버 경로는 전부 이미 스레드에서 호출되므로 이 경고가 뜨지 않는다.
     `backend/scripts/` 의 검증 스크립트처럼 `async def main()` 안에서 직접 부르는
-    코드가 이 경고의 정상적인 대상이다.
+    코드가 이 경고의 정상적인 대상이다. 경고는 **프로세스당 1회**만 남긴다 — 한
+    `_fetch_*` 가 원장 조회·읽기/쓰기·원장 기록으로 run_sync 를 2~3회 부르므로,
+    리밸런싱 수십 회짜리 스크립트에서는 매번 찍으면 천 줄이 넘어 정작 스크립트
+    출력을 덮는다.
     """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)  # 실행 중인 루프 없음 = 정상 경로
 
-    logger.warning(
-        "run_sync 가 실행 중인 이벤트루프 안에서 호출됐다 — 전용 워커 스레드로 "
-        "폴백한다. 서버 코드(FastAPI 라우트·engine 데몬)라면 asyncio.to_thread 로 "
-        "감싸 애초에 실행 중인 루프 밖에서 불러야 한다."
-    )
+    global _fallback_warned
+    if not _fallback_warned:
+        _fallback_warned = True
+        logger.warning(
+            "run_sync 가 실행 중인 이벤트루프 안에서 호출됐다 — 전용 워커 스레드로 "
+            "폴백한다(이 경고는 프로세스당 1회만 남긴다). 서버 코드(FastAPI 라우트·"
+            "engine 데몬)라면 asyncio.to_thread 로 감싸 애초에 실행 중인 루프 밖에서 "
+            "불러야 한다."
+        )
     return _run_in_worker_thread(coro)
 
 
@@ -99,7 +109,10 @@ def _run_in_worker_thread(coro: Coroutine[Any, Any, T]) -> T:
         except BaseException as exc:  # noqa: BLE001 - 호출자에게 그대로 재전파한다
             box["error"] = exc
 
-    thread = threading.Thread(target=_runner, name="local-store-run-sync")
+    # daemon=True: 코루틴이 걸려도 인터프리터 종료를 막지 않는다. join 은 타임아웃 없이
+    # 기다린다 — 여기서 중도 포기하면 호출자에게 돌려줄 값이 없고, 스토어 질의는
+    # asyncpg 자체 타임아웃과 상위의 bounded_socket_timeout 이 이미 상한을 건다.
+    thread = threading.Thread(target=_runner, name="local-store-run-sync", daemon=True)
     thread.start()
     thread.join()
 
