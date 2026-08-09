@@ -1333,6 +1333,17 @@ DART(OpenDART status 013)만 이 명시적 선언에 해당해 `dart_store`가 �
 
 **기간 통계(`stock_period_stats`)는 여전히 정확일치다.** 등락률·누적 순매수는 구간
 자체가 값인 집계라 긴 구간에서 짧은 구간을 뽑을 수 없다 — 커버리지가 원리적으로
-성립하지 않는다. 업종지수도 선적재 대상이 아니라 차단 시 섹터 로테이션은 멈춘다.
+성립하지 않는다. 업종지수도 선적재 대상이 아니다.
+
+**정정(2026-08-08 통합 리뷰)**: 위 문단이 "차단 시 섹터 로테이션은 멈춘다"고 적었는데
+실제 동작과 다르다. `app/services/metrics/fetch.py` 의 `_fetch_index_tickers` 는
+`except Exception: return []` 로 pykrx 실패를 조용히 빈 목록으로 삼키고,
+`app/services/metrics/sectors.py` 의 `compute_sectors` 는 그 빈 목록으로 업종 순회
+루프를 건너뛰어 `items=[]` 인 `SectorsOut` 을 예외 없이 **정상 200 응답**으로 낸다.
+"멈춤"(예외로 막힘)이 아니라 **"조용한 빈 성공"**이다 — §47 이 반복 지적한 사고
+형태가 이 경로에는 아직 남아 있다. `_fetch_index_tickers` 를 이 브랜치 범위에서
+고치지 않았으므로(범위 밖) 후속 과제로 남긴다: `except Exception` 을 걷어내고
+`DataSourceError` 를 그대로 올리거나, 최소한 호출자가 빈 목록과 조회 실패를 구분할
+수 있는 신호를 돌려줘야 한다.
 
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.

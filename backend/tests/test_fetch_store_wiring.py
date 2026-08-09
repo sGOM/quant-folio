@@ -364,10 +364,14 @@ def test_확보구간을_하루라도_못_미치면_원격을_탄다(_store, mon
     """경계 이빨 검증 — 확보구간이 요청을 '거의' 덮어도 하루라도 못 미치면 미스다.
 
     Step 5 가 지정한 이빨 검증(`read_coverage=lambda: []`)은 커버리지를 아예
-    비웠을 때만 실패를 잡는다. `_covers()` 의 부등호(`t >= end`)가 배선 과정에서
-    뒤집히거나(예: `t > end`) start/end 인자가 바뀌는 회귀는 "완전 포함"과 "완전
-    부재" 두 극단만 보는 테스트로는 안 잡힌다 — 경계에서 하루 못 미치는 케이스로
-    확인해야 그 부등호가 그대로 통과됐는지 드러난다.
+    비웠을 때만 실패를 잡는다. 이 테스트는 그보다 촘촘하게, 요청 범위를 하루라도
+    못 채우는 커버 구간이 로컬 히트로 오판되지 않는지(=원격을 타는지) 확인한다.
+
+    **주의**: 이 구성(`covered_to = end - 1일`)에서는 `_covers()` 의 부등호
+    (`t >= end`)를 `t > end` 로 뒤집어도 둘 다 "미스"로 같은 결과를 내 이 테스트로는
+    그 부등호 방향의 회귀를 잡지 못한다(실측 확인함 — 뒤집어도 이 테스트는 계속
+    통과한다). 부등호 방향 회귀는 정확 경계를 찍는
+    `test_확보구간이_요청_끝과_정확히_같으면_히트한다` 가 담당한다.
     """
     fake = _IndexOhlcvFakeStock()
     monkeypatch.setattr(F, "_pykrx_stock", lambda: fake)
@@ -378,3 +382,26 @@ def test_확보구간을_하루라도_못_미치면_원격을_탄다(_store, mon
     F._fetch_index_ohlcv("20180401", end_ymd, "1001")
 
     assert len(fake.calls) == 1
+
+
+def test_확보구간이_요청_끝과_정확히_같으면_히트한다(
+    _store, monkeypatch, _coverage, _index_ohlcv_store
+):
+    """정확 경계(covered_to == end) 히트 검증 — `_covers()` 의 부등호 방향을 찍는다.
+
+    위 테스트(`test_확보구간을_하루라도_못_미치면_원격을_탄다`)는 `covered_to = end -
+    1일` 구성이라 `t >= end` 와 `t > end` 가 똑같이 "미스"를 내 부등호 방향을
+    구분하지 못한다. 이 테스트는 `covered_to == end` 로 두 연산자가 실제로 갈라지는
+    지점을 찍는다 — `t >= end` 면 히트(원격 0회), `t > end` 면 미스(원격 1회).
+
+    `_covers()` 의 `t >= end` 를 `t > end` 로 뒤집으면 이 테스트가 실패한다(실측
+    확인: 뒤집었더니 `fake.calls == []` 단언이 깨졌고, 원복 후 다시 통과함).
+    """
+    fake = _IndexOhlcvFakeStock()
+    monkeypatch.setattr(F, "_pykrx_stock", lambda: fake)
+    end = date(2023, 1, 1)
+    _coverage["1001"] = [(date(2018, 1, 1), end)]
+
+    F._fetch_index_ohlcv("20180401", end.strftime("%Y%m%d"), "1001")
+
+    assert fake.calls == []
