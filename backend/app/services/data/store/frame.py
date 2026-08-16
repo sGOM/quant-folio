@@ -207,7 +207,7 @@ def cached_range(
     fetch_remote: Callable[[], pd.DataFrame],
     write_local: Callable[[pd.DataFrame], None],
     read_coverage: Callable[[], list[tuple[date, date]]],
-    merge_coverage: Callable[[date, date], None],
+    merge_coverage: Callable[[date, date, int], None],
 ) -> pd.DataFrame:
     """범위 조회의 로컬 우선 진입점 — 확보 구간이 요청을 덮으면 외부를 타지 않는다.
 
@@ -242,7 +242,9 @@ def cached_range(
     if not df.empty:
         # 빈 결과는 커버리지로 기록하지 않는다 — "없다는 명시적 선언"이 아니라
         # 스키마 변동으로 값을 잃은 것일 수도 있다(cached_frame 의 0행 가드와 같은 판단).
-        merge_coverage(start, min(end, final_through))
+        # row_count 는 그대로 전달만 한다 — "이 수가 이 구간에 그럴듯한가"는 소스마다
+        # 다른 도메인 지식(예: 거래일 달력)이라 이 함수(소스 불가지)가 판단하지 않는다.
+        merge_coverage(start, min(end, final_through), len(df))
 
     logger.debug("원격 조회: %s %s~%s rows=%d", key, start, end, len(df))
     return df

@@ -90,9 +90,33 @@ def _store_read_coverage(code):
     return indexes.read_coverage(code)
 
 
-def _store_merge_coverage(code, start, end):
-    from app.services.data.store import indexes
+#: cached_range 커버리지 기록 휴리스틱 임계값(설계서 §11). 정밀 판정이 아니라 "요청의
+#: 절반도 못 받은" 수준의 명백한 부분 응답만 잡는 넉넉한 여유다 — estimated_trading_days
+#: 자체가 공휴일을 연 15일로 가정한 근사치라, 촘촘한 임계값은 정상 응답도 오탐한다.
+_COVERAGE_MIN_EXPECTED_DAYS = 10  # 이보다 짧은 구간은 노이즈가 커 검사하지 않는다
+_COVERAGE_ROW_RATIO_THRESHOLD = 0.5  # 기대 거래일의 절반 미만이면 부분 응답으로 의심
 
+
+def _store_merge_coverage(code, start, end, row_count):
+    """수신 행 수가 그 구간의 기대 거래일 수 대비 현저히 적으면 커버리지를 기록하지
+    않는다 — 소스가 조용히 부분 응답했을 때 미수신 구간까지 확보로 굳는 것을 막는다
+    (설계서 §11). 데이터 자체(write_local)는 그대로 저장되고, 이 함수는 커버리지
+    기록만 보류한다.
+    """
+    from app.services.data.store import indexes
+    from app.services.market import estimated_trading_days
+
+    expected = estimated_trading_days(start, end)
+    if (
+        expected >= _COVERAGE_MIN_EXPECTED_DAYS
+        and row_count < expected * _COVERAGE_ROW_RATIO_THRESHOLD
+    ):
+        logger.warning(
+            "지수 OHLCV 부분 응답 의심으로 커버리지 기록 건너뜀 (%s %s~%s): "
+            "수신 %d행, 기대 %.0f행 이상",
+            code, start, end, row_count, expected,
+        )
+        return
     indexes.merge_coverage(code, start, end)
 
 
@@ -532,7 +556,7 @@ def _fetch_index_ohlcv(start_ymd: str, end_ymd: str, ticker: str) -> pd.DataFram
         fetch_remote=_remote,
         write_local=lambda df: _store_write_index_ohlcv(ticker, df, None),
         read_coverage=lambda: _store_read_coverage(ticker),
-        merge_coverage=lambda f, t: _store_merge_coverage(ticker, f, t),
+        merge_coverage=lambda f, t, n: _store_merge_coverage(ticker, f, t, n),
     )
     return out if not out.empty else None
 

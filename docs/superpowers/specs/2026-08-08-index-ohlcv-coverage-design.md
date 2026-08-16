@@ -256,3 +256,12 @@ retry_after=)` 시그니처를 공유한다(`DataSourceError.__init__`). 이 전
   추정) 대비 현저히 적으면 커버리지를 기록하지 않고 경고 로그를 남긴다." 다만 이건
   동작 변경(추정 로직 추가)이라 이 설계·브랜치의 범위 밖이며, 별도 후속 과제로
   남긴다.
+
+  **해소(2026-08-16)**: 위 문단이 제안한 그대로 행 수 휴리스틱을 구현했다. `frame.py`
+  의 `cached_range` 는 소스 불가지 원칙을 지켜 `merge_coverage(start, end, row_count)`
+  로 행 수를 전달만 하고 판단하지 않는다. 판단은 도메인 지식이 있는 호출부
+  (`metrics/fetch.py` 의 `_store_merge_coverage`)가 한다 — `app/services/market.py`
+  의 순수 함수 `estimated_trading_days(start, end)`(pykrx 호출 없음, 달력일×5/7 −
+  연 15일 공휴일 가정)로 기대치를 구하고, 기대 거래일이 10일 이상인 구간에서 수신
+  행 수가 기대치의 절반 미만이면 커버리지 기록을 건너뛰고 경고 로그를 남긴다. 상세는
+  `docs/improvements.md` "cached_range 부분 응답 방어(2026-08-16 해소)" 문단.
