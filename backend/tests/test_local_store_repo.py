@@ -365,3 +365,25 @@ def test_일봉_삭제는_커버리지도_함께_지운다():
 
     assert indexes.read_coverage(_COV_CODE) == []
     assert indexes.read_index_ohlcv(_COV_CODE, date(2020, 1, 1), date(2020, 6, 30)).empty
+
+
+def test_동시_병합은_유실_없이_직렬화된다():
+    """select→delete→insert 에 행 잠금이 없으면, 겹치는 두 범위를 동시에 병합할 때
+    나중에 커밋한 쪽이 먼저 커밋한 쪽의 확장분을 낡은 읽기값으로 덮어써 커버리지가
+    좁아질 수 있다(유실 방향은 항상 좁아지는 쪽이라 거짓 커버리지는 안 생기지만,
+    불필요한 재조회를 유발한다). 반복 실행으로 타이밍 의존 회귀를 잡는다.
+    """
+    import asyncio
+
+    async def _concurrent_merge():
+        await asyncio.gather(
+            indexes._merge_coverage(_COV_CODE, date(2020, 1, 1), date(2020, 6, 30)),
+            indexes._merge_coverage(_COV_CODE, date(2020, 4, 1), date(2020, 9, 30)),
+        )
+
+    for _ in range(20):
+        indexes.delete_index_ohlcv(_COV_CODE)
+        asyncio.run(_concurrent_merge())
+        assert indexes.read_coverage(_COV_CODE) == [
+            (date(2020, 1, 1), date(2020, 9, 30))
+        ]

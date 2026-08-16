@@ -197,6 +197,13 @@ def merge_coverage(index_code: str, start: date, end: date) -> None:
 async def _merge_coverage(index_code: str, start: date, end: date) -> None:
     one = timedelta(days=1)
     async with LocalStoreSession() as db:
+        # 아래 select→delete→insert 는 행 잠금이 없다. 같은 index_code 를 동시에
+        # 병합하면 두 트랜잭션이 같은 기존 행을 읽고 각자 delete+insert 해, 나중에
+        # 커밋한 쪽이 먼저 커밋한 쪽의 확장분을 자신의 낡은 읽기값으로 덮어쓸 수 있다
+        # (유실 방향은 항상 좁아지는 쪽이라 거짓 커버리지는 안 생기지만, 불필요한
+        # 재조회를 유발한다). 어드바이저리 락으로 같은 index_code 는 한 번에 하나씩만
+        # 병합하게 만든다 — 트랜잭션 종료 시 자동 해제, 마이그레이션 불필요.
+        await db.execute(select(func.pg_advisory_xact_lock(func.hashtext(index_code))))
         result = await db.execute(
             select(
                 IndexOhlcvCoverage.covered_from, IndexOhlcvCoverage.covered_to
