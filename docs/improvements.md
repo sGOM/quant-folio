@@ -1363,15 +1363,8 @@ DART(OpenDART status 013)만 이 명시적 선언에 해당해 `dart_store`가 �
 `DataSourceError` 를 그대로 올리거나, 최소한 호출자가 빈 목록과 조회 실패를 구분할
 수 있는 신호를 돌려줘야 한다.
 
-**섹터 로테이션의 조용한 빈 성공(2026-08-16)**: 위 문단이 "차단 시 섹터 로테이션은
-멈춘다"고 암시했는데 실제 동작과 달랐다. `app/services/metrics/fetch.py` 의
-`_fetch_index_tickers` 는 `except Exception: return []` 로 pykrx 실패를 조용히
-빈 목록으로 삼키고, `app/services/metrics/sectors.py` 의 `compute_sectors` 는 그
-빈 목록으로 업종 순회 루프를 건너뛰어 `items=[]` 인 `SectorsOut` 을 예외 없이
-**정상 200 응답**으로 낸다. "멈춤"(예외로 막힘)이 아니라 **"조용한 빈 성공"**이다 —
-§47 이 반복 지적한 사고 형태가 이 경로에 남아 있었다.
-
-**해소**: `_fetch_index_tickers` 가 다른 형제 함수(`_fetch_index_ohlcv`)와
+**해소(2026-08-16)**: 위에서 후속 과제로 남긴 "조용한 빈 성공"을 닫는다.
+`_fetch_index_tickers` 가 다른 형제 함수(`_fetch_index_ohlcv`)와
 같은 패턴으로 pykrx 예외를 `SourceUnavailableError` 로 감싸 `raise` 하도록 바꿨다.
 `compute_sectors` 의 시장별 순회 루프는 이 예외를 `try/except DataSourceError` 로
 받아 실패한 시장만 건너뛰고 계속 진행하되(개별 업종 실패에 이미 적용 중이던 저하
