@@ -114,6 +114,32 @@ class IndexOhlcv(Base):
     )
 
 
+class IndexOhlcvCoverage(Base):
+    """지수 OHLCV 로 확보한 구간 — 범위 조회의 커버리지 판정 근거.
+
+    커버 구간은 "받아온 행의 범위"가 아니라 **요청한 범위**다. `[A, B]` 를 달라고 해서
+    소스가 정상 응답했다면 그 창 안의 데이터는 전부 받은 것이므로, 저장된 행의
+    최소/최대 날짜를 뒤져 갭을 판정할 필요가 없다 — 거래일 달력 의존을 없애는 것이
+    이 설계의 핵심이다(설계 §3.1).
+
+    저장된 구간은 정의상 전부 확정분이다. 기록 시 `covered_to` 를 마지막 확정일로
+    잘라 넣기 때문이다(설계 §3.2) — 그래서 `final` 컬럼이 따로 없다.
+
+    한 지수에 행이 여럿일 수 있다. 겹치거나 맞닿은 구간만 병합하고 주말만큼 벌어진
+    구간은 병합하지 않기 때문이다(설계 §3.4).
+    """
+
+    __tablename__ = "index_ohlcv_coverage"
+
+    index_code: Mapped[str] = mapped_column(String(20), primary_key=True, nullable=False)
+    covered_from: Mapped[date] = mapped_column(Date, primary_key=True, nullable=False)
+    covered_to: Mapped[date] = mapped_column(Date, nullable=False)
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class IndexConstituent(Base):
     """PIT 지수구성 — base_date 시점의 지수 편입 종목."""
 

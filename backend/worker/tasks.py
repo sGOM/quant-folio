@@ -48,6 +48,12 @@ _LOOKBACK_DAYS = 500
 # 10%로 잡는다.
 _INGEST_FAILURE_ALERT_RATIO = 0.10
 
+#: 야간 선적재 대상 기준지수 — 레짐·패닉(1001·2001)과 벤치마크·잔차모멘텀(1028).
+#: 업종지수는 수십 개라 비용이 크고 섹터 로테이션 전용이므로 대상이 아니다.
+_SNAPSHOT_INDEX_TICKERS = ("1001", "2001", "1028")
+#: 선적재 구간(거래일). 소비자 중 가장 긴 창(섹터 252·레짐 ma_period+10)을 덮는다.
+_SNAPSHOT_INDEX_BDAYS = 400
+
 
 async def _ingest_daily_ohlcv_async() -> dict:
     from redis.asyncio import Redis
@@ -618,16 +624,16 @@ def _snapshot_steps(ymd: str) -> list[tuple[str, Callable[[], object]]]:
 
     별도 함수로 뽑은 이유는 테스트가 실제 pykrx 를 부르지 않고 갈아끼우기 위함이다.
 
-    **지수 OHLCV 는 일부러 넣지 않는다.** `cached_frame` 의 캐시키가 `(start, end)`
-    문자열이라 요청 범위가 **정확히 일치**해야만 로컬 히트한다. 여기서 하루치
-    (`_fetch_index_ohlcv(ymd, ymd, code)`)를 적재해봐야 실제 소비자는 전부 넓은
-    범위(패닉≈90영업일, 섹터 252영업일, 레짐 ma_period+10)라 키가 절대 겹치지
-    않는다 — 행은 쌓이지만 게이팅에 관여하지 못해 소비자는 매번 원격을 다시 타고
-    같은 행을 덮어쓴다. 이득 없이 실패율 분모(단계 수)만 늘려 알림 임계를 왜곡했다.
-    구간 커버리지 기반 조회는 별도 과제다(§49 의 남은 한계).
+    지수 OHLCV 는 **넓은 구간**으로 넣는다. `cached_range` 의 커버 판정이 구간 포함
+    이므로, 400 거래일을 미리 확보해 두면 그보다 짧은 창을 쓰는 소비자(패닉 90·섹터
+    252·레짐 ma_period+10)가 전부 로컬로 굴러간다. 하루치(`(ymd, ymd)`)로 넣던
+    시절에는 소비자 범위와 절대 겹치지 않아 히트가 0이라 이 단계를 뺐었다(§49 I4) —
+    구간 커버리지가 그 문제를 해소했다.
     """
+    from app.services.metrics.common import _approx_start, _ymd
     from app.services.metrics.fetch import (
         _fetch_fundamentals,
+        _fetch_index_ohlcv,
         _fetch_market_cap,
         _fetch_market_ohlcv_snapshot,
     )
@@ -639,6 +645,16 @@ def _snapshot_steps(ymd: str) -> list[tuple[str, Callable[[], object]]]:
     ]
     for mkt in mkts:
         steps.append((f"전종목OHLCV({mkt})", lambda m=mkt: _fetch_market_ohlcv_snapshot(ymd, m)))
+
+    day = datetime.strptime(ymd, "%Y%m%d").date()
+    hist_start_ymd = _ymd(_approx_start(day, _SNAPSHOT_INDEX_BDAYS, buffer=30))
+    for code in _SNAPSHOT_INDEX_TICKERS:
+        steps.append(
+            (
+                f"지수OHLCV({code})",
+                lambda c=code: _fetch_index_ohlcv(hist_start_ymd, ymd, c),
+            )
+        )
     return steps
 
 
@@ -679,9 +695,10 @@ def ingest_daily_snapshots() -> dict:
 
     온디맨드 write-through 만으로도 저장소는 채워지지만, 그러면 그 날짜를 처음 밟는
     백테스트가 대기 비용을 전부 문다. 배치가 미리 채워두면 장중 조회가 사라진다 —
-    단, 이는 **날짜 단위 키를 쓰는 소스**(펀더멘털·시가총액·전종목 OHLCV)에만
-    해당한다. 범위 키 소스(지수 OHLCV·기간 통계)는 요청 범위가 정확히 일치할 때만
-    로컬 히트하므로 선적재로 채울 수 없다(`_snapshot_steps` docstring 참고).
+    단, 이는 **날짜 단위 키를 쓰는 소스**(펀더멘털·시가총액·전종목 OHLCV)와 **구간
+    커버리지로 미리 넉넉히 확보해 두는 지수 OHLCV**에 해당한다. 범위 키 소스 중
+    기간 통계는 요청 범위가 정확히 일치할 때만 로컬 히트하므로 선적재로 채울 수
+    없다(`_snapshot_steps` docstring 참고).
 
     한 종류가 실패해도 나머지를 계속한다 — 부분 선적재라도 다음 백테스트의 외부
     조회를 그만큼 줄인다. 실패는 집계하고, 실패율이 임계(`_INGEST_FAILURE_ALERT_RATIO`,
@@ -689,8 +706,8 @@ def ingest_daily_snapshots() -> dict:
     §44-1(KRX 로그인 차단)이 재발하면 전 단계가 실패해도 태스크 자체는 SUCCESS 로
     끝나 아무 알림 없이 넘어갈 수 있기 때문이다.
 
-    단계가 4개뿐이라 형제(ingest_daily_ohlcv, 종목 단위)와 달리 **1건만 실패해도**
-    (1/4=25%) 이 10% 임계를 넘는다 — 여기서는 의도된 동작이다. 종목별 적재에서
+    단계가 7개뿐이라 형제(ingest_daily_ohlcv, 종목 단위)와 달리 **1건만 실패해도**
+    (1/7≈14%) 이 10% 임계를 넘는다 — 여기서는 의도된 동작이다. 종목별 적재에서
     몇 종목 실패는 흔한 잡음이지만, 여기 한 단계는 "하루치 데이터 종류 하나 전체"
     (예: 전체 시장 시가총액)이므로 그 하나의 실패도 무시할 잡음이 아니다.
     """

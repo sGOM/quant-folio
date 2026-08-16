@@ -180,11 +180,13 @@ def test_snapshot_steps_는_올바른_함수를_올바른_인자로_배선한다
 
     기존 두 테스트는 _snapshot_steps 자체를 통째로 대역해 이 함수 본문이
     `return []` 여도 통과한다 — 이 테스트가 그 공백을 메운다. 특히 late binding
-    (루프 변수 캡처) 이 깨져 KOSPI/KOSDAQ 이 같은 값으로 뭉개지는 회귀를 잡는다.
+    (루프 변수 캡처) 이 깨져 KOSPI/KOSDAQ 이나 지수 3종이 같은 값으로 뭉개지는
+    회귀를 잡는다.
 
-    지수 OHLCV 는 선적재 대상이 **아니다**(I4) — 범위 키(`start, end`)가 정확히
-    일치해야만 로컬 히트하는데 배치는 하루치만 넣어 소비자(넓은 범위)와 절대
-    겹치지 않았다. 이득 없이 실패율 분모만 늘렸다. 되살아나면 여기서 잡힌다.
+    지수 OHLCV 는 **넓은 구간**으로 선적재해야 한다. 하루치(`(ymd, ymd)`)로 넣으면
+    넓은 범위를 쓰는 소비자(패닉 90·섹터 252·레짐 210 거래일)와 커버 구간이 겹치지
+    않아 히트가 0이 된다 — 그래서 한 번 뺐던 단계다(§49 I4). 구간 커버리지가 그
+    문제를 해소했으므로 되살리되, 하루치로 퇴행하면 여기서 잡힌다.
     """
     import app.services.metrics.fetch as fetch_mod
 
@@ -210,14 +212,24 @@ def test_snapshot_steps_는_올바른_함수를_올바른_인자로_배선한다
     monkeypatch.setattr(fetch_mod, "_fetch_index_ohlcv", fake_index_ohlcv)
 
     steps = tasks._snapshot_steps("20260805")
-    assert len(steps) == 4
+    assert len(steps) == 7
     for _name, call in steps:
         call()
 
     assert calls["fundamentals"] == [("20260805", ("KOSPI", "KOSDAQ"))]
     assert calls["market_cap"] == [("20260805", ("KOSPI", "KOSDAQ"))]
     assert calls["market_ohlcv"] == [("20260805", "KOSPI"), ("20260805", "KOSDAQ")]
-    assert calls["index_ohlcv"] == []  # I4: 선적재 대상 아님
+
+    assert [t for _s, _e, t in calls["index_ohlcv"]] == ["1001", "2001", "1028"]
+    # 끝은 대상일, 시작은 400 거래일 근사만큼 과거 — 하루치가 아니다.
+    # 경계 상수(_SNAPSHOT_INDEX_BDAYS·buffer)가 조금 바뀌어도 안 깨지도록, 고정 날짜
+    # 대신 "최소 1년 이상 과거"라는 성질로 단언한다(하루치 퇴행은 확실히 잡힌다).
+    from datetime import datetime as _dt
+
+    for start_ymd, end_ymd, _t in calls["index_ohlcv"]:
+        assert end_ymd == "20260805"
+        span = (_dt.strptime(end_ymd, "%Y%m%d") - _dt.strptime(start_ymd, "%Y%m%d")).days
+        assert span > 365
 
 
 def test_snapshot_target_date는_KST_기준_전날이다(monkeypatch):

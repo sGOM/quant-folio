@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.local_store_db import LocalStoreSession, run_sync
-from app.models.store import IndexConstituent, IndexOhlcv
+from app.models.store import IndexConstituent, IndexOhlcv, IndexOhlcvCoverage
 from app.services.data.store.coerce import INTEGER, NUMERIC, TEXT, coerce_value
 
 logger = logging.getLogger("app.services.data.store")
@@ -97,6 +97,12 @@ def delete_index_ohlcv(index_code: str) -> None:
 async def _delete_ohlcv(index_code: str) -> None:
     async with LocalStoreSession() as db:
         await db.execute(delete(IndexOhlcv).where(IndexOhlcv.index_code == index_code))
+        # 커버리지도 함께 지운다. 행만 지우고 커버 구간이 남으면 "커버됐다는데 행이
+        # 없는" 상태가 되고, 그 캐시키는 다음 호출부터 영구히 빈 결과를 돌려준다
+        # (마이그레이션 0015 가 고친 것과 같은 형태의 함정).
+        await db.execute(
+            delete(IndexOhlcvCoverage).where(IndexOhlcvCoverage.index_code == index_code)
+        )
         await db.commit()
 
 
@@ -152,6 +158,82 @@ async def _delete_constituents(index_code: str, base_date: date) -> None:
             delete(IndexConstituent).where(
                 IndexConstituent.index_code == index_code,
                 IndexConstituent.base_date == base_date,
+            )
+        )
+        await db.commit()
+
+
+def read_coverage(index_code: str) -> list[tuple[date, date]]:
+    """그 지수의 확보 구간 목록을 (covered_from, covered_to) 오름차순으로 반환한다.
+
+    저장된 구간은 전부 확정분이다(기록 시 마지막 확정일로 잘라 넣는다).
+    """
+    return run_sync(_select_coverage(index_code))
+
+
+async def _select_coverage(index_code: str) -> list[tuple[date, date]]:
+    async with LocalStoreSession() as db:
+        result = await db.execute(
+            select(IndexOhlcvCoverage.covered_from, IndexOhlcvCoverage.covered_to)
+            .where(IndexOhlcvCoverage.index_code == index_code)
+            .order_by(IndexOhlcvCoverage.covered_from)
+        )
+        return [(r[0], r[1]) for r in result.all()]
+
+
+def merge_coverage(index_code: str, start: date, end: date) -> None:
+    """[start, end] 를 확보 구간에 병합한다. end < start 면 아무것도 하지 않는다.
+
+    겹치거나 하루 맞닿은 기존 구간을 흡수해 한 행으로 대체한다. 주말만큼 벌어진
+    구간(금요일 끝 ↔ 월요일 시작)은 병합하지 않는다 — 그 사이에 거래일이 있었는지
+    거래일 달력 없이 단정할 수 없기 때문이다. 대가는 구간이 잘게 쪼개지는 것뿐이고,
+    잘못 병합해 없는 구간을 커버됐다고 주장하는 쪽이 비교할 수 없이 위험하다.
+    """
+    if end < start:
+        return
+    run_sync(_merge_coverage(index_code, start, end))
+
+
+async def _merge_coverage(index_code: str, start: date, end: date) -> None:
+    one = timedelta(days=1)
+    async with LocalStoreSession() as db:
+        # 아래 select→delete→insert 는 행 잠금이 없다. 같은 index_code 를 동시에
+        # 병합하면 두 트랜잭션이 같은 기존 행을 읽고 각자 delete+insert 해, 나중에
+        # 커밋한 쪽이 먼저 커밋한 쪽의 확장분을 자신의 낡은 읽기값으로 덮어쓸 수 있다
+        # (유실 방향은 항상 좁아지는 쪽이라 거짓 커버리지는 안 생기지만, 불필요한
+        # 재조회를 유발한다). 어드바이저리 락으로 같은 index_code 는 한 번에 하나씩만
+        # 병합하게 만든다 — 트랜잭션 종료 시 자동 해제, 마이그레이션 불필요.
+        await db.execute(select(func.pg_advisory_xact_lock(func.hashtext(index_code))))
+        result = await db.execute(
+            select(
+                IndexOhlcvCoverage.covered_from, IndexOhlcvCoverage.covered_to
+            ).where(
+                IndexOhlcvCoverage.index_code == index_code,
+                # 양방향 조건이어야 한다. 한쪽만 보면(새.from <= 기존.to + 1일) 새
+                # 구간이 기존 구간보다 앞설 때 병합이 누락된다.
+                IndexOhlcvCoverage.covered_to >= start - one,
+                IndexOhlcvCoverage.covered_from <= end + one,
+            )
+        )
+        overlapping = [(r[0], r[1]) for r in result.all()]
+
+        new_from = min([start, *(f for f, _ in overlapping)])
+        new_to = max([end, *(t for _, t in overlapping)])
+
+        if overlapping:
+            # covered_from 이 PK 의 일부라 UPDATE 로는 경계를 못 옮긴다 — 삭제 후 삽입.
+            await db.execute(
+                delete(IndexOhlcvCoverage).where(
+                    IndexOhlcvCoverage.index_code == index_code,
+                    IndexOhlcvCoverage.covered_from.in_([f for f, _ in overlapping]),
+                )
+            )
+        await db.execute(
+            pg_insert(IndexOhlcvCoverage)
+            .values(index_code=index_code, covered_from=new_from, covered_to=new_to)
+            .on_conflict_do_update(
+                index_elements=["index_code", "covered_from"],
+                set_={"covered_to": new_to, "updated_at": func.now()},
             )
         )
         await db.commit()

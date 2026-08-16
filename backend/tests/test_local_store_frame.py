@@ -36,7 +36,7 @@ def test_인메모리_원장은_같은_키를_덮어쓴다():
     assert ledger.get("index_ohlcv", "1001|20260806").final is True
 
 
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
@@ -252,3 +252,121 @@ def test_make_cache_key_는_결정적이다():
     assert make_cache_key("20190312", ["KOSPI", "KOSDAQ"]) == make_cache_key(
         "20190312", ["KOSDAQ", "KOSPI"]
     )
+
+
+# ───── cached_range: 범위 조회의 구간 커버리지 계약 ─────
+
+from app.services.data.errors import SourceUnavailableError  # noqa: E402
+from app.services.data.store.frame import cached_range, last_final_date  # noqa: E402
+
+
+class _RangeStore:
+    """cached_range 주입 대역 — 호출 횟수와 커버 구간만 본다."""
+
+    def __init__(self, intervals=None, rows=1):
+        self.intervals: list[tuple[date, date]] = list(intervals or [])
+        self.remote_calls = 0
+        self.written: list[int] = []
+        self._rows = rows
+        self.fail: Exception | None = None
+
+    def read_local(self):
+        return pd.DataFrame({"close": [1.0] * self._rows})
+
+    def fetch_remote(self):
+        self.remote_calls += 1
+        if self.fail is not None:
+            raise self.fail
+        return pd.DataFrame({"close": [1.0] * self._rows})
+
+    def write_local(self, df):
+        self.written.append(len(df))
+
+    def read_coverage(self):
+        return list(self.intervals)
+
+    def merge_coverage(self, start, end):
+        if end < start:
+            return
+        self.intervals.append((start, end))
+
+    def call(self, start, end):
+        return cached_range(
+            "1001", start, end,
+            read_local=self.read_local,
+            fetch_remote=self.fetch_remote,
+            write_local=self.write_local,
+            read_coverage=self.read_coverage,
+            merge_coverage=self.merge_coverage,
+        )
+
+
+_PAST_A = date(2020, 1, 1)
+_PAST_B = date(2020, 6, 30)
+
+
+def test_last_final_date_는_KST_전날이다():
+    assert last_final_date(today=date(2026, 8, 8)) == date(2026, 8, 7)
+    assert is_final_date(date(2026, 8, 7), today=date(2026, 8, 8)) is True
+    assert is_final_date(date(2026, 8, 8), today=date(2026, 8, 8)) is False
+
+
+def test_커버된_구간은_외부를_타지_않는다():
+    store = _RangeStore(intervals=[(date(2019, 1, 1), date(2021, 1, 1))])
+
+    store.call(_PAST_A, _PAST_B)
+
+    assert store.remote_calls == 0
+
+
+def test_부분_커버는_원격을_타고_병합된_뒤_히트한다():
+    """워크포워드처럼 창이 밀리며 쌓이는 경우가 이 형태다."""
+    store = _RangeStore(intervals=[(_PAST_A, date(2020, 3, 31))])
+
+    store.call(_PAST_A, _PAST_B)
+    assert store.remote_calls == 1
+
+    store.call(_PAST_A, _PAST_B)
+    assert store.remote_calls == 1  # 병합된 구간이 요청을 덮는다
+
+
+def test_끝이_오늘이면_커버리지가_있어도_원격을_탄다():
+    """당일 봉은 장중 계속 변한다 — 로컬로 줄 수 없다."""
+    today = last_final_date() + timedelta(days=1)
+    store = _RangeStore(intervals=[(date(2000, 1, 1), date(2100, 1, 1))])
+
+    store.call(_PAST_A, today)
+
+    assert store.remote_calls == 1
+
+
+def test_빈_결과는_커버리지로_기록하지_않는다():
+    """§49 I3 와 같은 판단 — 빈 응답은 '없다는 명시적 선언'이 아니다."""
+    store = _RangeStore(rows=0)
+
+    store.call(_PAST_A, _PAST_B)
+    store.call(_PAST_A, _PAST_B)
+
+    assert store.intervals == []
+    assert store.remote_calls == 2
+
+
+def test_원격_실패는_클래스를_보존하고_보유_구간을_알려준다():
+    store = _RangeStore(intervals=[(_PAST_A, date(2020, 3, 31))])
+    store.fail = SourceUnavailableError("krx", "타임아웃")
+
+    with pytest.raises(SourceUnavailableError) as caught:
+        store.call(_PAST_A, _PAST_B)
+
+    assert "2020-01-01~2020-03-31" in str(caught.value)
+    assert "타임아웃" in str(caught.value)
+
+
+def test_보유_구간이_없으면_없음이라고_알려준다():
+    store = _RangeStore()
+    store.fail = SourceUnavailableError("krx", "타임아웃")
+
+    with pytest.raises(SourceUnavailableError) as caught:
+        store.call(_PAST_A, _PAST_B)
+
+    assert "없음" in str(caught.value)
