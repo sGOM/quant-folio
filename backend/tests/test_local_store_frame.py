@@ -267,6 +267,7 @@ class _RangeStore:
         self.intervals: list[tuple[date, date]] = list(intervals or [])
         self.remote_calls = 0
         self.written: list[int] = []
+        self.merged_row_counts: list[int] = []
         self._rows = rows
         self.fail: Exception | None = None
 
@@ -285,7 +286,8 @@ class _RangeStore:
     def read_coverage(self):
         return list(self.intervals)
 
-    def merge_coverage(self, start, end):
+    def merge_coverage(self, start, end, row_count):
+        self.merged_row_counts.append(row_count)
         if end < start:
             return
         self.intervals.append((start, end))
