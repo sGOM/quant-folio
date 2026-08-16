@@ -26,7 +26,7 @@ docker compose up -d --build
 docker compose ps                       # 상태 확인
 docker compose logs -f web              # 로그
 
-# ⚠️ web/engine/worker는 코드 변경 시 자동 리로드 안 됨 → 재시작 필수
+# ⚠️ web/engine/worker 재시작 필수(핫리로드 없음 — 아래 "필수 함정" 참고)
 docker compose restart web
 # 개발 중엔 docker-compose.override.yml 이 자동 병합되어 web 이 --reload 로 뜬다.
 # (운영 배포는 docker compose -f docker-compose.yml up -d --build 로 override 제외)
@@ -73,8 +73,3 @@ docker compose exec frontend npm run build
 - **전 문서 정합 점검·신규 발굴은 batch**: 관련 있을 수 있는 문서를 두루 훑는 정합 점검이나
   코드베이스 재점검으로 새 개선안을 뽑는 작업은 탐색 비용이 크므로, 매번 하지 말고 몇
   마일스톤마다 한 번 몰아서 한다.
-
-## 컨벤션
-
-- 커밋 메시지·주석·문서: **한국어**.
-- 프론트: TypeScript strict, 자체 SVG 차트(외부 차트 라이브러리 미사용).
