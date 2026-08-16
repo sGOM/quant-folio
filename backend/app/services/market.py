@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 # 하트비트까지 정지) — 짧게라도 반드시 타임아웃을 걸어야 한다.
 _BUSINESS_DAY_TIMEOUT = 5  # 초
 
+#: 연간 한국 공휴일 대략치(설·추석 연휴 포함) — 공식 통계가 아니라 근사 계산용 상수다.
+_KR_HOLIDAYS_PER_YEAR = 15
+
 KST = timezone(timedelta(hours=9))
 MARKET_OPEN = time(9, 0)
 MARKET_CLOSE = time(15, 30)
@@ -27,6 +30,22 @@ MARKET_CLOSE = time(15, 30)
 
 def now_kst() -> datetime:
     return datetime.now(KST)
+
+
+def estimated_trading_days(start: date, end: date) -> float:
+    """[start, end] 구간의 대략적인 기대 거래일 수 — 근사치이지 정확한 달력이 아니다.
+
+    달력일 × 5/7(평일 비중)에서 연 `_KR_HOLIDAYS_PER_YEAR` 일 가정으로 공휴일을 뺀다.
+    pykrx 호출이 없는 순수 계산이라 반복 호출 비용이 없지만, 설·추석 등 실제 공휴일
+    분포와는 어긋날 수 있다 — 정밀 판정이 아니라 "요청의 절반도 못 받은" 수준의 명백한
+    부분 응답만 잡는 넉넉한 임계값과 함께 쓸 것을 전제한다.
+    """
+    calendar_days = (end - start).days + 1
+    if calendar_days <= 0:
+        return 0.0
+    weekdays = calendar_days * 5 / 7
+    holiday_estimate = calendar_days * (_KR_HOLIDAYS_PER_YEAR / 365)
+    return max(weekdays - holiday_estimate, 0.0)
 
 
 @lru_cache(maxsize=512)
