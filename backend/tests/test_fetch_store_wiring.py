@@ -329,7 +329,9 @@ def _coverage(monkeypatch) -> dict[str, list[tuple[date, date]]]:
     monkeypatch.setattr(
         F,
         "_store_merge_coverage",
-        lambda code, start, end: store.setdefault(code, []).append((start, end)),
+        # row_count 는 fetch.py 의 부분 응답 휴리스틱 인자다 — 이 픽스처는 배선만
+        # 검증하므로 받되 무시하고 항상 기록한다(휴리스틱 자체는 별도 테스트가 본다).
+        lambda code, start, end, row_count: store.setdefault(code, []).append((start, end)),
     )
     return store
 
@@ -405,3 +407,39 @@ def test_확보구간이_요청_끝과_정확히_같으면_히트한다(
     F._fetch_index_ohlcv("20180401", end.strftime("%Y%m%d"), "1001")
 
     assert fake.calls == []
+
+
+# ───── _store_merge_coverage: 부분 응답 방어 휴리스틱 ─────
+
+
+@pytest.fixture
+def _merge_spy(monkeypatch):
+    """indexes.merge_coverage 호출 여부만 본다 — _store_merge_coverage 는 실제로 돈다."""
+    calls: list[tuple] = []
+    from app.services.data.store import indexes
+
+    monkeypatch.setattr(indexes, "merge_coverage", lambda *a: calls.append(a))
+    return calls
+
+
+def test_긴_구간에_행이_현저히_적으면_커버리지_기록을_건너뛴다(_merge_spy):
+    """5년 구간(기대 거래일 1000+개)에 2행만 오면 명백한 부분 응답이다."""
+    F._store_merge_coverage("1001", date(2018, 1, 1), date(2023, 1, 1), 2)
+
+    assert _merge_spy == []
+
+
+def test_긴_구간에_그럴듯한_행_수면_커버리지를_기록한다(_merge_spy):
+    """5년 구간에 900행이면 기대치(대략 1170)의 절반을 넘어 정상 응답으로 본다."""
+    start, end = date(2018, 1, 1), date(2023, 1, 1)
+    F._store_merge_coverage("1001", start, end, 900)
+
+    assert _merge_spy == [("1001", start, end)]
+
+
+def test_짧은_구간은_행_수와_무관하게_항상_기록한다(_merge_spy):
+    """기대 거래일이 임계(10일) 미만인 짧은 구간은 노이즈가 커 검사하지 않는다."""
+    start, end = date(2024, 6, 17), date(2024, 6, 18)  # 이틀 — 행 0이 아닌 1행
+    F._store_merge_coverage("1001", start, end, 1)
+
+    assert _merge_spy == [("1001", start, end)]
