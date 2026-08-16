@@ -439,6 +439,60 @@ def test_업종_하나가_막혀도_로테이션은_계속한다(monkeypatch):
     assert got is None
 
 
+class TestFetchIndexTickersDegradation:
+    """`_fetch_index_tickers` 가 업종지수 목록 조회 실패를 빈 목록으로 삼키지 않고
+    전파하는지(이전 판은 `except Exception: return []` 로 삼켜, 섹터 로테이션이
+    "업종이 없다"와 "조회가 실패했다"를 구분 못 하고 예외 없이 빈 200 을 냈다)."""
+
+    def test_조회_실패는_전파된다(self, monkeypatch):
+        from app.services.metrics import fetch as fetch_mod
+
+        class _FakeStock:
+            def get_index_ticker_list(self, date, market):
+                raise RuntimeError("연결 실패")
+
+        monkeypatch.setattr(fetch_mod, "_pykrx_stock", lambda: _FakeStock())
+
+        with pytest.raises(SourceUnavailableError):
+            fetch_mod._fetch_index_tickers("20260806", "KOSPI")
+
+
+class TestComputeSectorsTickerListDegradation:
+    """`compute_sectors` 의 시장별 업종목록 조회 실패 처리 — 전량 실패는 전파,
+    일부 시장만 실패하면 성공분은 살아남는다(§49 Task 11 과 동일한 저하 계약)."""
+
+    def test_모든_시장_조회가_실패하면_전파된다(self, monkeypatch):
+        from app.services.metrics import sectors
+
+        monkeypatch.setattr(sectors, "_fetch_index_ohlcv", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            sectors, "_fetch_index_tickers",
+            lambda *a, **kw: (_ for _ in ()).throw(SourceUnavailableError("krx", "일시장애")),
+        )
+
+        with pytest.raises(SourceUnavailableError):
+            sectors.compute_sectors("ALL", date(2026, 8, 6))
+
+    def test_한_시장만_실패해도_다른_시장_결과는_살아남는다(self, monkeypatch):
+        from app.services.metrics import sectors
+
+        def _tickers(date_ymd, mkt):
+            if mkt == "KOSDAQ":
+                raise SourceUnavailableError("krx", "일시장애")
+            return ["9999"]
+
+        fake_df = pd.DataFrame({"close": [float(100 + i) for i in range(30)]})
+
+        monkeypatch.setattr(sectors, "_fetch_index_tickers", _tickers)
+        monkeypatch.setattr(sectors, "_fetch_index_ohlcv", lambda *a, **kw: fake_df)
+        monkeypatch.setattr(sectors, "_get_index_name", lambda *a, **kw: "테스트업종")
+
+        out = sectors.compute_sectors("ALL", date(2026, 8, 6))
+
+        assert len(out.items) == 1
+        assert out.items[0].market == "KOSPI"
+
+
 class TestProviderWithFlowDegradation:
     """이월 항목 (1): `_provider_with_flow` 가 flow 조회 실패를 flow=None 으로 삼키지
     않고 그대로 전파하는지(예전 `except Exception: flow = None` 은 §47 사고 패턴을

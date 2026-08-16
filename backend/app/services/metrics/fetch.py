@@ -520,17 +520,23 @@ def _fetch_index_ohlcv(start_ymd: str, end_ymd: str, ticker: str) -> pd.DataFram
 
 
 def _fetch_index_tickers(date_ymd: str, mkt: str) -> list[str]:
-    """업종지수 코드 목록을 반환한다."""
+    """업종지수 코드 목록을 반환한다.
+
+    :raises DataSourceError: 조회가 실패했을 때(이전 판은 빈 목록을 돌려줬다 — 그래서
+        "업종이 없다"와 "조회가 실패했다"가 구분되지 않았다).
+    """
     stock = _pykrx_stock()
 
     try:
         result = stock.get_index_ticker_list(date=date_ymd, market=mkt)
-        if result is None:
-            return []
-        return list(result)
-    except Exception:
+    except Exception as e:  # noqa: BLE001 - pykrx 는 임의 예외를 던진다
+        wrapped = SourceUnavailableError(
+            "krx", f"업종지수 목록 조회 실패({mkt} {date_ymd}): {e}"
+        )
         logger.warning("업종지수 목록 조회 실패 (%s %s)", mkt, date_ymd, exc_info=True)
-        return []
+        note_failure(wrapped)
+        raise wrapped from e
+    return list(result) if result is not None else []
 
 
 def _get_index_name(date_ymd: str, ticker: str) -> str:

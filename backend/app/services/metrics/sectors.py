@@ -9,7 +9,7 @@ import logging
 from datetime import date
 
 from app.schemas.metrics import SectorMetric, SectorsOut
-from app.services.data.errors import DataSourceError
+from app.services.data.errors import DataSourceError, representative
 from app.services.metrics.common import (
     _approx_start,
     _compute_mdd,
@@ -62,9 +62,15 @@ def compute_sectors(market: str, as_of: date) -> SectorsOut:
 
     # ── 업종지수별 지표 계산 ──
     items: list[SectorMetric] = []
+    ticker_list_errors: list[DataSourceError] = []
 
     for mkt in mkts_to_fetch:
-        tickers = _fetch_index_tickers(as_of_ymd, mkt)
+        try:
+            tickers = _fetch_index_tickers(as_of_ymd, mkt)
+        except DataSourceError as e:
+            logger.warning("업종지수 목록 조회 실패로 시장 건너뜀 (%s): %s", mkt, e)
+            ticker_list_errors.append(e)
+            continue
         ref_mkt = mkt  # KOSPI 업종 → KOSPI 기준, KOSDAQ 업종 → KOSDAQ 기준
 
         for ticker in tickers:
@@ -84,6 +90,9 @@ def compute_sectors(market: str, as_of: date) -> SectorsOut:
                     items.append(metric)
             except Exception:
                 logger.warning("섹터 계산 오류 (ticker=%s %s)", ticker, mkt, exc_info=True)
+
+    if ticker_list_errors and not items:
+        raise representative(ticker_list_errors)
 
     return SectorsOut(as_of=as_of, items=items)
 

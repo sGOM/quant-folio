@@ -1327,4 +1327,22 @@ DART(OpenDART status 013)만 이 명시적 선언에 해당해 `dart_store`가 �
 `_snapshot_steps` 에서 제거했다(선적재 4단계 = 펀더멘털·시가총액·전종목 OHLCV×2).
 구간 커버리지 기반 조회(요청 범위가 적재 구간에 포함되면 히트)는 별도 과제로 남는다.
 
+**섹터 로테이션의 조용한 빈 성공(2026-08-16)**: 위 문단이 "차단 시 섹터 로테이션은
+멈춘다"고 암시했는데 실제 동작과 달랐다. `app/services/metrics/fetch.py` 의
+`_fetch_index_tickers` 는 `except Exception: return []` 로 pykrx 실패를 조용히
+빈 목록으로 삼키고, `app/services/metrics/sectors.py` 의 `compute_sectors` 는 그
+빈 목록으로 업종 순회 루프를 건너뛰어 `items=[]` 인 `SectorsOut` 을 예외 없이
+**정상 200 응답**으로 낸다. "멈춤"(예외로 막힘)이 아니라 **"조용한 빈 성공"**이다 —
+§47 이 반복 지적한 사고 형태가 이 경로에 남아 있었다.
+
+**해소**: `_fetch_index_tickers` 가 다른 형제 함수(`_fetch_index_ohlcv`)와
+같은 패턴으로 pykrx 예외를 `SourceUnavailableError` 로 감싸 `raise` 하도록 바꿨다.
+`compute_sectors` 의 시장별 순회 루프는 이 예외를 `try/except DataSourceError` 로
+받아 실패한 시장만 건너뛰고 계속 진행하되(개별 업종 실패에 이미 적용 중이던 저하
+계약과 동일), 루프가 끝난 뒤 **시도한 모든 시장이 조회 실패로 비었을 때만**
+`representative()` 대표 예외를 올린다. 한 시장만 막히고 다른 시장이 성공하면
+기존처럼 부분 결과를 돌려준다. 라우트(`api/routes/metrics.py`)는 이미
+`compute_sectors` 호출을 `except Exception` 으로 감싸 503으로 변환하고 있어 별도
+수정이 필요 없었다.
+
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.
