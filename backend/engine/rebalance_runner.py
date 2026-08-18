@@ -54,6 +54,9 @@ logger = logging.getLogger("engine.rebalance_runner")
 _LAST_PREFIX = "rebalance:last:"
 _REGIME_PREFIX = "rebalance:regime:"  # 직전 레짐 상태(risk-off 여부) 보관
 _LAST_TTL = 60 * 60 * 24 * 90  # 90일(휴장 등 대비 여유)
+# 시세 조회 실패 종목의 시가평가 대체값(마지막 로컬 종가)을 찾는 조회 창(일). 연휴·거래정지를
+# 넘길 정도로 넉넉하되, 이보다 오래된 종가는 '마지막으로 알려진 시세'로 보기 어렵다.
+_CLOSE_FALLBACK_DAYS = 30
 
 # pykrx 종합지수 티커(레짐 필터 기준지수). 백테스트 라우트와 동일 규약.
 _REGIME_INDEX_TICKER = {"KOSPI": "1001", "KOSDAQ": "2001"}
@@ -83,6 +86,9 @@ class RebalanceRunner(BaseRunner):
         # 호출될 수 있으므로, 폴백 진입 시 1회만 알림하고 PIT 조회가 다시 성공하면
         # 해제해 재발송 가능하게 한다(연속 실패 알림과 동일한 '전환 시점' dedup 규약).
         self._pit_fallback_active: bool = False
+        # 패닉 오버레이 미지원 알림 dedup 플래그. config 는 러너 기동 시 1회만 적재되므로
+        # (BaseRunner._load) 러너 수명 동안 1회만 알리면 충분하다.
+        self._panic_alerted: bool = False
         # 섹터 집중 한도(risk_layer.max_sector_pct)용 종목→업종 매핑 캐시. 업종 분류는
         # 사실상 정적이라 러너 수명 동안 1회만 조회해 재사용한다(None=미조회, {}=조회 실패).
         self._sector_map: dict[str, str] | None = None
@@ -104,6 +110,11 @@ class RebalanceRunner(BaseRunner):
           - 재진입: risk-off→risk-on 회복 & 현금 상태이면 cadence 를 기다리지 않고 즉시 매수.
           - 정기 리밸런싱: is_rebalance_due 일 때만 실행하며, 이때만 마지막 실행일을 소비한다.
             레짐 재진입은 월간 스케줄(_set_last)을 소비하지 않아 정규 cadence 를 유지한다.
+          - MDD 재진입: 킬스위치 쿨다운이 풀린 뒤 현금 상태이면 cadence 와 무관하게 즉시
+            매수한다(백테스트 just_rearmed). 이것도 스케줄을 소비하지 않는다.
+
+        예외로 panic_overlay 가 켜져 있으면(라이브 미구현) 이 전략의 매매를 중단한다 —
+        MDD 킬스위치만 계속 동작한다. 아래 게이트 주석 참고.
         """
         now = now_kst()
         rf = self._cfg.get("regime_filter") or {}
@@ -136,6 +147,25 @@ class RebalanceRunner(BaseRunner):
                 )
                 return
 
+        # 패닉 오버레이(config.panic_overlay)는 백테스트 엔진(portfolio.py 의 Arm→Confirm→
+        # Fill 상태기계)에만 있고 라이브에는 구현이 없다. 조용히 무시하면 라이브가 사용자가
+        # 검증한 백테스트보다 **항상 더 공격적**으로 돈다 — base_exposure(기본 0.70)를
+        # 무시해 100% 투자로 굴고, event_only=True 면 "확인된 패닉 때만 진입, 평소 현금"
+        # 이어야 할 전략이 상시 만기 투자 전략으로 뒤집힌다. 검증한 것과 다른 전략으로 실제
+        # 자금을 움직이는 것이므로, 판단 근거를 못 얻었을 때와 같은 규약으로 무행동(보유
+        # 유지 = 신규 매수보다 항상 덜 공격적)을 택하고 알린다.
+        # MDD 킬스위치(위)만 예외로 계속 동작시킨다 — 배선 공백 때문에 파국 백스톱까지
+        # 잃어서는 안 된다. 오버레이 자체가 아직 검증되지 않은 상태(docs/improvements.md
+        # §47: 3차 시도까지 전 arm 이벤트 0건, 결론 보류)라 라이브 재구현이 아니라 거부를
+        # 택했다. 키 부재/null 은 여기 걸리지 않는다(present-and-enabled 만 차단).
+        if (self._cfg.get("panic_overlay") or {}).get("enabled"):
+            await self._alert_panic_unsupported()
+            # 거부 중에는 재진입하지 않으므로 미소비 재진입 요구를 남기지 않는다. 남겨두면
+            # 나중에 panic_overlay 를 걷어내고 재기동했을 때 한참 지난 쿨다운 해제 요구로
+            # 첫 틱에 오발화한다(상태를 쓰고 소비하지 않는 누수 방지).
+            await self._clear_rearm_pending()
+            return
+
         risk_off = False
         reentry = False
         # 레짐 전환 판정은 장중에만(주문 실행 가능 시점). 매 tick 확인해 회복 즉시 반응.
@@ -157,8 +187,24 @@ class RebalanceRunner(BaseRunner):
 
         last = await self._get_last()
         due = is_rebalance_due(self._cfg, last, now)
+
+        # MDD 쿨다운 해제 직후 강제 재진입(백테스트 just_rearmed 대응). 재가동 전환은
+        # _evaluate_mdd_kill 이 rearm_pending 으로 남겨두므로, 장중·현금 상태이면 cadence 를
+        # 기다리지 않고 즉시 매수한다(그러지 않으면 월간 cadence 에서 최대 한 달간 현금
+        # 방치). risk_off 는 위에서 이미 걸러졌다 — 백테스트도 just_rearmed 재진입을
+        # `not risk_off` 분기 안에서만 판정한다. 보유가 남아 있으면 재진입할 게 없으므로
+        # 요구만 소비한다(백테스트의 `just_rearmed and not val` 과 동일).
+        rearm = False
+        if mdd_kill_pct and market_open:
+            state = await self._get_mdd_state()
+            if state and state.get("rearm_pending"):
+                rearm = not await self._has_holdings()
+                if not rearm:
+                    await self._clear_rearm_pending()
+
         logger.info(
-            "전략 %d 발화 판정: last=%s due=%s reentry=%s", self.strategy_id, last, due, reentry,
+            "전략 %d 발화 판정: last=%s due=%s reentry=%s rearm=%s",
+            self.strategy_id, last, due, reentry, rearm,
         )
 
         # 콜드 스타트 즉시 발화: initial_fill_immediate=true 이고 아직 한 번도 실행한 적이
@@ -173,20 +219,26 @@ class RebalanceRunner(BaseRunner):
             and not await self._has_holdings()
         )
 
-        if not (due or reentry or bootstrap):
+        if not (due or reentry or bootstrap or rearm):
             return
 
+        # 부트스트랩은 정규 리밸런싱을 대체하므로 "rebal" 태그. 재진입은 같은 거래일에
+        # 정기 발화·레짐 액션과 멱등성 키가 겹치지 않도록 사유별로 태그를 나눈다.
         if due or bootstrap:
-            kind = "정기 발화" if due else "콜드스타트 즉시 발화"
+            kind, bar_tag = ("정기 발화" if due else "콜드스타트 즉시 발화"), "rebal"
+        elif reentry:
+            kind, bar_tag = "레짐 재진입", "regime"
         else:
-            kind = "레짐 재진입"
+            kind, bar_tag = "MDD 쿨다운 해제 재진입", "rearm"
         logger.info("리밸런싱 전략 %d %s (%s)", self.strategy_id, kind, now.isoformat())
-        # 부트스트랩은 정규 리밸런싱을 대체하므로 "rebal" 태그(재진입만 "regime").
-        await self._rebalance_once(
-            now, risk_off=False, bar_tag="rebal" if (due or bootstrap) else "regime"
-        )
+        await self._rebalance_once(now, risk_off=False, bar_tag=bar_tag)
         if due or bootstrap:  # 재진입은 월간 cadence 스케줄을 소비하지 않는다
             await self._set_last(now)
+        if rearm:
+            # 리밸런싱을 마쳤으면 소비한다. 예외로 여기까지 못 오면(틱 실패) 요구가 남아
+            # 다음 틱에 재시도된다. 선정 결과가 비어 매수가 없었던 경우도 소비하는데,
+            # 백테스트도 just_rearmed 를 그 봉에서 한 번 쓰고 버린다(동일 규약).
+            await self._clear_rearm_pending()
 
     # ───────────────────── 마지막 실행일 상태 ─────────────────────
     def _last_key(self) -> str:
@@ -251,14 +303,29 @@ class RebalanceRunner(BaseRunner):
             return None
 
     async def _set_mdd_state(
-        self, hwm: float, killed: bool, kill_date: date | None
+        self, hwm: float, killed: bool, kill_date: date | None,
+        rearm_pending: bool = False,
     ) -> None:
         state = {
             "hwm": float(hwm),
             "killed": bool(killed),
             "kill_date": kill_date.isoformat() if kill_date else None,
+            "rearm_pending": bool(rearm_pending),
         }
         await self.redis.set(self._mdd_key(), json.dumps(state), ex=_LAST_TTL)
+
+    async def _clear_rearm_pending(self) -> None:
+        """강제 재진입 요구(rearm_pending)를 소비한다 — 재진입 리밸런싱을 마친 뒤 호출."""
+        state = await self._get_mdd_state()
+        if not state or not state.get("rearm_pending"):
+            return
+        kd = state.get("kill_date")
+        await self._set_mdd_state(
+            float(state["hwm"]),
+            bool(state.get("killed")),
+            date.fromisoformat(kd) if kd else None,
+            rearm_pending=False,
+        )
 
     async def _live_equity(self) -> float:
         """라이브 계좌 자산가치 근사 = 체결 재생 현금잔고 + 보유 종목 시가평가(§11).
@@ -272,9 +339,18 @@ class RebalanceRunner(BaseRunner):
             equity = 체결 재생 현금잔고 + Σ 현재 보유수량×현재가[시가평가]
 
         구 근사(capital + 미실현손익)는 확정 실현손익을 무시해 손실 라운드트립 이후에도
-        자산가치가 낙관적으로 리셋되는 편향이 있었다(MDD 킬스위치 과소 발동 방향). 시세 조회
-        실패 종목은 평단가로 평가한다(현금흐름에는 이미 반영됐으므로 시가 대신 원가로 두는
-        편이 미조회로 인한 오발동 왜곡보다 보수적).
+        자산가치가 낙관적으로 리셋되는 편향이 있었다(MDD 킬스위치 과소 발동 방향).
+
+        평가 대상은 **이 전략의 보유 전체**이며 현재 후보풀(PIT 유니버스)로 거르지 않는다.
+        지수 정기변경으로 후보풀에서 빠진 보유종목도 청산 전까지는 실제 자금이므로, 빼면
+        재구성일에 자산가치가 불연속으로 급락해 고점(HWM)·낙폭 판정이 오염된다(_holdings
+        의 universe 필터는 '이번에 매매할 후보'를 좁히는 것이라 목적이 다르다).
+
+        시가평가 가격은 현재가(REST) → 로컬 종가(price_ticks 최신) → 평단가 순으로
+        떨어진다. 평단가를 시세 대체값으로 쓰는 것은 보수적이지 않다 — 킬스위치가 필요한
+        급락 국면일수록 평단가는 시가보다 높아 자산가치를 과대평가하고 발동을 늦춘다.
+        그래서 마지막으로 알려진 실제 시장가(로컬 종가)를 먼저 쓰고, 그마저 없을 때만
+        (편입 직후 등 종가 이력 자체가 없는 경우) 평단가로 떨어진다.
         """
         capital = float(self._cfg.get("capital", 10_000_000))
         async with AsyncSessionLocal() as db:
@@ -304,27 +380,52 @@ class RebalanceRunner(BaseRunner):
         ]
         cash = replay_cash_balance(executions, capital)
 
-        pool = await self._resolve_universe(_last_business_day())
         async with AsyncSessionLocal() as db:
             rows = await db.scalars(
                 select(Position).where(
                     Position.user_id == self._user_id,
                     Position.strategy_id == self.strategy_id,
                     Position.qty > 0,
-                    Position.symbol.in_(pool),
                 )
             )
             positions = list(rows)
         if not positions:
             return cash
         prices = await self._quotes({p.symbol for p in positions})
+        missing = [p.symbol for p in positions if p.symbol not in prices]
+        last_closes = await self._last_known_closes(missing) if missing else {}
         market_value = 0.0
         for p in positions:
             price = prices.get(p.symbol)
-            if price is None:  # 시세 조회 실패 → 평단가로 보수 처리
+            if price is None:
+                price = last_closes.get(p.symbol)
+            if price is None:
+                # 시세·종가 이력 둘 다 없음 → 남은 값은 평단가뿐. 자산가치가 과대평가되는
+                # 방향이므로(킬스위치 지연) 조용히 넘기지 않고 남긴다.
                 price = p.avg_price
+                logger.warning(
+                    "전략 %d %s 현재가·로컬 종가 모두 없음 — 평단가로 평가(자산가치 과대평가 위험)",
+                    self.strategy_id, p.symbol,
+                )
             market_value += float(p.qty) * float(price)
         return cash + market_value
+
+    async def _last_known_closes(self, symbols: list[str]) -> dict[str, float]:
+        """로컬 price_ticks 의 마지막 종가를 종목별로 반환(외부 조회 없음).
+
+        시세 조회 실패 종목의 시가평가 대체값. 시세 조회가 실패하는 국면(급락·장애)에
+        외부를 한 번 더 두드리면 같은 이유로 또 실패하거나 틱을 지연시키므로 DB 만 읽는다.
+        조회 창(_CLOSE_FALLBACK_DAYS)을 넘도록 종가가 없으면 그 종목은 빠진다.
+        """
+        end = datetime.now()
+        start = end - timedelta(days=_CLOSE_FALLBACK_DAYS)
+        out: dict[str, float] = {}
+        async with AsyncSessionLocal() as db:
+            for sym in symbols:
+                series = await get_close_series(db, sym, start, end)
+                if len(series):
+                    out[sym] = float(series.iloc[-1])
+        return out
 
     def _business_days_since(self, start: date, end: date) -> int:
         """start(제외)~end(포함) 사이 영업일 수. 백테스트의 (i − kill_idx) 와 동일 의미.
@@ -350,18 +451,25 @@ class RebalanceRunner(BaseRunner):
              (killed=False) + 고점 기준선을 현재 자산가치로 리셋.
           3) 발동 판정: 미발동 상태에서 고점 대비 낙폭이 −mdd_kill_pct 이하이면 발동
              (killed=True, 발동일=오늘).
-        재진입 자체는 이 함수가 아니라 기존 레짐/cadence 게이팅이 담당한다(역할 분리).
+
+        2)의 재가동 전환은 백테스트의 just_rearmed(portfolio.py) 에 대응한다. 백테스트는
+        그 봉에서 곧바로 강제 재진입하지만, 라이브는 전환을 상태(rearm_pending)로 남겨
+        _tick_once 가 소비한다 — 전환은 여기서 이미 Redis 에 커밋되므로, 인메모리 플래그로
+        넘기면 그 뒤 틱이 실패(타임아웃·DataSourceError)했을 때 전환이 영영 사라져 다음
+        cadence(월간이면 최대 한 달)까지 현금으로 방치된다. 소비는 재진입 리밸런싱을
+        마친 뒤에만 일어난다(_clear_rearm_pending).
         """
         equity = await self._live_equity()
         today = now_kst().date()
         state = await self._get_mdd_state()
         if state is None:  # 최초/유실 → 현재 자산가치를 고점으로 초기화(안전측: 오발동 방지)
-            hwm, killed, kill_date = equity, False, None
+            hwm, killed, kill_date, rearm_pending = equity, False, None, False
         else:
             hwm = float(state["hwm"])
             killed = bool(state.get("killed"))
             kd = state.get("kill_date")
             kill_date = date.fromisoformat(kd) if kd else None
+            rearm_pending = bool(state.get("rearm_pending"))
 
         if equity > hwm:
             hwm = equity
@@ -375,14 +483,17 @@ class RebalanceRunner(BaseRunner):
             killed = False
             kill_date = None
             hwm = equity
+            rearm_pending = True  # 백테스트 just_rearmed — 강제 재진입 요구를 남긴다
             logger.info(
-                "리밸런싱 전략 %d MDD 킬스위치 쿨다운 경과 — 재가동(고점 리셋 %.0f)",
+                "리밸런싱 전략 %d MDD 킬스위치 쿨다운 경과 — 재가동(고점 리셋 %.0f), "
+                "cadence 무관 재진입 예약",
                 self.strategy_id, hwm,
             )
         # 발동 판정(미발동 상태에서만)
         if not killed and hwm > 0 and equity / hwm - 1.0 <= -mdd_kill_pct:
             killed = True
             kill_date = today
+            rearm_pending = False  # 다시 청산하므로 미소비 재진입 요구는 무효
             drawdown_pct = (equity / hwm - 1.0) * 100
             logger.warning(
                 "리밸런싱 전략 %d MDD 킬스위치 발동 — 자산가치 %.0f / 고점 %.0f "
@@ -403,7 +514,7 @@ class RebalanceRunner(BaseRunner):
                 ),
             )
 
-        await self._set_mdd_state(hwm, killed, kill_date)
+        await self._set_mdd_state(hwm, killed, kill_date, rearm_pending)
         return killed
 
     # ───────────────────── 목표비중 산정(주문 I/O 없음) ─────────────────────
@@ -826,6 +937,35 @@ class RebalanceRunner(BaseRunner):
             message=(
                 f"PIT 유니버스({source}) {cause} — config.universe 고정 폴백으로 전환. "
                 f"생존편향 검증 원칙상 지수 구성 이탈은 즉시 점검이 필요합니다."
+            ),
+        )
+
+    async def _alert_panic_unsupported(self) -> None:
+        """패닉 오버레이 미지원으로 매매를 중단했음을 알린다 — 러너 수명 중 1회.
+
+        60초 틱마다 재발행하면 알림이 폭주해 오히려 읽히지 않으므로 _pit_fallback_active
+        와 동일한 '전환 시점' dedup 규약을 쓴다(로그도 같은 이유로 1회만 남긴다).
+        """
+        if self._panic_alerted:
+            return
+        self._panic_alerted = True
+        logger.error(
+            "리밸런싱 전략 %d panic_overlay 가 설정돼 있으나 실거래 엔진에 구현이 없어 "
+            "매매를 중단한다(보유 유지). 백테스트와 다른 노출로 자금을 움직이지 않기 위한 "
+            "의도된 거부다.",
+            self.strategy_id,
+        )
+        await publish_alert(
+            self.redis,
+            user_id=self._user_id,
+            strategy_id=self.strategy_id,
+            severity="critical",
+            code="panic_overlay_unsupported",
+            message=(
+                "panic_overlay 는 백테스트에만 구현돼 있어 실거래에서 재현할 수 없습니다. "
+                "무시하고 매매하면 base_exposure·event_only 를 반영하지 않아 백테스트보다 "
+                "공격적으로 운용되므로, 이 전략의 매매를 중단합니다(기존 보유는 유지, MDD "
+                "킬스위치는 계속 동작). 실거래하려면 panic_overlay 를 해제하십시오."
             ),
         )
 

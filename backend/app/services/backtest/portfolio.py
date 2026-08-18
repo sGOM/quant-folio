@@ -37,13 +37,19 @@
 =================
 - **정수주(A-1)**: config.integer_shares(기본 True)가 켜져 있으면 매수·매도 거래대금을
   floor(금액/가격) 주 단위로 절사한다(실거래 compute_rebalance_orders 와 동일 규약).
-  전량 청산(포지션 정리)은 절사하지 않고 보유 전량을 그대로 정리한다(ADV 캡으로 줄어들지
-  않는 한 잔여주가 남지 않아야 하므로). 절사로 남는 소수점 금액은 자동으로 현금에 남는다
-  (val/cost 는 정수주 가치에 정확히 맞춰 갱신되므로 별도 이월 부기가 필요 없다).
+  전량 청산(포지션 정리)은 절사하지 않고 보유 전량을 그대로 정리한다. 절사로 남는 소수점
+  금액은 자동으로 현금에 남는다(val/cost 는 정수주 가치에 정확히 맞춰 갱신되므로 별도
+  이월 부기가 필요 없다).
 - **ADV 참여율 캡(A-2)**: config.adv_participation_cap(예 0.08)과 volume_panel 이 모두
   주어지면, 종목별 20일 ADV(거래대금, rolling·미래참조 없음)의 그 비율을 하루 매매 상한으로
   삼아 초과분을 절사한다(잔량은 다음 리밸런싱에서 재평가 — 이월 큐를 별도로 두지 않는
   단순화된 모델). volume_panel 미공급 시 설정돼 있어도 경고 로그만 남기고 미적용.
+  **강제청산(MDD 킬스위치·레짐 청산·패닉 오버레이 해제, _apply_rebalance(liquidate=True))
+  매도는 이 캡에서 면제된다** — 라이브 리밸런싱 러너에는 참여율 캡이나 주문 분할이 없어
+  위험회피 청산이 즉시 전량 나가므로, 백테스트만 스로틀하면 성과가 갈리고 킬스위치 쿨다운
+  동안 청산되지 않는 잔여 노출이 생긴다(_apply_rebalance 의 A-2 주석 참고). 다만 아래
+  price_limit_model 을 켠 경우 하한가 도달 종목은 강제청산이라도 그날 체결이 막힌다
+  (유동성 캡이 아니라 시장 규칙이라 별개 — 잔량은 다음 결정일로 이월).
 - **호가단위·상하한가(price_limit_model, opt-in, §4)**: config.price_limit_model=True 면
   체결가를 KRX 가격대별 호가단위로 라운딩하고, 전일종가 대비 ±30% 상하한가에 도달한
   방향의 주문(매수는 상한가, 매도는 하한가)을 그날 체결 불가로 막아 다음 리밸런싱으로
@@ -66,6 +72,7 @@
 """
 from __future__ import annotations
 
+import calendar
 import logging
 import math
 
@@ -129,6 +136,13 @@ def _rebalance_dates(dates: pd.DatetimeIndex, cfg: dict) -> set[pd.Timestamp]:
 
     각 주기(일/주/월)에서 지정 임계(dom/weekday) 이상인 '첫 거래일'을 선택한다.
     지정일이 휴장이면 같은 주기 내 다음 거래일에 자연 발화한다(is_rebalance_due 와 동일 취지).
+
+    dom 은 실거래 is_rebalance_due 와 동일하게 **그 날짜가 속한 달의 실제 일수로 클램프**한다
+    (1 미만도 1 로 하한). 그러지 않으면 dom=29~31 설정이 짧은 달(2월 등)에서 d.day>=dom 을
+    만족하는 거래일이 없어 그 주기를 통째로 건너뛰는데, 라이브는 월말에 발화하므로
+    백테스트/실거래 동작이 갈린다. 스키마(RebalanceConfig.rebalance_dom, ge=1 le=28)가
+    현재는 그런 값을 막고 있어 검증 경로로는 도달하지 않지만, 이 함수는 raw dict 를 받으므로
+    두 경로의 규약을 구조적으로 일치시켜 둔다.
     """
     cadence = cfg.get("cadence", "monthly")
     weekday = int(cfg.get("rebalance_weekday") or 0)
@@ -142,8 +156,11 @@ def _rebalance_dates(dates: pd.DatetimeIndex, cfg: dict) -> set[pd.Timestamp]:
             continue
         if cadence == "weekly" and d.weekday() < weekday:
             continue
-        if cadence in ("monthly", "quarterly") and d.day < dom:
-            continue
+        if cadence in ("monthly", "quarterly"):
+            # 월 길이는 달마다 다르므로 판정일 d 가 속한 달 기준으로 매번 클램프한다.
+            dom_eff = min(max(dom, 1), calendar.monthrange(d.year, d.month)[1])
+            if d.day < dom_eff:
+                continue
         seen_periods.add(key)
         picked.add(d)
     return picked
@@ -511,12 +528,15 @@ def _apply_rebalance(
     :param val: 종목→평가액(정규화 단위). 함수가 제자리 수정한다.
     :param cost: 종목→원가 기준 누적 투자액(정규화 단위). 포지션 수익률 산출용. 제자리 수정.
     :param equity: 리밸런싱 직전 총자산(cash+보유평가액).
-    :param liquidate: True 면 드리프트 밴드를 무시하고 보유 전량을 청산한다(레짐 현금화).
+    :param liquidate: True 면 드리프트 밴드를 무시하고 보유 전량을 청산한다(레짐 현금화·MDD
+        킬스위치·패닉 오버레이 해제). 이 강제청산 매도는 ADV 참여율 캡을 적용받지 않는다
+        (라이브 러너가 캡 없이 즉시 전량 매도하므로 — 아래 A-2 주석 참고).
     :param reason: 거래 로그의 사유 태그.
     :param slip_base: 편도 슬리피지(분수). 매수는 +slip, 매도는 −slip 로 체결가에 가산.
     :param slip_map: 종목별 슬리피지(분수) 오버라이드. 없으면 slip_base 를 쓴다(변동성 스케일용).
     :param integer_shares: True(기본)면 체결 거래대금을 정수주 단위로 절사(A-1).
-    :param adv_cap_frac: ADV 대비 1일 참여율 상한(0=미적용, A-2).
+    :param adv_cap_frac: ADV 대비 1일 참여율 상한(0=미적용, A-2). liquidate=True 인
+        강제청산에는 적용되지 않는다.
     :param adv_map: 종목→ADV(KRW) Series. adv_cap_frac>0 일 때만 사용.
     :param price_limit_model: True 면 체결가를 KRX 호가단위로 라운딩하고, 전일종가 대비
         ±30% 상하한가에 도달한 방향의 주문을 체결 불가(다음 리밸런싱 이월)로 막는다(opt-in,
@@ -587,7 +607,18 @@ def _apply_rebalance(
     # ADV 참여율 캡(A-2) — 유동성 상한을 초과하는 목표 거래대금을 사전 절사.
     # turnover 는 위에서 이미 '의도된' 드리프트 기준으로 집계했으므로 그대로 둔다
     # (실제 체결액은 그 이하 — 사후 분석 시 참고).
-    if adv_cap_frac > 0 and adv_map is not None:
+    #
+    # 강제청산(liquidate=True: MDD 킬스위치·레짐 청산·패닉 오버레이 해제)은 캡에서 면제한다.
+    # 근거는 두 가지다.
+    #  1) 실거래 정합성 — 라이브 리밸런싱 러너(engine/rebalance_runner.py)에는 ADV 참여율
+    #     캡도, 다른 이름의 주문 분할·수량 상한도 없다(2026-08-17 확인). 위험회피 청산은
+    #     그 자리에서 전량 시장가로 나간다. 백테스트만 스로틀하면 성과가 갈린다.
+    #  2) 상태기계 정합성 — 킬스위치는 발동 당일에만 청산 결정을 내리고 이후 쿨다운 동안
+    #     'killed' 분기로 아무 결정도 내리지 않는다. 캡으로 남은 잔여 포지션은 재청산되지
+    #     않아 '전량 현금 대피'라고 보고하면서 실제로는 쿨다운 내내 노출이 남는다
+    #     (재가동 판정 `just_rearmed and not val` 도 잔량 때문에 막힌다).
+    # 정기 리밸런싱 매도·매수는 종전대로 캡을 적용한다(유동성 모델링 유지).
+    if adv_cap_frac > 0 and adv_map is not None and not liquidate:
         sells = [(sym, _apply_adv_cap(amt, sym, adv_map, adv_cap_frac, capital)) for sym, amt in sells]
         buys = [(sym, _apply_adv_cap(amt, sym, adv_map, adv_cap_frac, capital)) for sym, amt in buys]
 
@@ -599,8 +630,11 @@ def _apply_rebalance(
         if _limit_blocked(sym, "sell"):
             continue  # 하한가 도달 — 매도 체결 불가(다음 리밸런싱으로 이월, §4)
         cur_val = val.get(sym, 0.0)
-        # 전량 청산(ADV 캡으로 amt 가 이미 줄었다면 '전량'이 아니므로 절사 대상이 된다) 만
-        # 정수주 절사를 건너뛴다 — 보유 전량을 정리하는 거래에 소수점 잔량을 남기지 않기 위함.
+        # 전량 청산(amt 가 보유 평가액 전부)만 정수주 절사를 건너뛴다 — 보유 전량을 정리하는
+        # 거래에 소수점 잔량을 남기지 않기 위함. 정기 리밸런싱 매도는 ADV 캡으로 amt 가 줄면
+        # '전량'이 아니게 되어 절사 대상이 된다(강제청산은 캡 면제라 여기 도달하면 항상 전량).
+        # 단 price_limit_model 이 켜져 하한가로 차단된 강제청산은 위 _limit_blocked 에서 이미
+        # continue 되어 그날 아예 체결되지 않는다(잔여 포지션이 남는 유일한 경로).
         is_full_exit = amt >= cur_val - 1e-9
         if integer_shares and not is_full_exit:
             amt = _floor_to_shares(amt, sym, fill_prices, capital)
