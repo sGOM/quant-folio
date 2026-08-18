@@ -1395,3 +1395,81 @@ min/max 클램프는 틀린 방향(요청은 달력일·데이터는 거래일�
 근거는 없다.
 
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.
+
+## 전체 코드 버그 검사 (2026-08-17, §50~§57)
+
+`/code-review` 전체 저장소 스캔(10건) + 병렬 서브에이전트 검증·수정에서, 각 수정의
+범위 밖으로 명시적으로 남긴 잔여 이슈들. 전부 진짜로 확인된 인접 버그이거나 근본
+원인이지만, 이번 배치의 수정 범위(파일 단위)를 넘어서거나 별도 설계 결정이 필요해
+후속 과제로 남긴다.
+
+## 50. `RecommendMember.price` 가 결측 종가를 0 sentinel 로 숨김 ⚠️
+
+`app/services/recommend.py` 가 결측 종가를 `int | None` 대신 `0`(sentinel)으로
+반환한다. 프론트(`recommend/page.tsx`)는 이 계약에 맞춰 `price > 0` 을 "값 있음"
+판정으로 쓰고 있어 당장 오표시는 없지만, `number` 타입이 nullable 의미를 숨기고
+있어 다른 소비처가 생기면 같은 함정(0을 정상값으로 오인)이 재발할 수 있다.
+근본 수정은 백엔드가 `price: int | None` 으로 결측을 명시하고 프론트가
+`price != null` 로 바꾸는 것 — API 계약 변경이라 이번 배치(프론트 전용) 범위 밖.
+
+## 51. 실전(prod) 환경의 접수 불명 주문, 완전 자동 회수 불가 ⚠️
+
+§33(`executor.execute_signal`)의 네트워크 예외 미포착으로 인한 주문 `PENDING` 고착을
+이번에 고쳤다(§ 아래 executor.py 커밋 참고) — `reconcile.py` 에 5분 유예 후 **잔고
+교차확인** 회수 경로를 추가했다. 다만 이 경로는 모의투자·매수 한정이다(실전은 잔고
+오귀속 위험, 매도는 잔고 감소라 판정 불가). 실전에서 주문번호 없이 접수 여부를
+확인하려면 브로커의 "당일 주문목록 조회" API 가 필요한데, 이는 `app/services/broker/*`
+확장이 필요해 이번 배치 범위 밖이었다. 현재는 critical 알림(`code=order_unconfirmed`)
+→ 수동 확인까지만 자동화됐다.
+
+## 52. `rebalance_weekday` 클램프 divergence (라이브만 클램프) ⚠️
+
+§50 인접 이슈. 라이브 `engine/rebalance.py::is_rebalance_due` 는 `rebalance_weekday`
+를 0~4로 클램프하지만 백테스트 `_rebalance_dates()` 는 클램프하지 않는다(§53 이 고친
+`rebalance_dom` 클램프와 같은 종류의 규약 이탈). 현재 스키마(`RebalanceConfig`,
+`ge=0, le=4`)가 유효값만 통과시켜 실질 영향은 없어 우선순위는 낮지만, `rebalance_dom`
+과 동일한 이유로 `_rebalance_dates()` 에 클램프를 추가해 두는 것이 raw dict 입력
+경로(스키마 우회)에 대한 구조적 방어가 된다.
+
+## 53. `rebalance_runner._quotes()` 가 리터럴 "0" 시세 문자열을 결측으로 못 거름 ⚠️
+
+§ 위 KIS 시세 0원 가드(client.py/runner.py/risk.py)로 결측 응답은 이제 예외로
+걸러지지만, KIS 가 문자 그대로 `"0"` 을 정상 응답으로 돌려주는 경우는 여전히
+`_quotes()`(`engine/rebalance_runner.py:894` 부근)가 dict 에 그대로 담는다.
+`_live_equity()` 가 이를 "결측"으로 보지 않아 해당 포지션 평가액만큼 자산이
+과소계상된다. 주문 생성 자체는 `rebalance.py:347` 의 `price <= 0` 가드가 막으므로
+오청산 위험은 없고 MDD 판정의 사이징 왜곡에 그친다.
+
+## 54. `_has_holdings()` 가 PIT 유니버스 밖 보유를 "현금"으로 오판 ⚠️
+
+`_live_equity()` 의 유니버스 이탈 자산 누락(2026-08-17 수정 완료)과 같은 뿌리.
+`_has_holdings()` 는 여전히 `_holdings(db, pool)` 로 PIT 후보풀 필터를 거치므로,
+후보풀에서 빠진 종목만 보유한 전략은 "보유 전무"로 읽혀 MDD rearm·재진입·bootstrap
+로직이 기존 포지션 위에 중복 진입을 시도할 수 있다. 백테스트의 `not val` 판정
+(포지션 딕셔너리 자체를 봄, 후보풀과 무관)과 계약이 어긋난다.
+
+## 55. `cached_frame` 최초 조회(원격)와 재조회(로컬)의 dedup 형태 불일치 ⚠️
+
+§56(중복 행 dedup)에서 `write_daily`/`write_periods` 저장 직전 dedup 을 추가했지만,
+`cached_frame` 은 원격 조회 직후 dedup 되지 않은 원본 `df`를 그대로 호출자에게
+반환한다(저장은 `write_local(df)` 에만 dedup 이 적용됨). 같은 논리적 조회인데
+최초 응답(중복 가능)과 이후 로컬 히트(dedup 됨)의 형태가 달라질 수 있다. 근본 수정은
+`app/services/metrics/fetch.py::_fetch_per_market` 의 `pd.concat` 직후 dedup —
+이 파일이 `store/` 밖이라 이번 배치 범위 밖이었다.
+
+## 56. `/turnaround` — `financial_filter_applied=False` 결과도 6시간 캐싱됨 ⚠️
+
+§ 위에서 "빈 결과 미캐싱"으로 고친 것과 인접한 별개 이슈. OpenDART 조회 실패로
+하드 필터가 미적용된(`app/schemas/screener.py:44-48` 에 명시된 "왜곡된") 응답은
+`items` 가 비어있지 않으면 여전히 6시간 캐싱된다 — 재무 필터 없이 나온 후보 목록이
+정상 결과처럼 오래 굳는다.
+
+## 57. `price_limit_model=True`(opt-in) 시 하한가 종목은 강제청산이라도 미체결 ⚠️
+
+§ ADV 캡 강제청산 면제(2026-08-17 수정)로 유동성 캡은 더 이상 강제청산을 막지 않지만,
+`price_limit_model` 을 켠 경우 하한가에 도달한 종목은 `_limit_blocked` 로 그날 체결
+자체가 막혀 잔량이 남는다. 이는 유동성 모델링이 아니라 KRX 시장 규칙(하한가는 실제로
+체결 불가)이라 ADV 캡과 같은 방식으로 면제할 수 없다 — 킬스위치의 "당일 전량 청산"
+전제가 하한가 상황에서는 원천적으로 성립하지 않음을 문서화만 해 둔다.
+
+새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.
