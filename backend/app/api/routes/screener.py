@@ -3,6 +3,8 @@
   GET /api/screener/turnaround — 전 시장 스캔 후 하드 필터를 통과한 턴어라운드 후보
 
 Redis 캐시(6시간). 블로킹 계산은 asyncio.to_thread 로 수행한다(metrics 라우트와 동일 패턴).
+빈 결과(KRX 시총 조회 실패 등 일시적 장애)는 캐시하지 않는다 — 일시적 실패가 TTL(6h)
+동안 굳어 정상 결과를 가리는 것을 방지한다(metrics.py sectors/stocks/panic 과 동일 정책).
 """
 from __future__ import annotations
 
@@ -53,5 +55,12 @@ async def turnaround(
         screen_turnaround, as_of, market,
         top_n=top_n, smallcap_pct=smallcap_pct, surge=surge, max_debt=max_debt,
     )
-    await redis.set(cache_key, result.model_dump_json(), ex=_CACHE_TTL)
+    # 빈 결과(KRX 시총 조회 실패 등 일시적 장애)는 캐시하지 않는다 — 일시적 실패가
+    # TTL(6h) 동안 굳어 정상 데이터를 가리는 것을 방지한다.
+    if result.items:
+        await redis.set(cache_key, result.model_dump_json(), ex=_CACHE_TTL)
+    else:
+        logger.warning(
+            "턴어라운드 스크리닝 결과가 비어 캐시를 건너뜀 (as_of=%s market=%s)", as_of, market
+        )
     return result
