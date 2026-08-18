@@ -170,9 +170,11 @@ class TossClient:
             items = data
         else:
             items = data.get("result") or data.get("prices") or data.get("data") or []
-        row = next((p for p in items if p.get("symbol") == symbol), items[0] if items else None)
+        # 요청한 종목코드와 정확히 일치하는 항목만 사용한다. items[0] 등으로
+        # 폴백하면 다른 종목의 가격을 조용히 반환하게 되어 매매 신호가 오염된다.
+        row = next((p for p in items if p.get("symbol") == symbol), None)
         if not row or row.get("lastPrice") in (None, ""):
-            raise TossError(f"시세 응답 형식 오류: {data}")
+            raise TossError(f"시세 응답에 '{symbol}' 매칭 없음: {data}")
         try:
             price = Decimal(str(row["lastPrice"]))
         except (ValueError, ArithmeticError) as e:
