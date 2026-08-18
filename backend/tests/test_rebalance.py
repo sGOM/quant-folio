@@ -1433,6 +1433,15 @@ class _MddFakeDb:
             return list(self._orders)
         return list(self._positions)
 
+    async def execute(self, stmt):
+        """get_close_series() 의 로컬 종가 폴백 조회 — 항상 빈 결과(로컬 종가 없음)."""
+
+        class _EmptyResult:
+            def all(self):
+                return []
+
+        return _EmptyResult()
+
     async def __aenter__(self):
         return self
 
@@ -1857,3 +1866,141 @@ def test_run_rebalance_backtest_adv_cap_noop_without_volume_panel(caplog):
         res = run_rebalance_backtest(panel, cfg, dates[0], dates[-1])
     assert "ADV" in caplog.text or "거래량" in caplog.text
     assert res["num_trades"] > 0  # 캡 없이 정상 체결됨(미적용 확인)
+
+
+# ───────── ADV 참여율 캡: 강제청산(liquidate) 면제 ─────────
+
+
+def _adv_liquidate_args(trades: list) -> dict:
+    """_apply_rebalance 공통 인자 — ADV 캡이 반드시 걸리도록 극단적으로 얇은 종목."""
+    return {
+        "prices": pd.Series({"THIN": 10_000.0}),
+        "d": pd.Timestamp("2024-03-01"),
+        "capital": 10_000_000.0,
+        "drift_band": 0.0,
+        "fees": 0.0,
+        "tax": 0.0,
+        "trades": trades,
+        # ADV 10만원 × 참여율 10% = 1만원 = 정규화 0.001 (보유 0.4 의 1/400)
+        "adv_cap_frac": 0.10,
+        "adv_map": pd.Series({"THIN": 100_000.0}),
+    }
+
+
+def test_apply_rebalance_liquidate_bypasses_adv_cap():
+    """강제청산(MDD 킬·레짐 청산)은 ADV 참여율 캡을 무시하고 당일 전량 매도한다.
+
+    라이브 러너(engine/rebalance_runner.py)에 참여율 캡·주문 분할이 없어 위험회피 청산이
+    즉시 전량 나가므로, 백테스트도 같은 규약이어야 성과가 갈리지 않는다. 잔여 포지션이
+    남으면 킬스위치 쿨다운 동안 재청산 기회가 없어 '현금 대피'가 거짓이 된다.
+    """
+    from app.services.backtest.portfolio import _apply_rebalance
+
+    val = {"THIN": 0.4}
+    cost = {"THIN": 0.4}
+    trades: list = []
+    cash, turnover, executed = _apply_rebalance(
+        val, cost, {}, 1.0, liquidate=True, reason="mdd_kill", **_adv_liquidate_args(trades)
+    )
+    assert val == {}                                  # 잔여 포지션 없음(핵심 단정)
+    assert executed == pytest.approx(0.4)             # 보유 전량이 실체결
+    assert cash == pytest.approx(1.0)                 # 시작현금 0.6 + 매도대금 0.4
+    assert len(trades) == 1 and trades[0]["side"] == "sell"
+
+
+def test_apply_rebalance_regular_sell_still_capped_by_adv():
+    """정기 리밸런싱 매도는 종전대로 ADV 캡이 걸린다(면제는 강제청산 한정)."""
+    from app.services.backtest.portfolio import _apply_rebalance
+
+    val = {"THIN": 0.4}
+    cost = {"THIN": 0.4}
+    trades: list = []
+    _cash, _turnover, executed = _apply_rebalance(
+        val, cost, {}, 1.0, liquidate=False, **_adv_liquidate_args(trades)
+    )
+    assert executed == pytest.approx(0.001)           # 캡(1만원/1,000만원)까지만 체결
+    assert val["THIN"] == pytest.approx(0.399)        # 잔량은 다음 리밸런싱으로 이월
+
+
+def test_mdd_kill_liquidation_leaves_no_residual_under_adv_cap():
+    """MDD 킬스위치 청산이 ADV 캡으로 분할되지 않고 쿨다운 진입 전에 완결된다(종단).
+
+    회귀 대상: 캡으로 잔량이 남으면 이후 매 거래일이 `killed` 분기로 빠져 재청산 결정이
+    아예 생기지 않고(재가동 판정 `just_rearmed and not val` 도 잔량 때문에 막힘) 쿨다운
+    내내 노출이 남는다. 그래서 '매도량이 전량인가'가 아니라 '잔여 보유가 0인가'를 단정한다.
+    """
+    dates = pd.bdate_range("2024-01-01", periods=70)
+    # 인덱스 50까지 10,000원 유지 → 이후 5일간 매일 -5%(누적 -14%)로 킬 임계(-10%) 돌파.
+    px = []
+    p = 10_000.0
+    for i in range(len(dates)):
+        if 51 <= i <= 55:
+            p *= 0.95
+        px.append(p)
+    price = pd.Series(px, index=dates)
+    panel = pd.DataFrame({"A": price, "B": price})
+    # 진입 시점(인덱스 20)에는 유동성이 풍부해 캡이 걸리지 않고, 인덱스 26부터 거래량이
+    # 말라 킬 발동 시점(인덱스 ~54)의 20일 ADV 는 극히 작다 → 캡이 반드시 물린다.
+    vol = pd.Series([1_000_000.0 if i < 26 else 10.0 for i in range(len(dates))], index=dates)
+    volume_panel = pd.DataFrame({"A": vol, "B": vol})
+    cfg = {
+        "universe": ["A", "B"],
+        "selection": {"method": "all"},
+        "cadence": "monthly",
+        "rebalance_dom": 1,
+        "capital": 10_000_000,
+        "drift_band_pct": 0.05,
+        "fill_mode": "same_close",
+        "fees": 0.0,
+        "tax": 0.0,
+        "slippage_bps": 0.0,
+        "integer_shares": False,
+        "adv_participation_cap": 0.10,
+        "risk_layer": {"mdd_kill_pct": 0.10, "mdd_rearm_days": 20},
+    }
+    res = run_rebalance_backtest(
+        panel, cfg, dates[20], dates[-1], volume_panel=volume_panel
+    )
+    assert res["num_kills"] >= 1
+    assert any(m["type"] == "mdd_exit" for m in res["markers"])
+    assert res["holdings"] == {}  # 쿨다운 동안 잔여 노출 없음(현금 대피 완결)
+
+
+# ───────── 리밸런스일 산정: 월말 클램프(라이브 is_rebalance_due 와 동일 규약) ─────────
+
+
+def test_rebalance_dates_clamps_dom_to_month_length(market_open):
+    """rebalance_dom 이 그 달 일수를 넘으면 월 마지막 날로 클램프해 주기를 건너뛰지 않는다.
+
+    스키마(RebalanceConfig.rebalance_dom, ge=1 le=28)는 이런 값을 막지만 _rebalance_dates 는
+    raw dict 를 받으므로 구성 가능하다. 라이브 is_rebalance_due 는 calendar.monthrange 로
+    이미 클램프하고 있어, 클램프가 없으면 dom=30 인 전략이 2월(28일)만 통째로 누락된다.
+    """
+    from app.services.backtest.portfolio import _rebalance_dates
+
+    dates = pd.bdate_range("2023-01-01", "2023-03-31")  # 2023-02 는 28일(비윤년)
+    picked = sorted(_rebalance_dates(dates, {"cadence": "monthly", "rebalance_dom": 30}))
+    assert [d.date().isoformat() for d in picked] == [
+        "2023-01-30",  # dom 그대로
+        "2023-02-28",  # 28 로 클램프 — 클램프 없으면 2월 주기 통째 누락
+        "2023-03-30",
+    ]
+    # 라이브 규약과 동일한지 교차 확인(2/28 에 발화해야 한다).
+    assert is_rebalance_due(
+        {"cadence": "monthly", "rebalance_time": "14:30", "rebalance_dom": 30},
+        None,
+        datetime(2023, 2, 28, 14, 30, tzinfo=KST),
+    ) is True
+
+
+def test_rebalance_dates_dom_within_month_length_unchanged():
+    """월 일수 이내의 dom 은 클램프 영향이 없다(기존 동작 보존)."""
+    from app.services.backtest.portfolio import _rebalance_dates
+
+    dates = pd.bdate_range("2023-01-01", "2023-03-31")
+    picked = sorted(_rebalance_dates(dates, {"cadence": "monthly", "rebalance_dom": 15}))
+    assert [d.date().isoformat() for d in picked] == [
+        "2023-01-16",  # 1/15 는 일요일 → 같은 달 다음 거래일에 자연 발화
+        "2023-02-15",
+        "2023-03-15",
+    ]
