@@ -256,8 +256,8 @@ export function RebalanceFields({
           )}
         </div>
       </Field>
-      <Field label="종목 추가(검색 후 선택)">
-        <SymbolSearch value={addCode} onChange={addSymbol} />
+      <Field label="종목 추가(검색 후 선택, 또는 코드 입력 후 Enter)">
+        <SymbolSearch value={addCode} onChange={addSymbol} commitOnType={false} />
       </Field>
 
       <div className="grid grid-cols-2 gap-3">

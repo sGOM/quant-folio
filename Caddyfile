@@ -27,7 +27,14 @@
 	@backend path /api/* /ws /ws/* /health /docs /openapi.json /redoc
 	handle @backend {
 		# reverse_proxy 는 WebSocket Upgrade 를 자동 처리한다(/ws 실시간 피드).
-		reverse_proxy web:8000
+		reverse_proxy web:8000 {
+			# 클라이언트가 직접 실어 보낸 X-Forwarded-For 를 신뢰하지 않도록,
+			# Caddy 가 실제로 관측한 접속 IP({remote_host})로 항상 덮어쓴다.
+			# (기본 reverse_proxy 는 기존 값 뒤에 append 만 하므로 이 설정 없이는
+			#  스푸핑된 첫 항목을 백엔드가 그대로 신뢰하게 되어 IP 기반 로그인
+			#  실패 카운터(auth.py _client_ip)가 무력화된다.)
+			header_up X-Forwarded-For {remote_host}
+		}
 	}
 
 	handle {

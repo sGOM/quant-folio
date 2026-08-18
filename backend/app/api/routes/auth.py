@@ -28,10 +28,18 @@ _LOGIN_FAIL_LIMIT_IP = 50      # 윈도우 내 IP당 허용 실패 횟수(다계
 
 
 def _client_ip(request: Request) -> str:
-    """오리진 IP — 단일 출처 proxy(Caddy)가 붙이는 X-Forwarded-For 첫 항목 우선."""
+    """오리진 IP.
+
+    단일 출처 proxy(Caddy)가 `header_up X-Forwarded-For {remote_host}`로
+    이 헤더를 항상 실제 접속 IP로 덮어쓰도록 설정되어 있어(Caddyfile 참고),
+    클라이언트가 스푸핑한 값이 아니라 Caddy 가 관측한 값 하나만 들어온다는
+    전제 하에 이 값을 신뢰한다. 다만 방어 이중화 차원에서, 혹시 여러 홉을
+    거쳐 콤마로 이어진 값이 들어오더라도 마지막 항목(가장 가까운 프록시가
+    기록한 값)을 취해 앞쪽에 끼워 넣은 임의 값에 흔들리지 않게 한다.
+    """
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
-        return fwd.split(",")[0].strip()
+        return fwd.rsplit(",", 1)[-1].strip()
     return request.client.host if request.client else "unknown"
 
 

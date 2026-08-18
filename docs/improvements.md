@@ -1472,4 +1472,44 @@ min/max 클램프는 틀린 방향(요청은 달력일·데이터는 거래일�
 체결 불가)이라 ADV 캡과 같은 방식으로 면제할 수 없다 — 킬스위치의 "당일 전량 청산"
 전제가 하한가 상황에서는 원천적으로 성립하지 않음을 문서화만 해 둔다.
 
+## 58. X-Forwarded-For 스푸핑으로 로그인 브루트포스 IP 스로틀 우회 가능 — 해소 ✅
+
+`_client_ip`(`app/api/routes/auth.py`)가 `X-Forwarded-For` 헤더의 첫 번째 항목을
+그대로 신뢰했는데, Caddy(`Caddyfile`)는 클라이언트가 보낸 이 헤더를 지우지 않고
+뒤에 실제 접속 IP만 append 하는 표준 동작이라, 공격자가
+`X-Forwarded-For: <임의값>`을 직접 실어 보내면 이 값이 매 요청마다 회전돼 IP당
+50회/15분 로그인 실패 한도가 전혀 누적되지 않았다(다계정 스프레이 방어 우회).
+이메일당 10회 한도는 그대로 적용돼 단일 계정 크리덴셜 스터핑은 막혔지만, IP
+기반 방어는 무력화 상태였다.
+
+**해소**: Caddy `@backend reverse_proxy`에 `header_up X-Forwarded-For
+{remote_host}`를 추가해 이 헤더를 항상 Caddy가 관측한 실제 접속 IP로 덮어쓰게
+하고(1차 방어), `_client_ip`도 방어 이중화 차원에서 콤마 구분 값의 마지막
+항목(가장 가까운 프록시가 기록한 값)을 취하도록 변경했다.
+
+**검증**: `pytest tests/test_login_bruteforce.py` 8건 통과. Caddy 설정 변경은
+`docker compose exec proxy caddy validate` 및 실제 스푸핑 헤더로 반영 여부
+확인이 필요하나 이번 세션에서는 docker 미기동으로 미실행.
+
+## 59. `SymbolSearch` append 재사용 시 타이핑 중 부분 문자열이 그대로 커밋됨 — 해소 ✅
+
+`SymbolSearch`는 원래 단일종목 선택용으로 설계돼 값 변경 즉시 `onChange`를
+호출하는데, `RebalanceFields`가 이를 종목 "추가"(append) 용도로 재사용하면서
+사용자가 자동완성 없이 종목코드를 직접 타이핑하면 "0"→"00"→"005"→…→"005930"
+각 타이핑 중간의 부분 문자열이 매번 신규 값으로 판정돼 무효한 종목코드가 그대로
+universe 배열에 커밋됐다.
+
+**해소**: `SymbolSearch`에 `commitOnType` prop(기본 `true`, 기존 단일종목 선택
+동작 유지) 추가 — `false`면 타이핑 중엔 `onChange`를 호출하지 않고 드롭다운
+선택 또는 Enter(확정)로만 부모에 값을 전달한다. `RebalanceFields`의 종목 추가
+필드는 `commitOnType={false}`로 배선.
+
+**검증**: `SymbolSearch.test.tsx`·`RebalanceFields.test.tsx` 신설(호스트에
+vitest devDependency 미설치로 이번 세션에서는 미실행, `npx tsc --noEmit`으로
+변경 파일 타입 오류 없음만 확인).
+
+**참고**: §58·§59 모두 2026-07-21에 별도로 열려 있던 미머지 PR(#105)에서 이미
+구현됐던 것을 오늘(2026-08-18) 재확인 후 현재 main 기준으로 재적용했다(원본
+PR은 base가 오래돼 그대로 머지할 수 없어 close, 커밋을 cherry-pick).
+
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.
