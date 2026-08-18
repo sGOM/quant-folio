@@ -124,6 +124,15 @@ async def test_toss_get_quote_bad_payload(toss, monkeypatch):
         await toss.get_quote("005930")
 
 
+async def test_toss_get_quote_no_symbol_match_raises_not_other_symbol(toss, monkeypatch):
+    """응답에 다른 종목만 있을 때, 그 종목 가격으로 조용히 폴백하면 안 된다."""
+    monkeypatch.setattr(
+        toss, "_request", _Recorder([{"symbol": "000660", "lastPrice": "999999", "currency": "KRW"}])
+    )
+    with pytest.raises(BrokerError):
+        await toss.get_quote("005930")
+
+
 async def test_toss_place_order_market(toss, monkeypatch):
     rec = _Recorder({"orderId": "T-123"})
     monkeypatch.setattr(toss, "_request", rec)
