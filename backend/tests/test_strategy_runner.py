@@ -196,6 +196,25 @@ async def test_position_lock_contention_skips_tick(monkeypatch):
     assert store.all(Order) == []
 
 
+async def test_zero_quote_price_does_not_trigger_stop_loss(monkeypatch):
+    """현재가 0(시세 결측이 흘러든 값)이면 손절도 매수도 하지 않고 틱을 건너뛴다.
+
+    이전엔 REST 폴백이 KIS 응답의 결측 가격을 Decimal(0) 으로 돌려줘, 손절 판정이
+    (평단−0)/평단 = 100% 하락으로 계산돼 실제 가격 변동 없이 전량 청산이 발동했다.
+    """
+    store = _Store()
+    _patch_common(monkeypatch, store, signal="buy")
+    store.rows[RiskLimit] = [
+        RiskLimit(user_id=_USER_ID, strategy_id=_STRATEGY_ID, stop_loss_pct=Decimal("0.1")),
+    ]
+    store.rows[Position] = [_position(avg_price=Decimal("100000"), qty=10)]
+    r = _make_runner(store, FakeRedis(), FakeBroker({_SYMBOL: 0}))
+
+    await r._tick_once()
+
+    assert store.all(Order) == []  # 무행동=보유 유지
+
+
 async def test_sell_signal_liquidates_full_holding(monkeypatch):
     store = _Store()
     _patch_common(monkeypatch, store, signal="sell")

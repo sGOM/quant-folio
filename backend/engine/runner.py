@@ -102,20 +102,36 @@ class StrategyRunner(BaseRunner):
     async def _current_price(self) -> Decimal | None:
         """현재가를 조회한다. PriceFeed 가 채운 Redis 캐시를 우선 쓰고, 없으면 REST 폴백.
 
-        :return: 현재가(Decimal), 조회 실패 시 None
+        0 이하 가격은 "유효한 현재가 없음"으로 취급해 None 을 반환한다(WS 경로의
+        `kis_ws.py::_handle` 과 리밸런싱의 `rebalance.py::compute_rebalance_orders` 가
+        쓰는 `price <= 0` 스킵 규약과 동일). 데이터 결측을 0 원으로 흘리면 하류의
+        손절·익절 판정이 "−100% 폭락"으로 오독해 실제 가격 변동 없이 전량 청산을
+        유발한다. 호출부(`_tick_once`)는 None 이면 그 틱을 건너뛴다(무행동=보유 유지).
+
+        :return: 현재가(Decimal, 0 초과), 조회 실패·비정상 가격이면 None
         """
         cached = await self.redis.get(f"{_PRICE_CACHE_PREFIX}{self._symbol}")
         if cached:
             try:
-                return Decimal(cached)
+                px = Decimal(cached)
             except Exception:  # noqa: BLE001
                 pass
+            else:
+                if px > 0:
+                    return px
+                logger.warning("%s 가격 캐시 값이 비정상(%s) — REST 폴백", self._symbol, px)
         try:
             quote = await self._broker.get_quote(self._symbol)
-            return quote.price
         except Exception as e:  # noqa: BLE001
             logger.warning("%s 현재가 조회 실패: %s", self._symbol, e)
             return None
+        if quote.price <= 0:
+            logger.warning(
+                "%s 현재가가 0 이하(%s) — 유효 시세 없음으로 보고 이번 틱 건너뜀",
+                self._symbol, quote.price,
+            )
+            return None
+        return quote.price
 
     async def _tick_once(self) -> None:
         # 장 운영시간이 아니면 신호 평가·주문을 건너뛴다(휴장일·시간외 보호).

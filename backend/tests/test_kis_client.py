@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json as jsonlib
 
+import pytest
+
 from tests.conftest import FakeRedis as _FakeRedis
 
 
@@ -123,6 +125,44 @@ async def test_non_rate_limit_error_raises_immediately_without_retry(monkeypatch
         await client.get_current_price("005930")
 
     assert len(http.calls) == 1
+
+
+async def test_get_quote_parses_price_and_keeps_zero_default_for_side_fields(monkeypatch):
+    """현재가는 엄격 파싱하되, 등락·고저·시가 등 부가 필드의 0 기본값은 유지한다."""
+    client, _ = _client(
+        monkeypatch, [_ok({"stck_prpr": "71500", "acml_vol": "1234"})], app_key="k-quote-ok",
+    )
+
+    quote = await client.get_quote("005930")
+
+    assert str(quote.price) == "71500"
+    assert quote.volume == 1234
+    assert str(quote.high) == "0"  # 부가 필드 결측은 여전히 0 (표시용, 매매 판단 밖)
+
+
+@pytest.mark.parametrize(
+    ("case", "output"),
+    [
+        ("missing", {"acml_vol": "1234"}),                      # stck_prpr 결측
+        ("empty", {"stck_prpr": "", "acml_vol": "1234"}),       # 빈 문자열
+        ("unparseable", {"stck_prpr": "N/A", "acml_vol": "1"}),  # 파싱 불가
+    ],
+)
+async def test_get_quote_raises_when_price_missing_or_unparseable(monkeypatch, case, output):
+    """현재가 결측·파싱실패를 0 으로 뭉개지 않고 KisError 로 알린다.
+
+    이전엔 `_dec` 가 조용히 Decimal(0) 을 반환해, 러너의 REST 폴백이 0 원을 "정상
+    현재가"로 리턴하고 손절 게이트가 −100% 하락으로 오독했다. 토스 구현
+    (`toss.py::get_quote`)과 동일하게 예외로 알린다.
+    """
+    from app.services.kis.client import KisError
+
+    client, _ = _client(
+        monkeypatch, [_ok(output)], app_key=f"k-quote-bad-{case}",
+    )
+
+    with pytest.raises(KisError):
+        await client.get_quote("005930")
 
 
 async def test_get_balance_retries_on_rate_limit_then_succeeds(monkeypatch):

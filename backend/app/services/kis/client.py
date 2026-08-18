@@ -227,13 +227,44 @@ class KisClient:
 
     @staticmethod
     def _dec(o: dict, key: str) -> Decimal:
+        """부가 필드용 관대한 Decimal 파싱 — 결측·파싱실패는 0으로 채운다.
+
+        0 기본값은 등락(`prdy_vrss`·`prdy_ctrt`)·고저·시가에 한해 의도된 동작이다.
+        이 필드들의 유일한 소비처는 조회 API(`app/api/routes/kis.py::get_quote` 응답)로,
+        엔진의 주문·리스크 경로는 이 값들을 읽지 않는다(토스 구현도 이 필드들을 아예
+        채우지 않고 0 으로 둔다). 반면 매매 판단의 근거인 현재가(`stck_prpr`)는 이
+        헬퍼를 쓰지 않고 `_price` 로 엄격 검증한다 — 결측을 0 으로 뭉개면 하류의
+        손절 판정이 "가격이 0 까지 폭락"으로 오독한다.
+        """
         try:
             return Decimal(str(o.get(key) or 0))
         except (ValueError, ArithmeticError):
             return Decimal("0")
 
+    @staticmethod
+    def _price(o: dict, symbol: str) -> Decimal:
+        """현재가(`stck_prpr`)를 엄격 파싱한다. 결측·파싱실패면 KisError.
+
+        결측/파싱실패를 0 으로 대체하지 않는다(값의 부재와 "가격 0" 은 다른 사건이다).
+        토스 구현(`toss.py::get_quote`)과 동일한 규약이며, 호출부는 예외를 "현재가
+        조회 실패"로 받아 그 주기를 건너뛴다(무행동=보유 유지).
+        """
+        raw = o.get("stck_prpr")
+        if raw is None or str(raw).strip() == "":
+            raise KisError(f"시세 응답에 현재가(stck_prpr)가 없습니다: {symbol}")
+        try:
+            return Decimal(str(raw).strip())
+        except (ValueError, ArithmeticError) as e:
+            raise KisError(f"시세 현재가 파싱 실패: {symbol} stck_prpr={raw!r}") from e
+
     async def get_quote(self, symbol: str) -> Quote:
-        """정규화된 현재가 시세(BrokerClient 인터페이스)."""
+        """정규화된 현재가 시세(BrokerClient 인터페이스).
+
+        현재가가 결측·파싱불가면 KisError 를 던진다. 값 자체가 0 이하인 경우는 여기서
+        막지 않는다 — 정지 여부 게이트(`base_runner._halt_gate_passed`)는 예외를
+        "정지 여부 모름"으로 취급해 주문을 통과시키므로, 0 가격 판정은 가격을 실제로
+        쓰는 호출부(러너의 현재가 조회·리스크 손절 게이트)에서 한다.
+        """
         o = await self.get_current_price(symbol)
         try:
             volume = int(float(o.get("acml_vol") or 0))
@@ -242,7 +273,7 @@ class KisClient:
         status_code = str(o.get("iscd_stat_cls_code") or "").strip()
         return Quote(
             symbol=symbol,
-            price=self._dec(o, "stck_prpr"),
+            price=self._price(o, symbol),
             change=self._dec(o, "prdy_vrss"),
             change_rate=self._dec(o, "prdy_ctrt"),
             volume=volume,
