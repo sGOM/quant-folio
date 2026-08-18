@@ -551,7 +551,7 @@ const DEFAULT_SUGGEST = ["AAPL", "TSLA", "NVDA"];
  * @param broker    주문 브로커(시세 미연동 시 안내·플레이스홀더 결정)
  * @param tossQuote 통합 시세(토스) 연동 여부
  */
-function Watchlist({
+export function Watchlist({
   broker,
   tossQuote,
 }: {
@@ -578,7 +578,11 @@ function Watchlist({
   // 변경 시 영속(복원 전에는 쓰지 않는다).
   useEffect(() => {
     if (!hydrated.current) return;
-    localStorage.setItem(WATCHLIST_KEY, JSON.stringify(symbols));
+    try {
+      localStorage.setItem(WATCHLIST_KEY, JSON.stringify(symbols));
+    } catch {
+      /* quota 초과 등 저장 실패 — 화면 상태는 이미 정상이므로 조용히 무시 */
+    }
   }, [symbols]);
 
   function add(raw: string) {
