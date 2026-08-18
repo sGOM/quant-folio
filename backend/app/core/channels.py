@@ -59,6 +59,20 @@ def position_lock_key(user_id: int, symbol: str) -> str:
     return f"{POSITION_LOCK_PREFIX}{user_id}:{symbol}"
 
 
+# 주문 단위 체결 정합 직렬화 락 프리픽스 — 같은 주문의 체결을 여러 경로가 동시에
+# 반영하는 것을 막는다. 체결 반영 경로가 셋(executor 즉시체결·reconcile 주기 폴링·
+# fill_notice 실시간 체결통보)이라, reconcile 폴링과 실시간 체결통보가 같은 주문의
+# executions 합을 커밋 전에 동시에 읽어 같은 체결을 이중 기록·이중 가산할 수 있다.
+# 두 경로가 이 키를 공유(SET NX)해 주문 단위로 상호 배제된다.
+RECONCILE_LOCK_PREFIX = "reconcile:lock:"
+RECONCILE_LOCK_TTL = 30  # 초
+
+
+def reconcile_lock_key(order_id: int) -> str:
+    """주문 단위 체결 정합 락 키(reconcile 폴링·실시간 체결통보 공유)."""
+    return f"{RECONCILE_LOCK_PREFIX}{order_id}"
+
+
 # 마지막 DB 백업 성공 시각(ISO) — worker.backup_database 가 기록, worker.check_backup_freshness
 # (§9)·엔진 헬스 API 가 조회. TTL 없이 최신값만 유지.
 BACKUP_LAST_SUCCESS_KEY = "backup:last_success_at"
