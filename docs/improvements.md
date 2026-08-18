@@ -1512,4 +1512,52 @@ vitest devDependency 미설치로 이번 세션에서는 미실행, `npx tsc --n
 구현됐던 것을 오늘(2026-08-18) 재확인 후 현재 main 기준으로 재적용했다(원본
 PR은 base가 오래돼 그대로 머지할 수 없어 close, 커밋을 cherry-pick).
 
+## 60. `auth`/`engine` 라우트 테스트 커버리지 0 해소 ✅
+
+`register`/`login`/`logout`/`me`/`update_me` 핸들러와 모든 인증 요청이 거치는
+의존성 `get_current_user`(`app/api/deps.py`), 실거래 진입/중지를 트리거하는
+`app/api/routes/engine.py`의 `start_strategy`/`stop_strategy`가 단 한 번도
+직접 테스트된 적이 없었다.
+
+`test_auth_routes.py`(신설): 회원가입(이메일 중복 409·비밀번호 해싱),
+로그인(성공 시 쿠키 발급+실패 카운터 리셋, 실패 시 401+카운터 증가, 브루트포스
+임계 도달 시 429), 로그아웃, `me`/`update_me`를 검증. `get_current_user`는
+쿠키 없음/세션 무효/DB에 사용자 없음/정상 세션 4분기 모두 검증.
+
+`test_engine_control_routes.py`(신설): `user_has_credentials` 자격증명 체크가
+DB 상태 변경·Redis 발행보다 먼저 실행되는지(순서 회귀 방지), `_get_owned`의
+소유권 체크로 타인 전략에 대한 start/stop이 404로 차단되는지(IDOR 방지) 검증.
+
+**실제 버그는 발견되지 않았다** — 두 라우트 모두 계약대로 동작했다. 목적은
+순수 커버리지 확보.
+
+**검증**: `pytest tests/test_auth_routes.py tests/test_engine_control_routes.py`
+20 passed. 전체 스위트 888 passed(기존 무관 실패 2건+에러 2건 제외).
+
+## 61. 체결품질 M2 노출·`LineChart` 테스트·App Router 에러 바운더리 — 해소 ✅
+
+`backend/app/services/backtest/fill_quality.py`가 계산하는 M2(`m2_time` —
+라이브가 체결한 당일 종가와 백테스트가 가정하는 익일 종가 사이의 시장 이동)가
+`lib/api.ts::FillQualityReport.m2_time` 타입으로만 정의되고
+`app/monitor/page.tsx::FillQualityPanel`은 M1/M3만 카드로 렌더해 완전히
+버려지고 있었다. M2는 백엔드 `grades`에 별도 등급이 없는 진단 보조 지표라는
+점을 확인한 뒤, M1/M3 사이에 M2 카드를 추가하고 "참고용, 별도 등급 없음"
+문구로 명시했다(`FillQualityMetric`의 `grade` prop을 선택적으로 확장).
+
+프로젝트 전체가 의존하는 자체 SVG 차트(외부 라이브러리 미사용 정책)에 테스트가
+0건이라 `LineChart.test.tsx` 신설로 NaN/Infinity 필터링, span=0(전 구간
+동일값) 0 나눗셈 방지, 데이터 2개 미만 시 안내 문구, `OverlayLineChart`의
+"두 시리즈 길이가 달라도 각자 인덱스 기준 독립 정규화" 계약을 검증했다.
+
+`frontend/app`에 App Router 최상위 `error.tsx`가 0건이라 컴포넌트 렌더 중
+예외가 나면 Next.js 기본 에러 화면으로 전체가 깨지고 재시도 경로가 없었다 —
+`app/error.tsx` 신설(`'use client'`, "다시 시도"/"새로고침" 버튼).
+
+**검증**: `npx tsc --noEmit` 변경 파일 타입 오류 없음(vitest 모듈 오류는 호스트
+devDependency 미설치로 무관). vitest 실행은 docker 미기동으로 미검증.
+
+**참고**: §60·§61도 §58·§59와 같은 미머지 PR(#104, base 오래돼 close)에서
+이미 구현됐던 것을 오늘 재확인 후 현재 main 기준으로 재적용했다. 원본의
+§41·§42는 번호가 재사용돼 §60·§61로 새로 기록한다.
+
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.
