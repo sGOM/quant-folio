@@ -9,6 +9,12 @@
 동시에 존재한다. 이 모듈도 반드시 `engine/reconcile.py._order_recorded_qty` 와
 동일한 "이미 기록된 누적 체결수량 대비 델타만 반영" 방식을 써서 중복 기록을 막는다.
 
+다만 델타 방식만으로는 부족하다 — "이미 기록된 수량 읽기 → record_fill → commit" 은
+read-then-write 구간이라, WS 통보 처리와 reconcile 스윕(60초 주기)이 겹치면 둘 다
+already=0 을 읽고 각자 같은 체결을 기록해 이중 가산될 수 있다(매수는 포지션 과다,
+매도는 `engine/fills.py` 의 오버셀 클램프 오작동). 그래서 이 구간을 reconcile 과
+**같은 주문 단위 분산 락 키**로 감싼다(아래 apply_fill_notice 참고).
+
 ── 중요한 미검증 가정(실계정으로 확인 전까지의 설계 결정) ──────────────────────
 1) KIS 체결통보 프레임의 체결수량(CNTG_QTY) 필드를 "이 주문의 누적 체결수량"으로
    간주해 `_order_recorded_qty` 델타 방식을 적용한다. 만약 실계정에서 이 필드가
@@ -46,7 +52,11 @@ from app.core.database import AsyncSessionLocal
 from app.models import Order
 from engine.fills import publish_event, record_fill
 from engine.kis_ws import issue_approval_key
-from engine.reconcile import _order_recorded_qty
+from engine.reconcile import (
+    _RECONCILE_LOCK_PREFIX,
+    _RECONCILE_LOCK_TTL,
+    _order_recorded_qty,
+)
 
 logger = logging.getLogger("engine.fill_notice")
 
@@ -131,6 +141,19 @@ async def apply_fill_notice(user_id: int, notice: FillNoticeData, redis) -> bool
 
     reconcile.py 와 동일하게 "이미 기록된 누적 체결수량" 대비 델타만 record_fill 에
     넘겨 executor 즉시체결·reconcile 폴링과 중복 기록되지 않게 한다.
+
+    델타 계산(read)과 기록(write) 사이에 reconcile 스윕이 끼어들면 둘 다 같은
+    `already` 를 읽어 같은 체결을 두 번 기록하므로, 그 구간을 reconcile 과 **동일한**
+    주문 단위 락 키(`reconcile:lock:{order.id}`)로 직렬화한다. 키를 공유하는 것이
+    이 방어의 핵심이다 — 접두어가 다르면 서로를 배제하지 못해 락이 무의미해진다.
+    (`app.core.channels.ORDER_LOCK_PREFIX` 는 order.id 가 아니라 idempotency_key 로
+    스코프된 executor 전용 키라 여기서는 쓸 수 없다.)
+
+    락 획득 실패 시 reconcile.py·executor.py 와 동일하게 재시도 없이 이번 통보를
+    스킵한다(중복 기록보다 스킵이 안전). 다만 **모의투자 매도** 통보를 스킵하면
+    자동 복구되지 않는다 — reconcile 의 잔고 폴백은 매수 전용이고(reconcile.py 의
+    `order.side != OrderSide.BUY` 조기 반환), 모의투자 일별체결조회는 늘 비어 있기
+    때문이다. 그래서 debug 가 아니라 warning 으로 남긴다.
     """
     async with AsyncSessionLocal() as db:
         order = await db.scalar(
@@ -143,20 +166,37 @@ async def apply_fill_notice(user_id: int, notice: FillNoticeData, redis) -> bool
             )
             return False
 
-        already = await _order_recorded_qty(db, order.id)
-        target = int(order.qty)
-        delta = notice.qty - already
-        if delta <= 0:
-            logger.debug(
-                "체결통보 중복/이미 반영 — 스킵 odno=%s 누적통보=%d 기록됨=%d",
-                notice.odno, notice.qty, already,
+        # ── 여기부터 commit 까지가 read-then-write 임계구간 ──
+        lock_key = f"{_RECONCILE_LOCK_PREFIX}{order.id}"
+        if not await redis.set(lock_key, "1", nx=True, ex=_RECONCILE_LOCK_TTL):
+            logger.warning(
+                "체결통보 스킵(다른 프로세스가 같은 주문 정합 중) order=%s odno=%s 누적통보=%d",
+                order.id, notice.odno, notice.qty,
             )
             return False
 
-        fully = (already + delta) >= target
-        price = notice.price if notice.price and notice.price > 0 else order.price
-        await record_fill(db, order, delta, price, fully_filled=fully, redis=redis)
-        await db.commit()
+        try:
+            # `already` 는 반드시 락 획득 이후에 읽는다(락 이전 값은 경쟁 상대의 커밋을
+            # 못 본 stale 값일 수 있다). Postgres READ COMMITTED 는 문장마다 새 스냅샷을
+            # 잡으므로, 이 시점 조회는 상대가 커밋한 executions 를 포함한다.
+            already = await _order_recorded_qty(db, order.id)
+            target = int(order.qty)
+            delta = notice.qty - already
+            if delta <= 0:
+                logger.debug(
+                    "체결통보 중복/이미 반영 — 스킵 odno=%s 누적통보=%d 기록됨=%d",
+                    notice.odno, notice.qty, already,
+                )
+                return False
+
+            fully = (already + delta) >= target
+            price = notice.price if notice.price and notice.price > 0 else order.price
+            await record_fill(db, order, delta, price, fully_filled=fully, redis=redis)
+            await db.commit()
+        finally:
+            # 중복 통보(delta<=0)가 흔한 경로라, 여기서 놓치면 TTL 30초 동안 키가 남아
+            # 다음 reconcile 스윕이 이 주문을 통째로 건너뛴다. 반드시 finally 로 푼다.
+            await redis.delete(lock_key)
 
         await publish_event(redis, {
             "type": "execution", "user_id": user_id, "order_id": order.id,
