@@ -341,3 +341,72 @@ async def test_lock_skip_when_another_process_holds_lock(monkeypatch):
 
     assert stats == {"checked": 0, "filled": 0, "partial": 0, "errors": 0}
     assert broker_created == []
+
+
+async def test_unconfirmed_pending_order_without_kis_id_resolved_via_paper_balance(monkeypatch):
+    """executor 의 order_unconfirmed 경로가 남긴 주문(PENDING·kis_order_id=None)은
+    일별체결조회 키가 없어 실전 경로를 못 타지만, 모의투자 BUY 는 잔고 폴백으로
+    자기수렴돼 고아화되지 않는다. get_order_execution 은 주문번호가 없어 아예
+    호출조차 되지 않아야 한다(None 을 넘겨 브로커를 깨우지 않음)."""
+    user = User(email="t@example.com", password_hash="x")
+    user.id = 1
+    order = _order(1, user_id=1, qty=10, side=OrderSide.BUY, status=OrderStatus.PENDING)
+    order.kis_order_id = None  # 접수 결과 불명 — 주문번호 미수신
+    session = _FakeSession([order], user)
+    redis = FakeRedis()
+    calls = _record_fill_spy(monkeypatch)
+    _patch_recorded_qty(monkeypatch, order_qty=0, symbol_qty=0)
+    monkeypatch.setattr(reconcile, "settings", type("S", (), {"is_paper_trading": True})())
+
+    exec_calls = []
+
+    class _NoIdBroker(_FakeBroker):
+        async def get_order_execution(self, order_id, symbol=None):
+            exec_calls.append(order_id)
+            return await super().get_order_execution(order_id, symbol)
+
+    broker = _NoIdBroker(
+        balance_positions=[{"symbol": "005930", "qty": 10, "avg_price": "71000"}],
+    )
+    monkeypatch.setattr(reconcile, "make_broker_for_user", lambda _u: broker)
+
+    stats = await reconcile.reconcile_open_orders(session, redis)
+
+    assert exec_calls == []  # 주문번호 없어 일별체결조회를 건너뛴다.
+    assert len(calls) == 1
+    assert calls[0]["qty"] == 10  # 잔고 보유 10주 전량 이 주문에 배정
+    assert calls[0]["fully_filled"] is True
+    assert stats["filled"] == 1
+
+
+async def test_unconfirmed_pending_order_alerts_when_balance_cannot_resolve(monkeypatch):
+    """잔고 교차확인으로도 못 밝히면(실전이거나, 모의투자인데 잔고에도 없으면)
+    자동 재주문하지 않고 critical 알림으로 사람에게 넘긴다."""
+    user = User(email="t@example.com", password_hash="x")
+    user.id = 1
+    order = _order(1, user_id=1, qty=10, side=OrderSide.BUY, status=OrderStatus.PENDING)
+    order.kis_order_id = None
+    session = _FakeSession([order], user)
+    redis = FakeRedis()
+    calls = _record_fill_spy(monkeypatch)
+    _patch_recorded_qty(monkeypatch, order_qty=0, symbol_qty=0)
+    monkeypatch.setattr(reconcile, "settings", type("S", (), {"is_paper_trading": False})())
+    broker = _FakeBroker(balance_positions=[])
+    monkeypatch.setattr(reconcile, "make_broker_for_user", lambda _u: broker)
+
+    alerts_published: list[dict] = []
+
+    async def _fake_publish_alert(_redis, **kwargs):
+        alerts_published.append(kwargs)
+
+    monkeypatch.setattr(reconcile, "publish_alert", _fake_publish_alert)
+
+    stats = await reconcile.reconcile_open_orders(session, redis)
+
+    assert calls == []  # 자동 재주문·자동 확정 없음
+    assert order.status == OrderStatus.PENDING  # 상태를 임의로 바꾸지 않는다
+    assert len(alerts_published) == 1
+    alert = alerts_published[0]
+    assert alert["severity"] == "critical"
+    assert alert["code"] == "order_unconfirmed"
+    assert stats["filled"] == 0 and stats["partial"] == 0

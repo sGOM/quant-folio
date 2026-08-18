@@ -13,6 +13,8 @@ FakeBroker·FakeRedis 를 쓰되, execute_signal 은 세션을 인자로 직접 
 import json
 from decimal import Decimal
 
+import httpx
+import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app.core.channels import ORDER_LOCK_PREFIX
@@ -158,6 +160,54 @@ async def test_broker_rejection_marks_order_rejected_and_publishes_event():
         json.loads(data) for _, data in redis.published if json.loads(data).get("status") == "rejected"
     ]
     assert len(rejected_events) >= 1
+
+
+async def test_network_error_on_place_order_keeps_pending_alerts_and_reraises(monkeypatch):
+    """place_order 가 BrokerError 가 아닌 네트워크/파싱 예외(httpx.TimeoutException 등)를
+    던지면 — 응답 수신 실패라 실제로는 브로커에 주문이 도달·체결됐을 수 있는 흔한 패턴 —
+    REJECTED 로 확정하지 않고 PENDING(주문번호 없음) 그대로 두어 reconcile 이 잔고로
+    교차확인하게 하고, critical 알림을 발행한 뒤 예외를 재전파한다(러너의 연속실패
+    카운터가 반복 장애를 인지하도록 — 모듈 docstring 3 참고)."""
+
+    class _FlakyBroker(FakeBroker):
+        async def place_order(self, *a, **k):
+            raise httpx.TimeoutException("read timeout")
+
+    store = _Store()
+    db = FakeDB(store)
+    redis = FakeRedis()
+    broker = _FlakyBroker({_SYMBOL: 70_000})
+
+    alerts_published: list[dict] = []
+
+    async def _fake_publish_alert(_redis, **kwargs):
+        alerts_published.append(kwargs)
+
+    monkeypatch.setattr("engine.executor.publish_alert", _fake_publish_alert)
+
+    with pytest.raises(httpx.TimeoutException):
+        await execute_signal(
+            db, redis, broker, user_id=_USER_ID, strategy_id=_STRATEGY_ID, symbol=_SYMBOL,
+            side="buy", qty=10, price=Decimal("70000"), idempotency_key=_key(),
+        )
+
+    orders = store.all(Order)
+    assert len(orders) == 1
+    order = orders[0]
+    # REJECTED 로 오판하지 않는다 — 실제 체결분이 무관리 상태로 남지 않도록 보수적 처리.
+    assert order.status == OrderStatus.PENDING
+    assert order.kis_order_id is None  # 주문번호 미수신
+    # 팬텀 포지션·체결을 만들지 않는다.
+    assert store.all(Execution) == []
+    assert store.all(Position) == []
+    # 사람이 확인하도록 critical 알림이 발행됐다.
+    assert len(alerts_published) == 1
+    alert = alerts_published[0]
+    assert alert["severity"] == "critical"
+    assert alert["code"] == "order_unconfirmed"
+    # 락은 finally 에서 반드시 해제돼 같은 신호봉 재시도가 영구 차단되지 않는다
+    # (idempotency_key UNIQUE 제약이 실제 중복주문 방지선 — 락은 동시 진입 차단용).
+    assert redis.store.get(f"{ORDER_LOCK_PREFIX}{_key()}") is None
 
 
 async def test_zero_fill_keeps_order_submitted_without_execution_or_position():
