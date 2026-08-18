@@ -165,6 +165,19 @@ async def test_check_stop_loss_false_for_zero_avg_price(store, db):
     assert await risk.check_stop_loss(db, _USER, _A, _SYMBOL, Decimal("100")) is False
 
 
+@pytest.mark.parametrize("bad_price", [Decimal("0"), Decimal("-1")])
+async def test_check_stop_loss_false_for_nonpositive_current_price(store, db, bad_price):
+    """현재가 0 이하(시세 결측이 흘러든 값)는 손절 판정 대상이 아니다.
+
+    이전엔 (avg−0)/avg = 100% 하락으로 계산돼 어떤 stop_loss_pct 설정이든 충족시켜,
+    실제 가격 변동 없이 데이터 결측만으로 전량 손절이 발동했다.
+    """
+    _limit(store, strategy_id=_A, stop_loss_pct=Decimal("0.1"))
+    _position(store, strategy_id=_A, qty=10, avg_price=100000)
+
+    assert await risk.check_stop_loss(db, _USER, _A, _SYMBOL, bad_price) is False
+
+
 # ─────────────────────────── _aggregate_position ───────────────────────────
 async def test_aggregate_position_weights_average_price_by_quantity(store, db):
     _position(store, strategy_id=_A, qty=10, avg_price=100000)
