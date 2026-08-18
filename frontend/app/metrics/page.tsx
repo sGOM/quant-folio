@@ -31,7 +31,7 @@ import {
   TooltipProvider,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { fmtPct, fmtNum, fmtAmt, pctColor } from "@/lib/format";
+import { fmtPct, fmtNum, fmtAmt, formatKRW, formatNumber, pctColor } from "@/lib/format";
 
 /** 종합점수(score) 계산 방식 설명 — 헤더 툴팁·안내에 공용으로 사용. */
 const SCORE_HINT =
@@ -434,7 +434,7 @@ function StocksTab() {
         {data && (
           <span className="ml-auto flex items-center gap-1 text-xs text-muted-foreground">
             <Info className="h-3.5 w-3.5" />
-            기준일: {fmtDate(data.as_of)} · 종합점수 상위 {data.count.toLocaleString("ko-KR")}종목
+            기준일: {fmtDate(data.as_of)} · 종합점수 상위 {formatNumber(data.count)}종목
           </span>
         )}
       </div>
@@ -529,7 +529,7 @@ function StockRow({ row }: { row: StockMetric }) {
       </td>
       {/* 가격 */}
       <td className="px-3 py-2 text-right tabular-nums">
-        {row.price == null ? "-" : row.price.toLocaleString("ko-KR")}
+        {row.price == null ? "-" : formatKRW(row.price, false)}
       </td>
       <td
         className={cn(
@@ -821,7 +821,7 @@ function PanicCard({ item }: { item: PanicMarket }) {
         <span>브레드스축 {item.breadth_sub == null ? "-" : Math.round(item.breadth_sub)}</span>
         <span>게이팅 {item.gated ? "충족" : "미충족"}</span>
         <span>60일고점대비 {fmtPct(item.dd60)}</span>
-        <span>유효종목 {item.universe.toLocaleString("ko-KR")}</span>
+        <span>유효종목 {formatNumber(item.universe)}</span>
       </div>
 
       {/* 시그널 분해 */}

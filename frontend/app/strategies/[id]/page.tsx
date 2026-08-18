@@ -21,7 +21,7 @@ import { TradeLogTable } from "@/components/TradeLogTable";
 import { DsrGradeBadge } from "@/components/DsrGradeBadge";
 import { summarizeConfig } from "@/lib/strategy";
 import { useSymbolNames } from "@/lib/useSymbolNames";
-import { fmtNum, fmtPct, pctColor } from "@/lib/format";
+import { fmtNum, fmtPct, formatKRW, pctColor } from "@/lib/format";
 import { alignOverlaySeries, fmtTrackingError } from "@/lib/tracking";
 
 // lib/format 공용 헬퍼에 이 화면의 표준 자릿수(2)만 입힌 별칭 — 포맷 로직 중복 금지.
@@ -172,8 +172,8 @@ function StrategyDetailContent({ sid }: { sid: number }) {
           <p className="mt-1 text-sm text-muted-foreground">
             {summarizeConfig(strategy.data.config)}
             {strategy.data.config.type === "rebalance"
-              ? ` · 배정자본 ${strategy.data.config.capital.toLocaleString()}원`
-              : ` · 초기자본 ${strategy.data.config.cash.toLocaleString()}원`}
+              ? ` · 배정자본 ${formatKRW(strategy.data.config.capital)}`
+              : ` · 초기자본 ${formatKRW(strategy.data.config.cash)}`}
           </p>
         )}
         {strategy.data?.description && (

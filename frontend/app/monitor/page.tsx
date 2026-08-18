@@ -44,7 +44,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { formatNumber, formatPercent, formatRelativeTime, trendColor } from "@/lib/format";
+import { formatKRW, formatNumber, formatPercent, formatRelativeTime, trendColor } from "@/lib/format";
 
 // 매매·체결 관련 이벤트 타입 — 어느 것이든 잔고/주문을 다시 가져온다.
 const TRADE_EVENTS = new Set(["execution", "order", "position", "fill", "signal"]);
@@ -401,8 +401,8 @@ function MonitorContent() {
               rows={
                 positions.data?.map((p) => [
                   nameOf(p.symbol),
-                  p.qty.toLocaleString(),
-                  p.avg_price.toLocaleString(),
+                  formatNumber(p.qty),
+                  formatKRW(p.avg_price, false),
                 ]) ?? []
               }
               empty="보유 포지션이 없습니다."
@@ -501,7 +501,7 @@ function OrderAuditTable({
                       {o.side === "buy" ? "매수" : "매도"}
                     </span>
                   </td>
-                  <td className="px-3 py-2 tabular-nums">{o.qty.toLocaleString()}</td>
+                  <td className="px-3 py-2 tabular-nums">{formatNumber(o.qty)}</td>
                   <td className="px-3 py-2">
                     <Tooltip>
                       <TooltipTrigger asChild>
