@@ -346,6 +346,65 @@ async def test_apply_fill_notice_no_matching_order_takes_no_lock(monkeypatch):
     assert redis.store == {}
 
 
+async def test_concurrent_reconcile_and_fill_notice_records_exactly_once(monkeypatch):
+    """reconcile 임계구역과 fill_notice 가 진짜로 동시에(asyncio.gather) 같은 주문을
+    처리해도, 공유 주문 단위 락으로 정확히 한 번만 기록된다.
+
+    위 락 테스트들은 락을 미리 store 에 심어두고 "이미 잡혀 있으면 스킵"만 확인한다 —
+    두 경로가 실제로 인터리브될 때도 안전한지는 증명하지 못한다(락을 통째로 지워도
+    통과하는 거짓 안전망이 될 수 있음). `_order_recorded_qty` 조회 직후 강제로
+    컨텍스트 스위치를 일으켜, 락이 없다면 두 경로가 똑같이 already=0 을 읽고 각자
+    기록하는 원래 버그가 재현되도록 만든다 — 락 코드를 되돌리면 이 테스트가 실패한다.
+    """
+    import asyncio
+
+    from engine import fill_notice
+    from engine.fills import record_fill
+    from engine.reconcile import _order_recorded_qty
+
+    class _RacySession(_FakeSession):
+        async def scalar(self, stmt):
+            result = await super().scalar(stmt)
+            if stmt.column_descriptions[0]["entity"] is Execution:
+                # already 조회 직후 — 원래 레이스가 발생하던 지점에서 강제 양보.
+                await asyncio.sleep(0)
+            return result
+
+    session = _RacySession()
+    order = _order(1, user_id=7, symbol="005930", qty=10, kis_order_id="ODNO099")
+    session.orders.append(order)
+    monkeypatch.setattr(fill_notice, "AsyncSessionLocal", lambda: session)
+    redis = _FakeRedis()
+
+    async def _reconcile_side() -> bool:
+        """reconcile_open_orders 의 임계구역(락→already 조회→record_fill→커밋→락 해제)을
+        같은 세션·레디스로 재현한다. fill_notice 와 동일한 락 키를 쓰는지가 핵심이다."""
+        lock_key = _lock_key(order.id)
+        if not await redis.set(lock_key, "1", nx=True, ex=30):
+            return False
+        try:
+            already = await _order_recorded_qty(session, order.id)
+            delta = 10 - already
+            if delta <= 0:
+                return False
+            await record_fill(
+                session, order, delta, Decimal("70000"), fully_filled=True, redis=redis
+            )
+            await session.commit()
+            return True
+        finally:
+            await redis.delete(lock_key)
+
+    notice = parse_fill_notice(_notice_plain("ODNO099", "005930", 10, "70000"))
+    results = await asyncio.gather(_reconcile_side(), apply_fill_notice(7, notice, redis))
+
+    assert results.count(True) == 1  # 정확히 한 경로만 기록
+    assert len(session.executions) == 1
+    assert sum(int(e.filled_qty) for e in session.executions) == 10
+    assert order.status == OrderStatus.FILLED
+    assert _lock_key(order.id) not in redis.store  # 양쪽 모두 종료 후 락 잔존 없음
+
+
 # ─────────────────────────── 5) KIS_HTS_ID 미설정 시 no-op ───────────────────────────
 
 

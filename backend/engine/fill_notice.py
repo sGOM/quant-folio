@@ -47,16 +47,13 @@ from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from sqlalchemy import select
 
+from app.core.channels import RECONCILE_LOCK_TTL, reconcile_lock_key
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models import Order
 from engine.fills import publish_event, record_fill
 from engine.kis_ws import issue_approval_key
-from engine.reconcile import (
-    _RECONCILE_LOCK_PREFIX,
-    _RECONCILE_LOCK_TTL,
-    _order_recorded_qty,
-)
+from engine.reconcile import _order_recorded_qty
 
 logger = logging.getLogger("engine.fill_notice")
 
@@ -144,10 +141,10 @@ async def apply_fill_notice(user_id: int, notice: FillNoticeData, redis) -> bool
 
     델타 계산(read)과 기록(write) 사이에 reconcile 스윕이 끼어들면 둘 다 같은
     `already` 를 읽어 같은 체결을 두 번 기록하므로, 그 구간을 reconcile 과 **동일한**
-    주문 단위 락 키(`reconcile:lock:{order.id}`)로 직렬화한다. 키를 공유하는 것이
-    이 방어의 핵심이다 — 접두어가 다르면 서로를 배제하지 못해 락이 무의미해진다.
-    (`app.core.channels.ORDER_LOCK_PREFIX` 는 order.id 가 아니라 idempotency_key 로
-    스코프된 executor 전용 키라 여기서는 쓸 수 없다.)
+    주문 단위 락(`app.core.channels.reconcile_lock_key`)으로 직렬화한다. 키를
+    공유하는 것이 이 방어의 핵심이다 — 접두어가 다르면 서로를 배제하지 못해 락이
+    무의미해진다. (`app.core.channels.ORDER_LOCK_PREFIX` 는 order.id 가 아니라
+    idempotency_key 로 스코프된 executor 전용 키라 여기서는 쓸 수 없다.)
 
     락 획득 실패 시 reconcile.py·executor.py 와 동일하게 재시도 없이 이번 통보를
     스킵한다(중복 기록보다 스킵이 안전). 다만 **모의투자 매도** 통보를 스킵하면
@@ -167,8 +164,8 @@ async def apply_fill_notice(user_id: int, notice: FillNoticeData, redis) -> bool
             return False
 
         # ── 여기부터 commit 까지가 read-then-write 임계구간 ──
-        lock_key = f"{_RECONCILE_LOCK_PREFIX}{order.id}"
-        if not await redis.set(lock_key, "1", nx=True, ex=_RECONCILE_LOCK_TTL):
+        lock_key = reconcile_lock_key(order.id)
+        if not await redis.set(lock_key, "1", nx=True, ex=RECONCILE_LOCK_TTL):
             logger.warning(
                 "체결통보 스킵(다른 프로세스가 같은 주문 정합 중) order=%s odno=%s 누적통보=%d",
                 order.id, notice.odno, notice.qty,
