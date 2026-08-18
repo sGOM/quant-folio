@@ -7,6 +7,22 @@
 
 체결 처리: 모의투자 검증 단계에서는 시장가 주문 접수를 즉시 체결로 간주해
 Execution·Position 을 갱신한다(정밀 체결 통보 연동은 5단계).
+
+주문 전송(place_order) 결과는 **세 갈래**이며 상태 전이가 각각 다르다.
+  1) 성공 → SUBMITTED(주문번호 기록) 후 체결 조회.
+  2) 증권사가 명시적으로 거부(BrokerError: HTTP 오류·rt_cd≠0) → REJECTED.
+     증권사까지 요청이 닿아 "접수되지 않음"이 확인된 경우이므로 실패로 확정해도 안전하다.
+  3) 그 밖의 예외(네트워크 타임아웃·연결 끊김·JSON 파싱 실패 등) → **접수 여부 불명**.
+     브로커 클라이언트는 httpx 예외를 BrokerError 로 감싸지 않으므로(app/services/kis/
+     client.py::_request_json) 이 예외들은 원형 그대로 올라온다. 요청이 증권사에 닿아
+     체결됐을 수도 있어 REJECTED 로 확정하면 실제 보유와 장부가 어긋난다. 그래서
+     PENDING(주문번호 없음) 그대로 두고 critical 알림을 올린 뒤 예외를 재전파한다.
+     회수는 engine/reconcile.py 의 자가치유 경로가 맡는다(주문번호 없는 PENDING 을
+     유예시간 후 잔고로 교차확인). 멱등성 키가 이미 이 행에 걸려 있어 다음 틱에
+     같은 신호로 재주문되지 않으므로, 이중 주문 위험 없이 대기시킬 수 있다.
+
+같은 이유로 틱 타임아웃(base_runner 의 asyncio.wait_for) 취소도 PENDING 을 남긴다
+(CancelledError 는 BaseException 이라 여기서 잡지 않는다) — 회수 경로는 3)과 동일하다.
 """
 from __future__ import annotations
 
@@ -25,6 +41,7 @@ from app.models import (
     OrderStatus,
 )
 from app.services.broker import BrokerClient, BrokerError
+from engine.alerts import publish_alert
 from engine.fills import publish_event as _publish
 from engine.fills import record_fill as _record_fill
 
@@ -108,6 +125,28 @@ async def execute_signal(
             await _publish(redis, {"type": "order", "user_id": user_id,
                                    "order_id": order.id, "status": "rejected", "symbol": symbol})
             return order
+        except Exception as e:  # noqa: BLE001 — 접수 여부 불명(네트워크 타임아웃 등)
+            # 증권사에 요청이 닿아 체결됐을 가능성이 남아 있으므로 REJECTED 로 확정하지
+            # 않는다(모듈 docstring 3). PENDING·주문번호 없음 그대로 두어 reconcile 이
+            # 잔고로 교차확인하게 하고, 조용한 장부 어긋남이 되지 않도록 즉시 알린다.
+            logger.exception("주문 접수 결과 불명 %s (%s %s %d주)", idempotency_key, side, symbol, qty)
+            try:
+                await publish_alert(
+                    redis,
+                    user_id=user_id,
+                    strategy_id=strategy_id,
+                    severity="critical",
+                    code="order_unconfirmed",
+                    message=(
+                        f"주문 접수 결과 불명 — {symbol} {side} {qty:,}주(주문 #{order.id}). "
+                        f"증권사 응답을 받지 못해 접수·체결 여부를 알 수 없습니다. "
+                        f"실제 체결됐을 수 있어 재주문하지 않고 대기시킵니다"
+                        f"(정합 루프가 잔고로 교차확인). 원인: {e!r}"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — 알림 실패가 원인 예외를 가리면 안 된다.
+                logger.warning("접수 불명 알림 발행 실패(무시) %s", idempotency_key, exc_info=True)
+            raise
 
         # 5) 실제 체결 조회 후 기록 + 포지션 갱신.
         #    시장가라도 실제 체결가는 신호 시점가(price)와 다르므로,
