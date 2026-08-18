@@ -155,11 +155,42 @@ def cached_frame(
         # (index_members 의 §47 재발 형태와 동일). 트레이드오프: 진짜 휴장일·무실적
         # 구간도 매 호출 재조회하지만, 백테스트는 거래일만 순회하므로 실비용은 작다.
         final = False
+    elif final and _has_all_null_column(read_local()):
+        # row_count(원격 원본 df 기준) 만으로는 컬럼 단위 강제변환 실패를 못
+        # 잡는다 — 소스가 컬럼 포맷을 바꿔(예: 로케일 문자열) coerce.py 가 그
+        # 컬럼의 모든 값을 None 으로 떨어뜨려도 row_count 는 그대로다. df(원격
+        # 원본)가 아니라 방금 write_local() 이 커밋한 값을 read_local() 로 다시
+        # 읽어 검사해야 한다 — 강제변환은 write_local 내부에서 일어나 df 자체는
+        # 멀쩡해 보인다. 여기서 확정하면 그 컬럼이 read_local() 빠른 경로로
+        # 영구 NULL 이 된다(§49 row 단위 0행 고착 버그의 컬럼 단위 변종).
+        # "컬럼 전체가 None"이라는 명백한 신호만 보고, 부분 결측(정상적인
+        # 결측치 섞임)은 여기서 걸지 않는다.
+        #
+        # 주의(범위 밖): read_local() 이 write 직후 0행을 돌려주는 경우(예: §49
+        # B1 — market 태그 없이 적재된 행이 markets 필터에 전부 걸러짐)는 이
+        # 가드가 잡지 않는다. 그 케이스까지 잡으려 하면 기존 계약 테스트
+        # (test_is_final_콜러블은_외부조회_뒤에_평가된다 — read_local 이 write_local
+        # 과 무관하게 항상 빈 프레임을 주는 스텁을 쓴다)와 충돌한다.
+        logger.warning(
+            "로컬 적재 컬럼 전체 결측 감지 — 확정 보류: %s %s", source, cache_key
+        )
+        final = False
     led.put(source, cache_key, row_count=row_count, final=final)
     logger.debug(
         "로컬 적재: %s %s rows=%d final=%s", source, cache_key, len(df), final
     )
     return df
+
+
+def _has_all_null_column(df: pd.DataFrame) -> bool:
+    """모든 값이 결측인 컬럼이 하나라도 있는가.
+
+    임계값을 튜닝하지 않는다 — "컬럼 전체가 None"이라는 명백한 실패 신호만 본다.
+    일부 종목만 결측인 정상적인 경우(신규상장 등)는 여기 걸리지 않는다.
+    """
+    if df.empty:
+        return False
+    return any(df[c].isna().all() for c in df.columns)
 
 
 def _covers(intervals: list[tuple[date, date]], start: date, end: date) -> bool:

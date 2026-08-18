@@ -48,6 +48,19 @@ def write_daily(trade_day: date, df: pd.DataFrame, *, columns: dict[str, str]) -
     if not present:
         return
 
+    if df.index.has_duplicates:
+        # 같은 (trade_date, symbol) 이 한 다중행 INSERT 안에 두 번 들어가면 Postgres 가
+        # "ON CONFLICT DO UPDATE command cannot affect row a second time" 로 거부해
+        # 그 값이 DataSourceError 가 아니므로 상위 예외 처리에 안 잡히고 호출자를
+        # 그대로 크래시시킨다(예: 시장전환일 등으로 같은 티커가 KOSPI/KOSDAQ 양쪽
+        # 응답에 함께 실려 concat 된 경우). INSERT 구성 전에 미리 정리한다.
+        dupes = int(df.index.duplicated().sum())
+        logger.warning(
+            "stock_daily_snapshots 중복 티커 %d건 제거(마지막 값 사용): %s",
+            dupes, trade_day,
+        )
+        df = df[~df.index.duplicated(keep="last")]
+
     rows: list[dict] = []
     for ticker, r in df.iterrows():
         row: dict = {"trade_date": trade_day, "symbol": str(ticker).zfill(6)}
