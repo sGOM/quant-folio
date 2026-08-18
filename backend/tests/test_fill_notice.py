@@ -7,6 +7,9 @@
   3) 델타 멱등(같은 누적체결수량 재통보는 스킵)
   4) 부분체결 → 전량체결 순차 통보의 누적 반영(중복 없음)
   5) KIS_HTS_ID 미설정 시 매니저 no-op
+  6) reconcile 과 공유하는 주문 단위 분산 락(획득 실패 시 스킵, 모든 경로에서 해제)
+
+레디스 대역은 conftest.FakeRedis 를 쓴다(SET NX/EX·delete 지원 — 락 동작 검증에 필요).
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ from engine.fill_notice import (
     apply_fill_notice,
     parse_fill_notice,
 )
+from tests.conftest import FakeRedis as _FakeRedis  # SET NX/EX·delete 지원 대역 재사용
 
 _KEY = "01234567890123456789012345678901"  # 32바이트(AES-256)
 _IV = "0123456789012345"  # 16바이트
@@ -163,13 +167,9 @@ class _FakeSession:
         return None
 
 
-class _FakeRedis:
-    def __init__(self):
-        self.published: list[tuple[str, str]] = []
-
-    async def publish(self, channel, data):
-        self.published.append((channel, data))
-        return 1
+def _lock_key(order_id: int) -> str:
+    """apply_fill_notice 가 reconcile 과 **공유**하는 주문 단위 락 키."""
+    return f"reconcile:lock:{order_id}"
 
 
 def _order(order_id: int, user_id: int, symbol: str, qty: int, kis_order_id: str) -> Order:
@@ -265,6 +265,85 @@ async def test_partial_then_full_fill_accumulates_without_duplication(monkeypatc
     # 첫 4주 + 이번 델타 6주 = 누적 10주. 중복 기록 없이 정확히 두 건.
     assert len(session.executions) == 2
     assert sum(int(e.filled_qty) for e in session.executions) == 10
+
+
+# ─────────────────────────── 6) 주문 단위 분산 락 ───────────────────────────
+
+
+async def test_apply_fill_notice_skips_when_order_lock_held(monkeypatch):
+    """reconcile 이 같은 주문을 정합 중이면(락 보유) 통보를 반영하지 않는다.
+
+    락이 없던 시절엔 WS 통보와 60초 reconcile 스윕이 둘 다 already=0 을 읽어 같은
+    체결을 이중 기록할 수 있었다. 락 키는 reconcile 과 **동일**해야 상호배제가 성립한다.
+    """
+    from engine import fill_notice
+
+    session = _FakeSession()
+    order = _order(1, user_id=7, symbol="005930", qty=10, kis_order_id="ODNO004")
+    session.orders.append(order)
+    monkeypatch.setattr(fill_notice, "AsyncSessionLocal", lambda: session)
+
+    redis = _FakeRedis()
+    redis.store[_lock_key(order.id)] = "1"  # 다른 프로세스(reconcile)가 이미 보유
+
+    notice = parse_fill_notice(_notice_plain("ODNO004", "005930", 10, "71000"))
+    applied = await apply_fill_notice(7, notice, redis)
+
+    assert applied is False
+    assert session.executions == []
+    assert redis.published == []
+    # 남의 락을 뺏거나 지우지 않는다.
+    assert redis.store[_lock_key(order.id)] == "1"
+
+
+async def test_apply_fill_notice_releases_lock_on_success(monkeypatch):
+    from engine import fill_notice
+
+    session = _FakeSession()
+    order = _order(1, user_id=7, symbol="005930", qty=10, kis_order_id="ODNO005")
+    session.orders.append(order)
+    monkeypatch.setattr(fill_notice, "AsyncSessionLocal", lambda: session)
+    redis = _FakeRedis()
+
+    notice = parse_fill_notice(_notice_plain("ODNO005", "005930", 10, "71000"))
+    assert await apply_fill_notice(7, notice, redis) is True
+    assert _lock_key(order.id) not in redis.store
+
+
+async def test_apply_fill_notice_releases_lock_on_duplicate_skip(monkeypatch):
+    """중복 통보(델타 0)로 조기 반환할 때도 락을 반드시 푼다.
+
+    이 경로가 가장 흔하므로(KIS 는 누적수량을 반복 통보), 여기서 락이 새면 TTL 30초
+    동안 키가 남아 다음 reconcile 스윕이 해당 주문을 통째로 건너뛴다.
+    """
+    from engine import fill_notice
+
+    session = _FakeSession()
+    order = _order(1, user_id=7, symbol="005930", qty=10, kis_order_id="ODNO006")
+    session.orders.append(order)
+    monkeypatch.setattr(fill_notice, "AsyncSessionLocal", lambda: session)
+    redis = _FakeRedis()
+
+    notice = parse_fill_notice(_notice_plain("ODNO006", "005930", 4, "70000"))
+    assert await apply_fill_notice(7, notice, redis) is True
+    assert _lock_key(order.id) not in redis.store
+
+    # 같은 누적수량 재통보 → 델타 0 스킵. 그래도 락은 남지 않아야 한다.
+    assert await apply_fill_notice(7, notice, redis) is False
+    assert _lock_key(order.id) not in redis.store
+
+
+async def test_apply_fill_notice_no_matching_order_takes_no_lock(monkeypatch):
+    """주문 매칭 실패 시엔 락을 잡지 않는다(order.id 가 없어 잠글 대상 자체가 없음)."""
+    from engine import fill_notice
+
+    session = _FakeSession()
+    monkeypatch.setattr(fill_notice, "AsyncSessionLocal", lambda: session)
+    redis = _FakeRedis()
+
+    notice = parse_fill_notice(_notice_plain("NOPE", "005930", 5, "70000"))
+    assert await apply_fill_notice(7, notice, redis) is False
+    assert redis.store == {}
 
 
 # ─────────────────────────── 5) KIS_HTS_ID 미설정 시 no-op ───────────────────────────
