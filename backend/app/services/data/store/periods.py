@@ -47,6 +47,18 @@ def write_periods(
     if not present:
         return
 
+    if df.index.has_duplicates:
+        # daily.write_daily 와 같은 이유: 같은 (start,end,investors,symbol) 이 한
+        # 다중행 INSERT 안에 두 번 들어가면 Postgres 가 "ON CONFLICT DO UPDATE
+        # command cannot affect row a second time" 로 거부하고, 그 예외는
+        # DataSourceError 가 아니라서 호출자를 그대로 크래시시킨다.
+        dupes = int(df.index.duplicated().sum())
+        logger.warning(
+            "stock_period_stats 중복 티커 %d건 제거(마지막 값 사용): %s~%s",
+            dupes, start, end,
+        )
+        df = df[~df.index.duplicated(keep="last")]
+
     rows: list[dict] = []
     for ticker, r in df.iterrows():
         row: dict = {

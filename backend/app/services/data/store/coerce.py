@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import math
 from decimal import Decimal, InvalidOperation
 
 import pandas as pd
@@ -34,6 +35,16 @@ def coerce_value(value: object, kind: str) -> object | None:
             return None
     except (TypeError, ValueError):
         pass  # pd.isna 가 스칼라를 못 주는 값(배열 등) — 아래 변환에서 걸러진다
+    if isinstance(value, float) and math.isinf(value):
+        # pd.isna(inf) 는 False 라 위 가드를 통과한다. INTEGER 분기에서
+        # int(float(inf)) 는 (TypeError, ValueError) 가 아니라 OverflowError 를
+        # 던져 이 함수를 호출한 write_daily/write_periods 전체를 실패시킨다
+        # (그 값은 DataSourceError 가 아니라 상위 예외 처리에도 안 잡힌다).
+        # NUMERIC 분기는 예외 없이 Decimal('Infinity') 를 그대로 반환해버리는데,
+        # 그 값을 저장 가능한지는 DB 쪽 사정이라 이 계층에서 보장할 수 없다.
+        # 위 docstring 대로 이상값 한 개가 전체 적재를 막으면 안 되므로 None 으로
+        # 떨어뜨린다.
+        return None
     if kind == NUMERIC:
         try:
             return Decimal(str(value))
@@ -42,6 +53,9 @@ def coerce_value(value: object, kind: str) -> object | None:
     if kind == INTEGER:
         try:
             return int(float(value))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError 백스톱: 위 inf 가드는 float/np.float64 만 잡는다.
+            # np.float32('inf')·문자열 "inf" 등 다른 경로로 들어온 무한대는 여기서
+            # 걸러야 int(float(value)) 가 OverflowError 를 던지는 걸 막는다.
             return None
     return str(value)
