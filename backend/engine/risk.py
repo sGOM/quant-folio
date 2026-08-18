@@ -226,9 +226,22 @@ async def check_stop_loss(
     symbol: str,
     current_price: Decimal,
 ) -> bool:
-    """손절 조건 도달 여부. avg_price 대비 stop_loss_pct 이상 하락 시 True."""
+    """손절 조건 도달 여부. avg_price 대비 stop_loss_pct 이상 하락 시 True.
+
+    `current_price <= 0` 이면 손절 판정을 하지 않고 False 를 반환한다(무행동=보유 유지).
+    0 은 "가격이 0 원까지 폭락"이 아니라 시세 결측이 흘러든 값이며, 그대로 나누면
+    하락률이 100% 가 되어 어떤 stop_loss_pct 설정이든 충족시켜 실제 가격 변동 없이
+    전량 손절이 발동한다. 호출부가 걸러도 이 함수는 엔진 코어의 하드 게이트이므로
+    호출 경로와 무관하게 스스로 안전해야 한다(`avg_price <= 0` 방어와 같은 이유).
+    """
     limit = await _get_limit(db, user_id, strategy_id)
     if not limit or limit.stop_loss_pct is None:
+        return False
+    if current_price <= 0:
+        logger.warning(
+            "%s 현재가가 0 이하(%s) — 유효 시세 없음으로 보고 손절 판정 건너뜀",
+            symbol, current_price,
+        )
         return False
     pos = await _aggregate_position(db, user_id, symbol)
     if pos is None or pos.qty <= 0 or pos.avg_price <= 0:
