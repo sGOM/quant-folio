@@ -30,9 +30,7 @@ import pandas as pd
 from app.services.data.errors import (
     DataSourceError,
     SourceSchemaError,
-    SourceUnavailableError,
     classify_httpx,
-    cooldown_remaining,
     note_failure,
     representative,
 )
@@ -131,7 +129,8 @@ def _parse_master(text: str, market: str) -> list[dict]:
     실제 콘텐츠 폭(227/221)이 어긋나는 off-by-one 함정이 있다.
 
     :raises SourceSchemaError: 행이 tail 폭보다 짧음, 데이터 행이 없음,
-        part1/part2 파싱 후 컬럼·행 수가 기대와 다름(포맷이 바뀐 신호)
+        part1/part2 파싱 후 컬럼·행 수가 기대와 다름(포맷이 바뀐 신호),
+        모든 행이 symbol/name 파싱 실패로 걸러져 유효 행이 0건(포맷이 바뀐 신호)
     """
     field_specs, columns = _widths_and_columns(market)
     tail = sum(field_specs)
@@ -176,18 +175,17 @@ def _parse_master(text: str, market: str) -> list[dict]:
         raw = part2_row.to_dict()
         raw["표준코드"] = std_code
         rows.append({"symbol": symbol.zfill(6), "name": name, "raw": raw})
+
+    if not rows:
+        raise SourceSchemaError("kis_master", f"{market} 마스터에 유효한 종목 행이 없다")
     return rows
 
 
 def _download_zip(market: str) -> bytes:
-    # 쿨다운 검사는 호출 직전 한 곳(여기)에서만 한다 — 걸어두기만 하고 아무도 읽지
-    # 않으면 죽은 코드이고, 다운로드 장애 시 매 호출이 네트워크 타임아웃을 새로 소진한다.
-    # 이미 걸린 쿨다운을 검사만 하고 갱신하지는 않는다(여기서 note_failure 하면
-    # 호출이 들어오는 한 쿨다운이 끝없이 연장된다).
-    remaining = cooldown_remaining("kis_master")
-    if remaining > 0:
-        raise SourceUnavailableError("kis_master", f"쿨다운 중 — 다운로드 생략({remaining:.0f}초 남음)")
-
+    # 쿨다운 게이트 없음: 유일한 호출자(야간 배치, 1일 1회)에게 60초 쿨다운은
+    # 무의미하고, 두 시장이 쿨다운 키를 공유하면 한 시장 실패가 다른 시장 시도를
+    # 막아버린다(§3.4 부분 실패 보장 위반). note_failure 는 계속 호출해 실패를
+    # 기록하지만(다른 모듈이 공유하는 errors.py 인프라), 여기서 다시 읽지는 않는다.
     url = _BASE_URL.format(name=_FILE_NAMES[market])
     try:
         resp = httpx.get(url, timeout=_TIMEOUT, follow_redirects=True)
@@ -248,8 +246,14 @@ async def snapshot_stock_master(db, trade_date: date | None = None) -> int:
     for market in ("KOSPI", "KOSDAQ"):
         try:
             rows = fetch_market_master(market)
-        except DataSourceError as e:
-            errors.append(e)
+        except Exception as e:  # noqa: BLE001 — DataSourceError 외에도 UnicodeDecodeError·
+            # ParserError 등 미포장 예외가 새어나올 수 있다(§3.4: 한 시장 실패가 다른
+            # 시장 시도를 막아선 안 된다). fetch_market_master 호출만 감싸므로 아래
+            # db.execute/add_all 의 실패는 여전히 그대로 전파된다.
+            if isinstance(e, DataSourceError):
+                errors.append(e)
+            else:
+                errors.append(SourceSchemaError("kis_master", f"{market} 처리 중 예상치 못한 오류: {e}"))
             logger.warning("KIS 종목마스터(%s) 적재 실패 — 스킵: %s", market, e)
             continue
 

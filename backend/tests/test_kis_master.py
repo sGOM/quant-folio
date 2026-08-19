@@ -11,16 +11,6 @@ from datetime import date
 
 import pytest
 
-from app.services.data.errors import clear_cooldown, note_failure
-
-
-@pytest.fixture(autouse=True)
-def _clean_cooldown():
-    """전송 실패 테스트가 건 kis_master 쿨다운이 다른 테스트로 새지 않게 한다."""
-    clear_cooldown("kis_master")
-    yield
-    clear_cooldown("kis_master")
-
 
 def test_kis_stock_master_snapshot_model_schema():
     from app.models import KisStockMasterSnapshot
@@ -109,6 +99,18 @@ def test_parse_master_empty_text_raises_schema_error():
         km._parse_master("", "KOSPI")
 
 
+def test_parse_master_all_rows_filtered_raises_schema_error():
+    """symbol/name 이 모두 빈 값이라 모든 행이 걸러지면 빈 리스트를 조용히
+    반환하지 말고 SourceSchemaError 로 실패해야 한다(KIS 포맷 변경 감지용)."""
+    from app.services.data.errors import SourceSchemaError
+    from app.services.data import kis_master as km
+
+    line = _build_line("KOSPI", "", "", "", {"거래정지": "N"})
+
+    with pytest.raises(SourceSchemaError):
+        km._parse_master(line, "KOSPI")
+
+
 class _Resp:
     def __init__(self, content: bytes, status: int = 200):
         self.content = content
@@ -185,33 +187,6 @@ def test_fetch_market_master_bad_zip_raises_schema_error(monkeypatch):
 
     with pytest.raises(SourceSchemaError):
         km.fetch_market_master("KOSPI")
-
-
-def test_fetch_market_master_during_cooldown_skips_httpx_call(monkeypatch):
-    """쿨다운 중에는 httpx.get을 호출하지 않고 즉시 SourceUnavailableError를 raise한다."""
-    from app.services.data import kis_master as km
-    from app.services.data.errors import SourceUnavailableError
-
-    # 쿨다운을 설정한다
-    note_failure(SourceUnavailableError("kis_master", "test cooldown"))
-
-    # httpx.get이 호출되지 않았는지 확인할 카운터
-    call_count = {"count": 0}
-
-    def fake_get(*a, **kw):
-        call_count["count"] += 1
-        raise AssertionError("httpx.get should not be called during cooldown")
-
-    monkeypatch.setattr(km.httpx, "get", fake_get)
-
-    # 쿨다운 중이므로 즉시 raise
-    with pytest.raises(SourceUnavailableError) as exc_info:
-        km.fetch_market_master("KOSPI")
-
-    # httpx.get이 호출되지 않았는지 확인
-    assert call_count["count"] == 0
-    # 쿨다운 메시지가 있는지 확인
-    assert "쿨다운" in str(exc_info.value)
 
 
 class _FakeMasterDB:
@@ -291,6 +266,63 @@ def test_snapshot_stock_master_both_markets_fail_raises(monkeypatch):
         asyncio.run(km.snapshot_stock_master(db, trade_date=date(2026, 8, 19)))
 
     assert db.added == []
+
+
+def test_snapshot_stock_master_kospi_download_failure_does_not_block_kosdaq(monkeypatch):
+    """Finding 1 회귀 방지: 쿨다운 키를 시장 간에 공유하면 KOSPI 다운로드 실패가
+    건 쿨다운을 KOSDAQ 의 _download_zip 호출이 물려받아 httpx.get 을 아예 타지
+    않는다. fetch_market_master 를 몽키패치하면 이 버그가 숨으므로, 실제
+    _download_zip 경로(httpx.get)를 그대로 태워야 한다."""
+    import asyncio
+
+    from app.services.data import kis_master as km
+
+    kosdaq_line = _build_line(
+        "KOSDAQ", "247540", "KR7247540008", "에코프로비엠", {"거래정지 여부": "N"},
+    )
+    kosdaq_zip = _zip_bytes("kosdaq_code.mst", kosdaq_line.encode("cp949"))
+
+    call_count = {"count": 0}
+
+    def fake_get(url, timeout=None, follow_redirects=None):
+        call_count["count"] += 1
+        if "kospi" in url:
+            raise RuntimeError("KOSPI CDN 연결 실패")
+        return _Resp(kosdaq_zip)
+
+    monkeypatch.setattr(km.httpx, "get", fake_get)
+    db = _FakeMasterDB()
+
+    n = asyncio.run(km.snapshot_stock_master(db, trade_date=date(2026, 8, 19)))
+
+    # httpx.get 이 두 시장 모두에 대해 실제로 호출됐어야 한다 — 쿨다운으로
+    # KOSDAQ 시도가 생략됐다면 1회에서 그친다.
+    assert call_count["count"] == 2
+    assert n == 1
+    assert {o.symbol for o in db.added} == {"247540"}
+    assert {o.market for o in db.added} == {"KOSDAQ"}
+
+
+def test_snapshot_stock_master_non_datasource_error_does_not_block_other_market(monkeypatch):
+    """Finding 3 회귀 방지: fetch_market_master 가 DataSourceError 로 포장되지
+    않은 예외(UnicodeDecodeError·ParserError 류를 대표하는 RuntimeError)를 던져도
+    다른 시장 처리는 계속돼야 한다."""
+    import asyncio
+
+    from app.services.data import kis_master as km
+
+    def _fake_fetch(market):
+        if market == "KOSPI":
+            raise RuntimeError("예상 못한 파싱 버그")
+        return [{"symbol": "247540", "name": "에코프로비엠", "raw": {}}]
+
+    monkeypatch.setattr(km, "fetch_market_master", _fake_fetch)
+    db = _FakeMasterDB()
+
+    n = asyncio.run(km.snapshot_stock_master(db, trade_date=date(2026, 8, 19)))
+
+    assert n == 1
+    assert {o.symbol for o in db.added} == {"247540"}
 
 
 class _FakeScalarDB:
