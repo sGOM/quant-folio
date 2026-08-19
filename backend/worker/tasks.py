@@ -273,6 +273,52 @@ def snapshot_sector_map() -> dict:
     return _run_async(_snapshot_sector_map_async())
 
 
+async def _snapshot_kis_stock_master_async() -> dict:
+    from app.core.config import settings
+    from app.core.database import AsyncSessionLocal
+    from app.services.data.kis_master import snapshot_stock_master
+
+    async with AsyncSessionLocal() as db:
+        try:
+            n = await snapshot_stock_master(db)
+            await db.commit()
+        except Exception as e:  # noqa: BLE001
+            await db.rollback()
+            # 매일 배치라 조용히 실패하면 다음날 재시도까지 스테일 상태로 남는다.
+            # 다른 배치 태스크와 동일한 sentinel 관례로 알린다.
+            from redis.asyncio import Redis
+
+            from engine.alerts import publish_alert
+
+            redis = Redis.from_url(settings.REDIS_URL)
+            try:
+                await publish_alert(
+                    redis, user_id=None, strategy_id=0, severity="warning",
+                    message=f"KIS 종목마스터 적재 실패: {e}",
+                    code="kis_master_outage",
+                    dedup_window_hours=24.0,
+                )
+            finally:
+                await redis.aclose()
+            raise
+
+    result = {"snapshot_symbols": n}
+    logger.info("KIS 종목마스터 스냅샷 적재 완료: %s", result)
+    return result
+
+
+@celery_app.task(name="worker.snapshot_kis_stock_master")
+def snapshot_kis_stock_master() -> dict:
+    """KIS 종목마스터(거래정지·관리종목·액면가·업종분류 등)를 매일 1회 적재한다.
+
+    코스피·코스닥 zip 을 받아 파싱해 kis_stock_master_snapshots 에 스냅샷으로
+    쌓는다(docs/superpowers/specs/2026-08-18-kis-stock-master-cache-design.md).
+    한 시장만 실패해도 다른 시장은 저장되고, 둘 다 실패했을 때만 알림 발행 후
+    예외를 전파한다.
+    """
+    return _run_async(_snapshot_kis_stock_master_async())
+
+
 # DB 백업(E-2) — 저장 위치·보존기간. worker 컨테이너에 마운트된 named volume(db_backups)에
 # 쓴다(docker-compose.yml 참고). scripts/backup_db.sh(호스트 crontab용)와 별도 구현이지만
 # 파일명 규칙(quant_YYYYMMDD_HHMMSS.sql.gz)·보존정책은 그대로 맞춘다.
