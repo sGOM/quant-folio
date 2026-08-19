@@ -139,6 +139,28 @@ def test_부분_실패는_확정으로_굳히지_않는다(_store, monkeypatch):
     assert entry is None or entry.final is False
 
 
+def test_fetch_per_market_dedups_overlapping_ticker_across_markets(monkeypatch):
+    """§55: 같은 티커가 KOSPI/KOSDAQ 양쪽 응답에 겹쳐 실려도(시장전환일 등) concat 직후
+    중복 없이 반환한다. write_daily/write_periods 는 저장 직전 이미 이 dedup 을 하는데,
+    cached_frame 은 write_local 이 커밋한 값이 아니라 이 함수의 원본 반환값을 그대로
+    호출자에게 주므로, 여기서 안 하면 최초 응답(중복)과 로컬 재조회(dedup)의 형태가
+    달라진다.
+    """
+    monkeypatch.setattr(F, "_pykrx_stock", lambda: object())
+
+    def _fetch_one(stock, mkt):  # noqa: ARG001
+        if mkt == "KOSPI":
+            return pd.DataFrame({"PER": [10.0]}, index=["005930"])
+        return pd.DataFrame({"PER": [99.0]}, index=["005930"])  # 같은 티커, 다른 응답
+
+    df, complete = F._fetch_per_market(
+        _fetch_one, ["KOSPI", "KOSDAQ"], what="테스트", when="20190312", source="test",
+    )
+    assert complete is True
+    assert len(df) == 1
+    assert df.loc["005930", "PER"] == 99.0  # 마지막(KOSDAQ) 값 채택 — write_daily 와 동일 규약
+
+
 def test_확정_적재분은_pykrx_를_다시_부르지_않는다(_store, monkeypatch):
     fake = _FakeStock({"KOSPI": _fund_frame(), "KOSDAQ": _fund_frame()})
     monkeypatch.setattr(F, "_pykrx_stock", lambda: fake)

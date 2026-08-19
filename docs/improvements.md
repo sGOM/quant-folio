@@ -1465,7 +1465,7 @@ as_missing`·`test_quotes_keeps_positive_prices` 신설.
 consulting_pit_pool`(호출 시 `_resolve_universe` 가 불리면 실패하도록 만들어 pool
 의존이 완전히 제거됐음을 증명)·`test_has_holdings_false_when_no_positions` 신설.
 
-## 55. `cached_frame` 최초 조회(원격)와 재조회(로컬)의 dedup 형태 불일치 ⚠️
+## 55. `cached_frame` 최초 조회(원격)와 재조회(로컬)의 dedup 형태 불일치 — 해소 ✅
 
 §56(중복 행 dedup)에서 `write_daily`/`write_periods` 저장 직전 dedup 을 추가했지만,
 `cached_frame` 은 원격 조회 직후 dedup 되지 않은 원본 `df`를 그대로 호출자에게
@@ -1473,6 +1473,12 @@ consulting_pit_pool`(호출 시 `_resolve_universe` 가 불리면 실패하도�
 최초 응답(중복 가능)과 이후 로컬 히트(dedup 됨)의 형태가 달라질 수 있다. 근본 수정은
 `app/services/metrics/fetch.py::_fetch_per_market` 의 `pd.concat` 직후 dedup —
 이 파일이 `store/` 밖이라 이번 배치 범위 밖이었다.
+
+**해소(2026-08-19)**: 제안된 위치 그대로 `_fetch_per_market` 의 `pd.concat(frames)`
+직후, `write_daily` 와 동일한 `~index.duplicated(keep="last")` dedup 을 추가했다
+(시장전환일 등으로 같은 티커가 KOSPI/KOSDAQ 양쪽 응답에 겹쳐 실려도 최초 응답부터
+정리됨). `test_fetch_per_market_dedups_overlapping_ticker_across_markets`
+(`tests/test_fetch_store_wiring.py`) 신설.
 
 ## 56. `/turnaround` — `financial_filter_applied=False` 결과도 6시간 캐싱됨 ⚠️
 

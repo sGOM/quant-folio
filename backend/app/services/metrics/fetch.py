@@ -179,7 +179,16 @@ def _fetch_per_market(
     if not frames:
         empty = pd.DataFrame(columns=empty_columns) if empty_columns else pd.DataFrame()
         return empty, complete
-    return pd.concat(frames), complete
+    combined = pd.concat(frames)
+    if combined.index.has_duplicates:
+        # §55: 시장전환일 등으로 같은 티커가 KOSPI/KOSDAQ 양쪽 응답에 함께 실리면
+        # concat 후 중복 인덱스가 남는다. write_daily/write_periods(store/daily.py·
+        # periods.py) 는 저장 직전 이미 이 dedup 을 적용하는데, cached_frame 은
+        # write_local 이 커밋한 값이 아니라 이 함수가 반환한 원본 df 를 그대로
+        # 호출자에게 돌려주므로, 여기서 안 하면 최초 응답(중복 가능)과 이후 로컬
+        # 히트(dedup 됨)의 형태가 달라진다. 저장 쪽과 동일하게 마지막 값을 채택.
+        combined = combined[~combined.index.duplicated(keep="last")]
+    return combined, complete
 
 # 펀더멘털(PER/PBR/DIV) 프로세스 내 LRU 캐시.
 # 특정 as_of 일자의 전 종목 펀더멘털은 확정 후 변하지 않으므로 (as_of, 시장) 단위로
