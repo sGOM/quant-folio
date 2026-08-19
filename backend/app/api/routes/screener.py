@@ -56,11 +56,15 @@ async def turnaround(
         top_n=top_n, smallcap_pct=smallcap_pct, surge=surge, max_debt=max_debt,
     )
     # 빈 결과(KRX 시총 조회 실패 등 일시적 장애)는 캐시하지 않는다 — 일시적 실패가
-    # TTL(6h) 동안 굳어 정상 데이터를 가리는 것을 방지한다.
-    if result.items:
+    # TTL(6h) 동안 굳어 정상 데이터를 가리는 것을 방지한다. §56: 재무 하드 필터가
+    # OpenDART 조회 실패로 미적용된(왜곡된) 결과도 items 가 비어있지 않으면 여기서
+    # 함께 걸러야 한다 — 그렇지 않으면 필터 없이 나온 후보 목록이 그대로 6시간 굳는다.
+    if result.items and result.financial_filter_applied:
         await redis.set(cache_key, result.model_dump_json(), ex=_CACHE_TTL)
     else:
         logger.warning(
-            "턴어라운드 스크리닝 결과가 비어 캐시를 건너뜀 (as_of=%s market=%s)", as_of, market
+            "턴어라운드 스크리닝 결과 캐시 건너뜀(items=%d financial_filter_applied=%s) "
+            "(as_of=%s market=%s)",
+            len(result.items), result.financial_filter_applied, as_of, market,
         )
     return result

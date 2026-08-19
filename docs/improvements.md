@@ -1480,12 +1480,18 @@ consulting_pit_pool`(호출 시 `_resolve_universe` 가 불리면 실패하도�
 정리됨). `test_fetch_per_market_dedups_overlapping_ticker_across_markets`
 (`tests/test_fetch_store_wiring.py`) 신설.
 
-## 56. `/turnaround` — `financial_filter_applied=False` 결과도 6시간 캐싱됨 ⚠️
+## 56. `/turnaround` — `financial_filter_applied=False` 결과도 6시간 캐싱됨 — 해소 ✅
 
 § 위에서 "빈 결과 미캐싱"으로 고친 것과 인접한 별개 이슈. OpenDART 조회 실패로
 하드 필터가 미적용된(`app/schemas/screener.py:44-48` 에 명시된 "왜곡된") 응답은
 `items` 가 비어있지 않으면 여전히 6시간 캐싱된다 — 재무 필터 없이 나온 후보 목록이
 정상 결과처럼 오래 굳는다.
+
+**해소(2026-08-19)**: `app/api/routes/screener.py::turnaround` 의 캐싱 조건에
+`result.financial_filter_applied` 를 추가(`if result.items and result.
+financial_filter_applied:`) — 필터 미적용 결과는 items 가 있어도 캐시하지 않는다.
+`tests/test_screener_route.py` 신설(캐시됨/캐시 안 됨 2건, 라우트 핸들러를 직접
+호출해 검증 — DB·네트워크 불필요).
 
 ## 57. `price_limit_model=True`(opt-in) 시 하한가 종목은 강제청산이라도 미체결 ⚠️
 
