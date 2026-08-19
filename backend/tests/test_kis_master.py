@@ -6,6 +6,7 @@ tests/test_krx_index.py 의 _FakeSnapshotDB 패턴처럼 최소 대역 세션으
 """
 from __future__ import annotations
 
+import io
 from datetime import date
 
 import pytest
@@ -96,3 +97,81 @@ def test_parse_master_empty_text_raises_schema_error():
 
     with pytest.raises(SourceSchemaError):
         km._parse_master("", "KOSPI")
+
+
+class _Resp:
+    def __init__(self, content: bytes, status: int = 200):
+        self.content = content
+        self._status = status
+
+    def raise_for_status(self) -> None:
+        if self._status >= 400:
+            import httpx
+            request = httpx.Request("GET", "https://example.test")
+            response = httpx.Response(self._status, request=request)
+            raise httpx.HTTPStatusError("boom", request=request, response=response)
+
+
+def _zip_bytes(inner_name: str, content: bytes) -> bytes:
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(inner_name, content)
+    return buf.getvalue()
+
+
+def test_fetch_market_master_downloads_extracts_and_parses(monkeypatch):
+    from app.services.data import kis_master as km
+
+    line = _build_line(
+        "KOSPI", "005930", "KR7005930003", "삼성전자", {"거래정지": "N"},
+    )
+    zip_content = _zip_bytes("kospi_code.mst", line.encode("cp949"))
+
+    captured = {}
+
+    def fake_get(url, timeout=None, follow_redirects=None):
+        captured["url"] = url
+        return _Resp(zip_content)
+
+    monkeypatch.setattr(km.httpx, "get", fake_get)
+
+    rows = km.fetch_market_master("KOSPI")
+
+    assert "kospi_code.mst.zip" in captured["url"]
+    assert rows[0]["symbol"] == "005930"
+
+
+def test_fetch_market_master_download_failure_raises_unavailable(monkeypatch):
+    from app.services.data import kis_master as km
+    from app.services.data.errors import SourceUnavailableError
+
+    def boom(*a, **kw):
+        raise RuntimeError("연결 실패")
+
+    monkeypatch.setattr(km.httpx, "get", boom)
+
+    with pytest.raises(SourceUnavailableError):
+        km.fetch_market_master("KOSPI")
+
+
+def test_fetch_market_master_zip_without_mst_raises_schema_error(monkeypatch):
+    from app.services.data import kis_master as km
+    from app.services.data.errors import SourceSchemaError
+
+    zip_content = _zip_bytes("readme.txt", b"not the master file")
+    monkeypatch.setattr(km.httpx, "get", lambda *a, **kw: _Resp(zip_content))
+
+    with pytest.raises(SourceSchemaError):
+        km.fetch_market_master("KOSPI")
+
+
+def test_fetch_market_master_bad_zip_raises_schema_error(monkeypatch):
+    from app.services.data import kis_master as km
+    from app.services.data.errors import SourceSchemaError
+
+    monkeypatch.setattr(km.httpx, "get", lambda *a, **kw: _Resp(b"this is not a zip"))
+
+    with pytest.raises(SourceSchemaError):
+        km.fetch_market_master("KOSPI")

@@ -175,3 +175,43 @@ def _parse_master(text: str, market: str) -> list[dict]:
         raw["표준코드"] = std_code
         rows.append({"symbol": symbol.zfill(6), "name": name, "raw": raw})
     return rows
+
+
+def _download_zip(market: str) -> bytes:
+    url = _BASE_URL.format(name=_FILE_NAMES[market])
+    try:
+        resp = httpx.get(url, timeout=_TIMEOUT, follow_redirects=True)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:  # noqa: BLE001
+        exc = classify_httpx("kis_master", e)
+        note_failure(exc)
+        logger.warning("KIS 종목마스터(%s) 다운로드 실패: %s", market, exc)
+        raise exc from e
+
+
+def _extract_mst_text(zip_bytes: bytes, market: str) -> str:
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            names = [n for n in zf.namelist() if n.endswith(".mst")]
+            if not names:
+                raise SourceSchemaError(
+                    "kis_master", f"{market} zip 안에 .mst 파일이 없다: {zf.namelist()}",
+                )
+            with zf.open(names[0]) as f:
+                return f.read().decode("cp949")
+    except zipfile.BadZipFile as e:
+        raise SourceSchemaError("kis_master", f"{market} zip 파싱 실패: {e}") from e
+
+
+def fetch_market_master(market: str) -> list[dict]:
+    """market("KOSPI"|"KOSDAQ")의 종목마스터를 다운로드·파싱해 반환한다.
+
+    각 항목: {"symbol": 6자리 코드, "name": 한글명, "raw": {필드명: 값, ...}}.
+
+    :raises DataSourceError: 다운로드 실패(SourceUnavailableError 등) 또는
+        파싱 실패(SourceSchemaError)
+    """
+    zip_bytes = _download_zip(market)
+    text = _extract_mst_text(zip_bytes, market)
+    return _parse_master(text, market)
