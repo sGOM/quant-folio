@@ -37,6 +37,13 @@ celery_app.conf.beat_schedule = {
         "task": "worker.ingest_daily_snapshots",
         "schedule": crontab(hour=18, minute=50),
     },
+    # KIS 종목마스터(거래정지·관리종목·액면가·업종분류) 일별 스냅샷 — 일봉 적재
+    # (18:30)와 로컬 저장소 선적재(18:50) 사이. 인증·유량제한 없는 시장 전체 zip
+    # 다운로드라 다른 배치와 자원 경합이 없다.
+    "snapshot-kis-stock-master-nightly": {
+        "task": "worker.snapshot_kis_stock_master",
+        "schedule": crontab(hour=18, minute=40),
+    },
     # 체결 정합 정기 점검(B-2) — 주간(월요일 아침). 슬리피지 실측이 서서히 벌어지는
     # 종류의 이슈라 일 단위로 돌 필요는 없다.
     "check-fill-quality-drift": {
