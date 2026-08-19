@@ -104,6 +104,26 @@ def test_price_close_falls_back_to_market_cap_over_shares(monkeypatch):
     assert by_code["000660"].price == 143_000
 
 
+def test_price_none_when_close_and_fallback_both_missing(monkeypatch):
+    """§50: 종가·폴백(시가총액/상장주식수) 둘 다 결측이면 price 는 0 sentinel 이 아니라
+    None 이어야 한다 — 0 은 실제 KRX 상장종목에서 나올 수 없는 값인데도 예전엔 0 으로
+    채워 "값 있음"과 구분이 안 됐다.
+    """
+    _patch_common(monkeypatch, qmetrics_side_effect=lambda members, as_of: {})
+    # 상장주식수 컬럼 자체를 없애 폴백 경로를 막는다(005930 은 원래도 당일 종가 결측).
+    cap_df = pd.DataFrame(
+        {"시가총액": [400_000_000_000_000, 100_000_000_000_000]},
+        index=["005930", "000660"],
+    )
+    monkeypatch.setattr(recommend_mod, "_fetch_market_cap", lambda *a: cap_df)
+
+    out = recommend_mod.compute_kospi200_scored(AS_OF)
+
+    by_code = {m.code: m for m in out.items}
+    assert by_code["005930"].price is None
+    assert by_code["000660"].price == 143_000  # 정상 종가는 그대로 채워진다
+
+
 def test_opendart_failure_falls_back_to_neutral_without_raising(monkeypatch):
     """DataSourceError(외부 장애)는 삼키고 중립 처리한다(Task 7 — except DataSourceError)."""
     def _boom(members, as_of):

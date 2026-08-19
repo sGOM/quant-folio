@@ -847,8 +847,8 @@ export interface TurnaroundScreenOut {
 export interface RecommendMember {
   code: string;
   name: string;
-  /** 현재가(원). */
-  price: number;
+  /** 현재가(원). 종가 조회 실패 시 결측(null) — 0 이 아니다. */
+  price: number | null;
   /** 당일 등락률(소수 비율). */
   change_rate: number | null;
   /** 시가총액(원). */

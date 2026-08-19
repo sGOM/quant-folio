@@ -1403,7 +1403,7 @@ min/max 클램프는 틀린 방향(요청은 달력일·데이터는 거래일�
 원인이지만, 이번 배치의 수정 범위(파일 단위)를 넘어서거나 별도 설계 결정이 필요해
 후속 과제로 남긴다.
 
-## 50. `RecommendMember.price` 가 결측 종가를 0 sentinel 로 숨김 ⚠️
+## 50. `RecommendMember.price` 가 결측 종가를 0 sentinel 로 숨김 — 해소 ✅
 
 `app/services/recommend.py` 가 결측 종가를 `int | None` 대신 `0`(sentinel)으로
 반환한다. 프론트(`recommend/page.tsx`)는 이 계약에 맞춰 `price > 0` 을 "값 있음"
@@ -1411,6 +1411,17 @@ min/max 클램프는 틀린 방향(요청은 달력일·데이터는 거래일�
 있어 다른 소비처가 생기면 같은 함정(0을 정상값으로 오인)이 재발할 수 있다.
 근본 수정은 백엔드가 `price: int | None` 으로 결측을 명시하고 프론트가
 `price != null` 로 바꾸는 것 — API 계약 변경이라 이번 배치(프론트 전용) 범위 밖.
+
+**해소(2026-08-19)**: 제안된 대로 계약을 바꿨다. `app/schemas/recommend.py::
+RecommendMember.price` 를 `Optional[int] = None` 으로, `app/services/recommend.py`
+의 sentinel `else 0` 을 `else None` 으로 변경. 프론트 `lib/api.ts::RecommendMember.
+price` 타입을 `number | null` 로, `recommend/page.tsx` 의 판정을 `price > 0` 에서
+`price != null` 로 바꾸고 그 위에 있던 "0 sentinel" 설명 주석은 더 이상 사실이
+아니므로 제거했다. `test_price_none_when_close_and_fallback_both_missing`
+(`tests/test_recommend.py`) 신설 — 종가·폴백(시가총액/상장주식수) 둘 다 결측인
+케이스가 `price is None` 임을 검증. `npx tsc --noEmit` 타입 오류 없음, 백엔드
+전체 스위트 929 passed 확인. `market_cap`(같은 파일 §50 인접, 동일한 0 sentinel
+패턴)은 이번 지적 범위 밖이라 손대지 않았다.
 
 ## 51. 실전(prod) 환경의 접수 불명 주문, 완전 자동 회수 불가 ⚠️
 

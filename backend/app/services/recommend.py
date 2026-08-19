@@ -153,7 +153,7 @@ def compute_kospi200_scored(as_of: date) -> RecommendOut:
         items.append(RecommendMember(
             code=code_str,
             name=seed_names.get(code_str) or krx_names.get(code_str) or code_str,
-            price=int(round(float(row["price_close"]))) if not _is_nan(row.get("price_close")) else 0,
+            price=int(round(float(row["price_close"]))) if not _is_nan(row.get("price_close")) else None,
             change_rate=_safe_float(row.get("change_rate")),
             market_cap=int(row["시가총액"]) if not _is_nan(row.get("시가총액")) else 0,
             avg_value_20=_safe_float(row.get("avg_value_20")) or 0.0,

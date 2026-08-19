@@ -414,10 +414,7 @@ function ResultTable({
                 <div className="font-mono text-[11px] text-muted-foreground">{m.code}</div>
               </td>
               <td className="px-3 py-2 text-right tabular-nums">
-                {/* 백엔드가 결측 종가를 0으로 채워 보낸다(KRX 상장종목의 실제 가격은
-                    항상 양수이므로 0은 데이터 없음을 뜻한다) — null 이 아니라 0 을
-                    기준으로 판정한다. */}
-                {m.price > 0 ? formatKRW(m.price, false) : "-"}
+                {m.price != null ? formatKRW(m.price, false) : "-"}
               </td>
               <td className={cn("px-3 py-2 text-right tabular-nums", pctColor(m.change_rate))}>
                 {m.change_rate == null

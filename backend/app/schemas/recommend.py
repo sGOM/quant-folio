@@ -19,7 +19,7 @@ class RecommendMember(BaseModel):
 
     code: str
     name: str
-    price: int
+    price: Optional[int] = None  # 결측(종가 조회 실패)이면 None — 0 sentinel 아님(§50)
     change_rate: Optional[float] = None  # 당일 등락률(소수)
     market_cap: int
     avg_value_20: float
