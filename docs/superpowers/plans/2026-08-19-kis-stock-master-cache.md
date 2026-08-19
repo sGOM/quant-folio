@@ -1115,3 +1115,11 @@ docker compose exec db psql -U quant -d quant -c \
 이 단계는 자동화된 테스트로 대체할 수 없다(실 KIS CDN 응답 형식이 스펙과
 일치하는지는 네트워크 접근 없이는 확인 불가) — 계획 실행자가 직접 확인하고
 결과를 보고할 것.
+
+**검증 완료(2026-08-19)**: `alembic upgrade head`(0016→0017) 적용 후 워커
+재기동, `celery call worker.snapshot_kis_stock_master` 수동 실행. 로그
+"KIS 종목마스터 스냅샷 적재: trade_date=2026-08-19 4385종목(성공 시장 2/2)".
+DB 확인: KOSPI 2563 / KOSDAQ 1822 행, 삼성전자(005930) raw 필드 정상 파싱
+(거래정지="N", 관리종목="N"). 실 KIS CDN 응답 형식이 파서 스펙과 일치함을
+확인. 관련 테스트 45건(`test_kis_master.py`·`test_kis_master_snapshot_task.py`·
+`test_risk_evaluate.py`) 통과.
