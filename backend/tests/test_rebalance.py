@@ -1575,6 +1575,39 @@ async def test_has_holdings_false_when_no_positions(monkeypatch):
     assert await r._has_holdings() is False
 
 
+class _FakeQuoteBroker:
+    """symbol→Decimal 가격 매핑을 그대로 Quote 로 감싸 돌려주는 대역 브로커."""
+
+    def __init__(self, prices: dict):
+        from decimal import Decimal
+
+        self._prices = {s: Decimal(str(p)) for s, p in prices.items()}
+
+    async def get_quote(self, symbol: str):
+        from app.services.broker.base import Quote
+
+        return Quote(symbol=symbol, price=self._prices[symbol])
+
+
+async def test_quotes_drops_literal_zero_price_as_missing():
+    """§53: KIS 가 결측을 리터럴 "0"으로 정상 응답해도 결측으로 취급해 제외한다."""
+    from decimal import Decimal
+
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._broker = _FakeQuoteBroker({"A": "1200", "B": "0"})
+    prices = await r._quotes({"A", "B"})
+    assert prices == {"A": Decimal("1200")}
+
+
+async def test_quotes_keeps_positive_prices():
+    from decimal import Decimal
+
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._broker = _FakeQuoteBroker({"A": "1200", "B": "1800"})
+    prices = await r._quotes({"A", "B"})
+    assert prices == {"A": Decimal("1200"), "B": Decimal("1800")}
+
+
 async def _mdd_runner(monkeypatch, *, mdd_kill_pct=0.2, rearm_days=5):
     """MDD 킬스위치 상태기계만 검증하기 위해 자산가치·거래일 판정을 대체한 러너."""
     r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())

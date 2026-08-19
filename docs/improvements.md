@@ -1431,7 +1431,7 @@ min/max 클램프는 틀린 방향(요청은 달력일·데이터는 거래일�
 과 동일한 이유로 `_rebalance_dates()` 에 클램프를 추가해 두는 것이 raw dict 입력
 경로(스키마 우회)에 대한 구조적 방어가 된다.
 
-## 53. `rebalance_runner._quotes()` 가 리터럴 "0" 시세 문자열을 결측으로 못 거름 ⚠️
+## 53. `rebalance_runner._quotes()` 가 리터럴 "0" 시세 문자열을 결측으로 못 거름 — 해소 ✅
 
 § 위 KIS 시세 0원 가드(client.py/runner.py/risk.py)로 결측 응답은 이제 예외로
 걸러지지만, KIS 가 문자 그대로 `"0"` 을 정상 응답으로 돌려주는 경우는 여전히
@@ -1439,6 +1439,11 @@ min/max 클램프는 틀린 방향(요청은 달력일·데이터는 거래일�
 `_live_equity()` 가 이를 "결측"으로 보지 않아 해당 포지션 평가액만큼 자산이
 과소계상된다. 주문 생성 자체는 `rebalance.py:347` 의 `price <= 0` 가드가 막으므로
 오청산 위험은 없고 MDD 판정의 사이징 왜곡에 그친다.
+
+**해소(2026-08-19)**: `_quotes()` 가 조회 성공 응답이라도 `quote.price <= 0` 이면
+결측으로 간주해 제외하도록 바꿨다 — 러너 전반의 `price <= 0` 결측 관례
+(risk.py/runner.py/rebalance.py)와 통일. `test_quotes_drops_literal_zero_price_
+as_missing`·`test_quotes_keeps_positive_prices` 신설.
 
 ## 54. `_has_holdings()` 가 PIT 유니버스 밖 보유를 "현금"으로 오판 — 해소 ✅
 

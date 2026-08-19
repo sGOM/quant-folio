@@ -1045,14 +1045,25 @@ class RebalanceRunner(BaseRunner):
         return {p.symbol: p.qty for p in rows}
 
     async def _quotes(self, symbols: set[str]) -> dict[str, Decimal]:
-        """대상 종목들의 현재가를 REST 로 조회한다(실패 종목은 제외)."""
+        """대상 종목들의 현재가를 REST 로 조회한다(실패·0 이하 가격 종목은 제외).
+
+        §53: KIS 가 결측을 예외가 아니라 리터럴 "0"으로 정상 응답하는 경우가 있다
+        (`kis/client.py::get_quote` docstring — 0 판정은 의도적으로 호출부 책임).
+        그대로 담으면 `_live_equity()` 가 결측으로 못 보고 해당 포지션 평가액만큼
+        자산가치가 과소계상된다. 나머지 러너 전반의 `price <= 0` 결측 관례
+        (risk.py/runner.py/rebalance.py)와 통일한다.
+        """
         prices: dict[str, Decimal] = {}
         for sym in symbols:
             try:
                 quote = await self._broker.get_quote(sym)
-                prices[sym] = quote.price
             except Exception as e:  # noqa: BLE001
                 logger.warning("%s 현재가 조회 실패 — 이번 리밸런싱에서 제외: %s", sym, e)
+                continue
+            if quote.price <= 0:
+                logger.warning("%s 현재가 0 이하(%s) — 결측으로 간주해 제외", sym, quote.price)
+                continue
+            prices[sym] = quote.price
         return prices
 
     async def _execute_orders(
