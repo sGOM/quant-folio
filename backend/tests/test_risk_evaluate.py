@@ -14,11 +14,12 @@ conftest 의 기본 FakeDB 로 충분하다(`_RiskFakeDB` 불필요).
 """
 from __future__ import annotations
 
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
 
-from app.models import Position, RiskLimit
+from app.models import KisStockMasterSnapshot, Position, RiskLimit
 from engine import risk
 from tests.conftest import FakeDB, _Store
 
@@ -51,6 +52,13 @@ def _position(store, *, strategy_id, symbol=_SYMBOL, qty, avg_price):
             user_id=_USER, strategy_id=strategy_id, symbol=symbol,
             qty=Decimal(str(qty)), avg_price=Decimal(str(avg_price)),
         ),
+    )
+
+
+def _master_snapshot(store, *, symbol=_SYMBOL, market="KOSPI", trade_date, raw):
+    return _add(
+        store,
+        KisStockMasterSnapshot(symbol=symbol, market=market, trade_date=trade_date, name="테스트", raw=raw),
     )
 
 
@@ -103,6 +111,46 @@ async def test_evaluate_buy_rejects_when_max_position_size_fully_consumed(store,
 
     assert decision.approved is False
     assert decision.reason == "최대 포지션 한도 도달"
+
+
+async def test_evaluate_buy_rejects_management_designated_symbol(store, db):
+    _master_snapshot(store, trade_date=date.today(), raw={"관리종목": "Y", "정리매매": "N"})
+
+    decision = await risk.evaluate_buy(db, _USER, _A, _SYMBOL, Decimal("70000"), Decimal("1000000"))
+
+    assert decision.approved is False
+    assert "관리종목" in decision.reason
+
+
+async def test_evaluate_buy_rejects_kosdaq_delisting_liquidation_symbol(store, db):
+    _master_snapshot(
+        store, market="KOSDAQ", trade_date=date.today(),
+        raw={"관리 종목 여부": "N", "정리매매 여부": "Y"},
+    )
+
+    decision = await risk.evaluate_buy(db, _USER, _A, _SYMBOL, Decimal("70000"), Decimal("1000000"))
+
+    assert decision.approved is False
+    assert "정리매매" in decision.reason
+
+
+async def test_evaluate_buy_allows_when_flags_normal(store, db):
+    _master_snapshot(store, trade_date=date.today(), raw={"관리종목": "N", "정리매매": "N"})
+
+    decision = await risk.evaluate_buy(db, _USER, _A, _SYMBOL, Decimal("70000"), Decimal("1000000"))
+
+    assert decision.approved is True
+
+
+async def test_evaluate_buy_allows_when_snapshot_stale(store, db):
+    """야간배치 공백(연휴 등)으로 스냅샷이 오래되면 판정하지 않고 연다(fail-open)."""
+    _master_snapshot(
+        store, trade_date=date.today() - timedelta(days=30), raw={"관리종목": "Y"},
+    )
+
+    decision = await risk.evaluate_buy(db, _USER, _A, _SYMBOL, Decimal("70000"), Decimal("1000000"))
+
+    assert decision.approved is True
 
 
 # ─────────────────────────── evaluate_sell ───────────────────────────

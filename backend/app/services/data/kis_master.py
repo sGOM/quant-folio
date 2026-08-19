@@ -303,3 +303,45 @@ async def latest_stock_master(db, symbol: str) -> dict | None:
     if row is None:
         return None
     return {"trade_date": row.trade_date, "market": row.market, "name": row.name, **row.raw}
+
+
+# 관리종목·정리매매 플래그 필드명은 시장마다 다르다(KOSPI: 축약형, KOSDAQ: "…여부" 형).
+# 원본 스키마 지식이므로 _KOSPI_COLUMNS/_KOSDAQ_COLUMNS 와 함께 이 파일이 소유한다
+# (risk.py 가 문자열 리터럴로 따로 들고 있으면 KIS 포맷 변경 시 조용히 게이트가 열린다).
+_MGMT_FIELD = {"KOSPI": "관리종목", "KOSDAQ": "관리 종목 여부"}
+_LIQ_FIELD = {"KOSPI": "정리매매", "KOSDAQ": "정리매매 여부"}
+
+# ponytail: 달력일 기준 고정 임계값(추석·설 연휴 최대 공백을 넉넉히 커버). KRX 휴장일
+# 캘린더로 "영업일 공백"을 정확히 재는 게 아니므로, 실제 연휴가 이보다 길어지면 조정.
+_MAX_STALE_DAYS = 10
+
+
+def management_block_reason(snapshot: dict | None, *, today: date | None = None) -> str | None:
+    """스냅샷의 관리종목·정리매매 플래그로 매수 차단 사유를 판정한다. 없으면 None.
+
+    스냅샷이 없거나(`None`) `_MAX_STALE_DAYS` 보다 오래됐으면 **판정하지 않고 연다**
+    (fail-open) — `live_gate.py`의 실전 게이트(표본 부족 시 차단)와 반대 방향인 이유는
+    실패 모드가 다르기 때문이다. 이 캐시가 비거나 멈춰도(야간배치 장애·연휴) 매매
+    자체를 전면 차단하면 배치 장애가 매매 중단으로 번진다. 또한 종목마스터 원본에는
+    이 엔진이 거래하지 않는 채권형 펀드·ETN 등 코드도 섞여 있어(예: 관리종목 검사와
+    무관한 `F70100030` 유형), 부재를 근거로 막는 게 늘 안전측도 아니다.
+    거래정지는 `engine/halt.py`가 브로커 응답으로 실시간 판정하므로 여기서 다루지
+    않는다(이 스냅샷은 최대 하루 지연). 시장경고·투자주의환기 등은 매수 자체를
+    막을 사유가 아니라 주의 신호라 의도적으로 미검사.
+    """
+    if snapshot is None:
+        return None
+    trade_date = snapshot.get("trade_date")
+    if trade_date is None:
+        return None
+    if ((today or date.today()) - trade_date).days > _MAX_STALE_DAYS:
+        return None
+
+    market = snapshot.get("market") or ""
+    mgmt_field = _MGMT_FIELD.get(market)
+    if mgmt_field and snapshot.get(mgmt_field) == "Y":
+        return f"관리종목 지정 종목(기준일 {trade_date}) — 신규 매수 차단"
+    liq_field = _LIQ_FIELD.get(market)
+    if liq_field and snapshot.get(liq_field) == "Y":
+        return f"정리매매 종목(기준일 {trade_date}) — 신규 매수 차단"
+    return None

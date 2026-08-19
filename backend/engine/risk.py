@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Execution, Order, OrderSide, Position, RiskLimit
+from app.services.data import kis_master
 
 logger = logging.getLogger("engine.risk")
 
@@ -51,6 +52,10 @@ async def evaluate_buy(
     if price <= 0:
         return RiskDecision(False, 0, "유효하지 않은 가격")
 
+    block_reason = await _check_management_issue(db, symbol)
+    if block_reason:
+        return RiskDecision(False, 0, block_reason)
+
     limit = await _get_limit(db, user_id, strategy_id)
     cash = desired_cash
     if limit and limit.max_position_size is not None:
@@ -66,6 +71,17 @@ async def evaluate_buy(
     if qty <= 0:
         return RiskDecision(False, 0, "주문 가능 수량 부족")
     return RiskDecision(True, qty, "")
+
+
+async def _check_management_issue(db: AsyncSession, symbol: str) -> str | None:
+    """KIS 종목마스터 캐시(관리종목·정리매매)로 신규 매수 차단 사유를 조회한다.
+
+    청산(evaluate_sell)에는 적용하지 않는다 — 이미 보유한 관리종목은 계속 팔 수
+    있어야 한다. 판정 로직(플래그 필드명·fail-open 규칙)은 원본 스키마를 소유한
+    kis_master.py 에 있다(app.services.data.kis_master.management_block_reason).
+    """
+    snapshot = await kis_master.latest_stock_master(db, symbol)
+    return kis_master.management_block_reason(snapshot)
 
 
 async def evaluate_sell(

@@ -361,3 +361,54 @@ def test_latest_stock_master_flattens_raw():
         "trade_date": date(2026, 8, 19), "market": "KOSPI",
         "name": "삼성전자", "거래정지": "N",
     }
+
+
+# ─────────────────────────── management_block_reason ───────────────────────────
+def test_management_block_reason_none_when_snapshot_missing():
+    from app.services.data import kis_master as km
+
+    assert km.management_block_reason(None) is None
+
+
+def test_management_block_reason_blocks_kospi_management_issue():
+    from app.services.data import kis_master as km
+
+    snap = {"trade_date": date(2026, 8, 19), "market": "KOSPI", "관리종목": "Y", "정리매매": "N"}
+    reason = km.management_block_reason(snap, today=date(2026, 8, 19))
+    assert reason is not None
+    assert "관리종목" in reason
+
+
+def test_management_block_reason_blocks_kosdaq_delisting_liquidation():
+    from app.services.data import kis_master as km
+
+    snap = {
+        "trade_date": date(2026, 8, 19), "market": "KOSDAQ",
+        "관리 종목 여부": "N", "정리매매 여부": "Y",
+    }
+    reason = km.management_block_reason(snap, today=date(2026, 8, 19))
+    assert reason is not None
+    assert "정리매매" in reason
+
+
+def test_management_block_reason_none_when_flags_normal():
+    from app.services.data import kis_master as km
+
+    snap = {"trade_date": date(2026, 8, 19), "market": "KOSPI", "관리종목": "N", "정리매매": "N"}
+    assert km.management_block_reason(snap, today=date(2026, 8, 19)) is None
+
+
+def test_management_block_reason_fails_open_when_stale():
+    from app.services.data import kis_master as km
+
+    snap = {"trade_date": date(2026, 8, 1), "market": "KOSPI", "관리종목": "Y"}
+    # today - trade_date = 18일 > _MAX_STALE_DAYS(10) → 판정하지 않고 연다.
+    assert km.management_block_reason(snap, today=date(2026, 8, 19)) is None
+
+
+def test_management_block_reason_within_stale_window_still_blocks():
+    from app.services.data import kis_master as km
+
+    snap = {"trade_date": date(2026, 8, 10), "market": "KOSPI", "관리종목": "Y"}
+    # today - trade_date = 9일 <= _MAX_STALE_DAYS(10) → 여전히 유효.
+    assert km.management_block_reason(snap, today=date(2026, 8, 19)) is not None
