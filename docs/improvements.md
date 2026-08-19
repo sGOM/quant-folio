@@ -1422,7 +1422,7 @@ min/max 클램프는 틀린 방향(요청은 달력일·데이터는 거래일�
 확장이 필요해 이번 배치 범위 밖이었다. 현재는 critical 알림(`code=order_unconfirmed`)
 → 수동 확인까지만 자동화됐다.
 
-## 52. `rebalance_weekday` 클램프 divergence (라이브만 클램프) ⚠️
+## 52. `rebalance_weekday` 클램프 divergence (라이브만 클램프) — 해소 ✅
 
 §50 인접 이슈. 라이브 `engine/rebalance.py::is_rebalance_due` 는 `rebalance_weekday`
 를 0~4로 클램프하지만 백테스트 `_rebalance_dates()` 는 클램프하지 않는다(§53 이 고친
@@ -1430,6 +1430,12 @@ min/max 클램프는 틀린 방향(요청은 달력일·데이터는 거래일�
 `ge=0, le=4`)가 유효값만 통과시켜 실질 영향은 없어 우선순위는 낮지만, `rebalance_dom`
 과 동일한 이유로 `_rebalance_dates()` 에 클램프를 추가해 두는 것이 raw dict 입력
 경로(스키마 우회)에 대한 구조적 방어가 된다.
+
+**해소(2026-08-19)**: `app/services/backtest/portfolio.py::_rebalance_dates` 의
+`weekday` 계산을 `min(max(int(cfg.get("rebalance_weekday") or 0), 0), 4)` 로 바꿔
+라이브 `is_rebalance_due` 와 동일하게 클램프했다. `test_rebalance_dates_clamps_
+weekday_out_of_range`(`tests/test_rebalance.py`) 신설 — weekday=9 raw dict 입력이
+4(금요일)로 클램프되어 주기를 건너뛰지 않음을 검증.
 
 ## 53. `rebalance_runner._quotes()` 가 리터럴 "0" 시세 문자열을 결측으로 못 거름 — 해소 ✅
 

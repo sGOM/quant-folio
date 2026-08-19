@@ -2075,3 +2075,19 @@ def test_rebalance_dates_dom_within_month_length_unchanged():
         "2023-02-15",
         "2023-03-15",
     ]
+
+
+def test_rebalance_dates_clamps_weekday_out_of_range():
+    """rebalance_weekday 가 0~4 범위를 벗어나면 4(금요일)로 클램프한다(§52).
+
+    라이브 is_rebalance_due(engine/rebalance.py)는 이미 min(max(...,0),4) 로 클램프
+    한다. 클램프가 없으면 weekday=9 인 주간 전략은 d.weekday() < weekday 를 항상
+    만족해(평일 최대값 4) 매주 조건을 만족하는 거래일이 없어 주기를 통째로 건너뛴다.
+    """
+    from app.services.backtest.portfolio import _rebalance_dates
+
+    dates = pd.bdate_range("2023-01-02", "2023-01-20")  # 3주(월~금) 구간
+    picked = sorted(_rebalance_dates(dates, {"cadence": "weekly", "rebalance_weekday": 9}))
+    assert [d.date().isoformat() for d in picked] == [
+        "2023-01-06", "2023-01-13", "2023-01-20",  # 4(금)로 클램프 → 매주 첫 금요일
+    ]

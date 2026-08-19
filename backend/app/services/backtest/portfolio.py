@@ -143,9 +143,13 @@ def _rebalance_dates(dates: pd.DatetimeIndex, cfg: dict) -> set[pd.Timestamp]:
     백테스트/실거래 동작이 갈린다. 스키마(RebalanceConfig.rebalance_dom, ge=1 le=28)가
     현재는 그런 값을 막고 있어 검증 경로로는 도달하지 않지만, 이 함수는 raw dict 를 받으므로
     두 경로의 규약을 구조적으로 일치시켜 둔다.
+
+    weekday 도 같은 이유로 실거래 is_rebalance_due(`engine/rebalance.py`)와 동일하게
+    0~4 로 클램프한다(§52). 스키마(`ge=0, le=4`)가 유효값만 통과시켜 검증 경로로는
+    영향이 없지만, raw dict 입력에 대한 구조적 방어는 dom 과 동일하게 갖춰 둔다.
     """
     cadence = cfg.get("cadence", "monthly")
-    weekday = int(cfg.get("rebalance_weekday") or 0)
+    weekday = min(max(int(cfg.get("rebalance_weekday") or 0), 0), 4)
     dom = int(cfg.get("rebalance_dom") or 1)
 
     picked: set[pd.Timestamp] = set()
