@@ -30,7 +30,9 @@ import pandas as pd
 from app.services.data.errors import (
     DataSourceError,
     SourceSchemaError,
+    SourceUnavailableError,
     classify_httpx,
+    cooldown_remaining,
     note_failure,
     representative,
 )
@@ -178,6 +180,14 @@ def _parse_master(text: str, market: str) -> list[dict]:
 
 
 def _download_zip(market: str) -> bytes:
+    # 쿨다운 검사는 호출 직전 한 곳(여기)에서만 한다 — 걸어두기만 하고 아무도 읽지
+    # 않으면 죽은 코드이고, 다운로드 장애 시 매 호출이 네트워크 타임아웃을 새로 소진한다.
+    # 이미 걸린 쿨다운을 검사만 하고 갱신하지는 않는다(여기서 note_failure 하면
+    # 호출이 들어오는 한 쿨다운이 끝없이 연장된다).
+    remaining = cooldown_remaining("kis_master")
+    if remaining > 0:
+        raise SourceUnavailableError("kis_master", f"쿨다운 중 — 다운로드 생략({remaining:.0f}초 남음)")
+
     url = _BASE_URL.format(name=_FILE_NAMES[market])
     try:
         resp = httpx.get(url, timeout=_TIMEOUT, follow_redirects=True)

@@ -11,6 +11,16 @@ from datetime import date
 
 import pytest
 
+from app.services.data.errors import clear_cooldown, note_failure
+
+
+@pytest.fixture(autouse=True)
+def _clean_cooldown():
+    """전송 실패 테스트가 건 kis_master 쿨다운이 다른 테스트로 새지 않게 한다."""
+    clear_cooldown("kis_master")
+    yield
+    clear_cooldown("kis_master")
+
 
 def test_kis_stock_master_snapshot_model_schema():
     from app.models import KisStockMasterSnapshot
@@ -175,3 +185,30 @@ def test_fetch_market_master_bad_zip_raises_schema_error(monkeypatch):
 
     with pytest.raises(SourceSchemaError):
         km.fetch_market_master("KOSPI")
+
+
+def test_fetch_market_master_during_cooldown_skips_httpx_call(monkeypatch):
+    """쿨다운 중에는 httpx.get을 호출하지 않고 즉시 SourceUnavailableError를 raise한다."""
+    from app.services.data import kis_master as km
+    from app.services.data.errors import SourceUnavailableError
+
+    # 쿨다운을 설정한다
+    note_failure(SourceUnavailableError("kis_master", "test cooldown"))
+
+    # httpx.get이 호출되지 않았는지 확인할 카운터
+    call_count = {"count": 0}
+
+    def fake_get(*a, **kw):
+        call_count["count"] += 1
+        raise AssertionError("httpx.get should not be called during cooldown")
+
+    monkeypatch.setattr(km.httpx, "get", fake_get)
+
+    # 쿨다운 중이므로 즉시 raise
+    with pytest.raises(SourceUnavailableError) as exc_info:
+        km.fetch_market_master("KOSPI")
+
+    # httpx.get이 호출되지 않았는지 확인
+    assert call_count["count"] == 0
+    # 쿨다운 메시지가 있는지 확인
+    assert "쿨다운" in str(exc_info.value)
