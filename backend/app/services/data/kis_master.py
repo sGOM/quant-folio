@@ -225,3 +225,77 @@ def fetch_market_master(market: str) -> list[dict]:
     zip_bytes = _download_zip(market)
     text = _extract_mst_text(zip_bytes, market)
     return _parse_master(text, market)
+
+
+async def snapshot_stock_master(db, trade_date: date | None = None) -> int:
+    """KOSPI+KOSDAQ 종목마스터를 지정일(기본 오늘) 스냅샷으로 적재한다.
+
+    한 시장이 실패해도 다른 시장은 저장한다(§48 부분 실패 관례) — 두 시장이 모두
+    실패했을 때만 대표 예외를 올린다. 같은 날 재실행은 해당 시장 행을 지우고
+    다시 넣어 덮어쓴다(멱등). flush 만 하고 commit 은 호출부 책임이다
+    (krx_index.snapshot_sector_map 과 동일한 트랜잭션 경계).
+
+    :raises DataSourceError: 두 시장 모두 실패했을 때, 원인 우선순위상 대표 예외
+    """
+    from sqlalchemy import delete
+
+    from app.models import KisStockMasterSnapshot
+
+    snap_date = trade_date or date.today()
+    errors: list[DataSourceError] = []
+    saved = 0
+
+    for market in ("KOSPI", "KOSDAQ"):
+        try:
+            rows = fetch_market_master(market)
+        except DataSourceError as e:
+            errors.append(e)
+            logger.warning("KIS 종목마스터(%s) 적재 실패 — 스킵: %s", market, e)
+            continue
+
+        await db.execute(
+            delete(KisStockMasterSnapshot).where(
+                KisStockMasterSnapshot.market == market,
+                KisStockMasterSnapshot.trade_date == snap_date,
+            )
+        )
+        db.add_all(
+            [
+                KisStockMasterSnapshot(
+                    trade_date=snap_date, symbol=r["symbol"], market=market,
+                    name=r["name"], raw=r["raw"],
+                )
+                for r in rows
+            ]
+        )
+        saved += len(rows)
+
+    if saved == 0 and errors:
+        raise representative(errors)
+
+    await db.flush()
+    logger.info(
+        "KIS 종목마스터 스냅샷 적재: trade_date=%s %d종목(성공 시장 %d/2)",
+        snap_date, saved, 2 - len(errors),
+    )
+    return saved
+
+
+async def latest_stock_master(db, symbol: str) -> dict | None:
+    """symbol 의 가장 최근 종목마스터 스냅샷을 반환한다. 없으면 None.
+
+    반환 딕셔너리: {"trade_date", "market", "name", **raw}.
+    """
+    from sqlalchemy import select
+
+    from app.models import KisStockMasterSnapshot
+
+    row = await db.scalar(
+        select(KisStockMasterSnapshot)
+        .where(KisStockMasterSnapshot.symbol == symbol)
+        .order_by(KisStockMasterSnapshot.trade_date.desc())
+        .limit(1)
+    )
+    if row is None:
+        return None
+    return {"trade_date": row.trade_date, "market": row.market, "name": row.name, **row.raw}

@@ -212,3 +212,120 @@ def test_fetch_market_master_during_cooldown_skips_httpx_call(monkeypatch):
     assert call_count["count"] == 0
     # 쿨다운 메시지가 있는지 확인
     assert "쿨다운" in str(exc_info.value)
+
+
+class _FakeMasterDB:
+    """KisStockMasterSnapshot 대상 execute/add_all/flush 만 지원하는 최소 대역."""
+
+    def __init__(self):
+        self.deleted_markets: list[str] = []
+        self.added: list = []
+        self.flushed = False
+
+    async def execute(self, stmt):
+        self.deleted_markets.append(str(stmt))
+        return None
+
+    def add_all(self, objs):
+        self.added.extend(objs)
+
+    async def flush(self):
+        self.flushed = True
+
+
+def test_snapshot_stock_master_saves_both_markets(monkeypatch):
+    import asyncio
+
+    from app.services.data import kis_master as km
+
+    def _fake_fetch(market):
+        if market == "KOSPI":
+            return [{"symbol": "005930", "name": "삼성전자", "raw": {"거래정지": "N"}}]
+        return [{"symbol": "247540", "name": "에코프로비엠", "raw": {"거래정지 여부": "N"}}]
+
+    monkeypatch.setattr(km, "fetch_market_master", _fake_fetch)
+    db = _FakeMasterDB()
+
+    n = asyncio.run(km.snapshot_stock_master(db, trade_date=date(2026, 8, 19)))
+
+    assert n == 2
+    assert {o.symbol for o in db.added} == {"005930", "247540"}
+    assert {o.market for o in db.added} == {"KOSPI", "KOSDAQ"}
+    assert all(o.trade_date == date(2026, 8, 19) for o in db.added)
+    assert db.flushed
+
+
+def test_snapshot_stock_master_partial_failure_still_saves_other_market(monkeypatch):
+    import asyncio
+
+    from app.services.data import kis_master as km
+    from app.services.data.errors import SourceUnavailableError
+
+    def _fake_fetch(market):
+        if market == "KOSPI":
+            raise SourceUnavailableError("kis_master", "다운로드 실패")
+        return [{"symbol": "247540", "name": "에코프로비엠", "raw": {}}]
+
+    monkeypatch.setattr(km, "fetch_market_master", _fake_fetch)
+    db = _FakeMasterDB()
+
+    n = asyncio.run(km.snapshot_stock_master(db, trade_date=date(2026, 8, 19)))
+
+    assert n == 1
+    assert {o.symbol for o in db.added} == {"247540"}
+
+
+def test_snapshot_stock_master_both_markets_fail_raises(monkeypatch):
+    import asyncio
+
+    from app.services.data import kis_master as km
+    from app.services.data.errors import DataSourceError, SourceUnavailableError
+
+    def _fake_fetch(market):
+        raise SourceUnavailableError("kis_master", f"{market} 다운로드 실패")
+
+    monkeypatch.setattr(km, "fetch_market_master", _fake_fetch)
+    db = _FakeMasterDB()
+
+    with pytest.raises(DataSourceError):
+        asyncio.run(km.snapshot_stock_master(db, trade_date=date(2026, 8, 19)))
+
+    assert db.added == []
+
+
+class _FakeScalarDB:
+    def __init__(self, row):
+        self._row = row
+
+    async def scalar(self, stmt):
+        return self._row
+
+
+def test_latest_stock_master_returns_none_when_missing():
+    import asyncio
+
+    from app.services.data import kis_master as km
+
+    db = _FakeScalarDB(None)
+    result = asyncio.run(km.latest_stock_master(db, "999999"))
+    assert result is None
+
+
+def test_latest_stock_master_flattens_raw():
+    import asyncio
+
+    from app.services.data import kis_master as km
+
+    class _Row:
+        trade_date = date(2026, 8, 19)
+        market = "KOSPI"
+        name = "삼성전자"
+        raw = {"거래정지": "N"}
+
+    db = _FakeScalarDB(_Row())
+    result = asyncio.run(km.latest_stock_master(db, "005930"))
+
+    assert result == {
+        "trade_date": date(2026, 8, 19), "market": "KOSPI",
+        "name": "삼성전자", "거래정지": "N",
+    }
