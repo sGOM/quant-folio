@@ -318,6 +318,36 @@ class SectorMapSnapshot(Base):
     )
 
 
+# ─────────────────────── kis_stock_master_snapshots ───────────────────────
+class KisStockMasterSnapshot(Base):
+    """KIS 종목마스터(거래정지·관리종목·액면가·업종분류 등) 일별 스냅샷.
+
+    KRX MDC/FDR/DART 어디에도 없던 매매 상태 플래그를 KIS 공개 CDN 의 시장 전체
+    zip(worker.snapshot_kis_stock_master, 매일 18:40 KST)에서 받아 적재한다. 원본
+    필드는 시장별로 다르고(60~70개) 소비처가 아직 불확실해 raw JSONB 로 무손실
+    보존하고, 조회 빈도가 확실한 name 만 승격 컬럼으로 둔다
+    (docs/superpowers/specs/2026-08-18-kis-stock-master-cache-design.md).
+    이 파일이 제공하는 정보는 '현재' 상태뿐이라 스냅샷 도입 이전 구간은 소급
+    적용이 불가능하다(sector_map_snapshots 와 동일한 구조적 한계).
+    """
+    __tablename__ = "kis_stock_master_snapshots"
+    __table_args__ = (
+        UniqueConstraint("symbol", "trade_date", name="uq_kis_stock_master_symbol_date"),
+        Index("ix_kis_stock_master_date", "trade_date"),
+        Index("ix_kis_stock_master_symbol", "symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    market: Mapped[str] = mapped_column(String(10), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    raw: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 # ─────────────────────────── news_articles ───────────────────────────
 class NewsArticle(Base):
     """경제 뉴스 기사(docs/ROADMAP.md M3 — 수집·요약·종목 연계).
