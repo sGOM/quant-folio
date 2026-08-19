@@ -1537,6 +1537,44 @@ async def test_live_equity_reflects_realized_pnl_from_past_roundtrip(monkeypatch
     assert await r._live_equity() == 10_005_000.0
 
 
+class _ScalarFakeDb:
+    def __init__(self, value):
+        self._value = value
+
+    async def scalar(self, stmt):
+        return self._value
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+async def test_has_holdings_true_without_consulting_pit_pool(monkeypatch):
+    """§54: 후보풀에서 빠진 종목만 보유해도 '보유 있음'으로 판정해야 한다.
+
+    구현이 pool 필터 없이 판정한다는 걸 증명하기 위해 _resolve_universe 를 호출
+    시 실패하도록 만들어 둔다 — 여전히 호출된다면 이 테스트가 실패한다.
+    """
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._user_id = 1
+
+    async def _boom(as_of):
+        raise AssertionError("_has_holdings 가 PIT 후보풀을 조회해서는 안 된다")
+
+    monkeypatch.setattr(r, "_resolve_universe", _boom)
+    monkeypatch.setattr(rebalance_runner, "AsyncSessionLocal", lambda: _ScalarFakeDb(42))
+    assert await r._has_holdings() is True
+
+
+async def test_has_holdings_false_when_no_positions(monkeypatch):
+    r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())
+    r._user_id = 1
+    monkeypatch.setattr(rebalance_runner, "AsyncSessionLocal", lambda: _ScalarFakeDb(None))
+    assert await r._has_holdings() is False
+
+
 async def _mdd_runner(monkeypatch, *, mdd_kill_pct=0.2, rearm_days=5):
     """MDD 킬스위치 상태기계만 검증하기 위해 자산가치·거래일 판정을 대체한 러너."""
     r = RebalanceRunner(strategy_id=1, redis=_FakeRedis())

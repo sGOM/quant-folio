@@ -1440,13 +1440,19 @@ min/max 클램프는 틀린 방향(요청은 달력일·데이터는 거래일�
 과소계상된다. 주문 생성 자체는 `rebalance.py:347` 의 `price <= 0` 가드가 막으므로
 오청산 위험은 없고 MDD 판정의 사이징 왜곡에 그친다.
 
-## 54. `_has_holdings()` 가 PIT 유니버스 밖 보유를 "현금"으로 오판 ⚠️
+## 54. `_has_holdings()` 가 PIT 유니버스 밖 보유를 "현금"으로 오판 — 해소 ✅
 
 `_live_equity()` 의 유니버스 이탈 자산 누락(2026-08-17 수정 완료)과 같은 뿌리.
 `_has_holdings()` 는 여전히 `_holdings(db, pool)` 로 PIT 후보풀 필터를 거치므로,
 후보풀에서 빠진 종목만 보유한 전략은 "보유 전무"로 읽혀 MDD rearm·재진입·bootstrap
 로직이 기존 포지션 위에 중복 진입을 시도할 수 있다. 백테스트의 `not val` 판정
 (포지션 딕셔너리 자체를 봄, 후보풀과 무관)과 계약이 어긋난다.
+
+**해소(2026-08-19)**: `_has_holdings()` 가 더 이상 `_resolve_universe`/`_holdings`
+를 거치지 않고, 이 전략의 포지션(수량>0) 존재 여부를 후보풀과 무관하게 직접 쿼리
+하도록 바꿨다 — 백테스트의 `not val` 계약과 일치. `test_has_holdings_true_without_
+consulting_pit_pool`(호출 시 `_resolve_universe` 가 불리면 실패하도록 만들어 pool
+의존이 완전히 제거됐음을 증명)·`test_has_holdings_false_when_no_positions` 신설.
 
 ## 55. `cached_frame` 최초 조회(원격)와 재조회(로컬)의 dedup 형태 불일치 ⚠️
 

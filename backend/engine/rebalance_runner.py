@@ -271,11 +271,24 @@ class RebalanceRunner(BaseRunner):
         await self.redis.set(self._regime_key(), "1" if risk_off else "0", ex=_LAST_TTL)
 
     async def _has_holdings(self) -> bool:
-        """후보풀(고정/PIT) 종목의 보유 포지션(수량>0)이 하나라도 있는지."""
-        pool = await self._resolve_universe(_last_business_day())
+        """이 전략의 보유 포지션(수량>0)이 하나라도 있는지 — PIT 후보풀과 무관하게 판정한다.
+
+        예전엔 `_holdings(db, pool)` 로 PIT 후보풀 필터를 거쳤는데, 후보풀에서
+        빠진 종목만 보유한 전략은 "보유 전무"로 오판돼 MDD rearm·재진입·bootstrap
+        로직이 기존 포지션 위에 중복 진입을 시도할 수 있었다(§54). 백테스트의
+        `not val` 판정(포지션 딕셔너리 자체를 봄, 후보풀과 무관)과 계약을 맞춘다.
+        """
         async with AsyncSessionLocal() as db:
-            positions = await self._holdings(db, pool)
-        return bool(positions)
+            exists = await db.scalar(
+                select(Position.id)
+                .where(
+                    Position.user_id == self._user_id,
+                    Position.strategy_id == self.strategy_id,
+                    Position.qty > 0,
+                )
+                .limit(1)
+            )
+        return exists is not None
 
     # ───────────────────── MDD 킬스위치 상태(고점 HWM·발동) ─────────────────────
     #
