@@ -21,7 +21,7 @@ class RecommendMember(BaseModel):
     name: str
     price: Optional[int] = None  # 결측(종가 조회 실패)이면 None — 0 sentinel 아님(§50)
     change_rate: Optional[float] = None  # 당일 등락률(소수)
-    market_cap: int
+    market_cap: Optional[int] = None  # 결측(시총 조회 실패)이면 None — 0 sentinel 아님
     avg_value_20: float
     # ── 밸류에이션(div은 pykrx 원값 %) ──
     per: Optional[float] = None

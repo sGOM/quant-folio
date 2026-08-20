@@ -1600,4 +1600,22 @@ devDependency 미설치로 무관). vitest 실행은 docker 미기동으로 미�
 이미 구현됐던 것을 오늘 재확인 후 현재 main 기준으로 재적용했다. 원본의
 §41·§42는 번호가 재사용돼 §60·§61로 새로 기록한다.
 
+## 62. `RecommendMember.market_cap` 도 §50과 동일한 0 sentinel 패턴 — 해소 ✅
+
+§50에서 `price`만 고치고 인접한 `market_cap=int(row["시가총액"]) if not _is_nan(...)
+else 0`은 범위 밖으로 남겨뒀다(2026-08-19 전체 재스캔 발견 #1). 결측 시총을 0으로
+반환하면 프론트가 실제 시총 0원 상장사와 구분할 수 없다.
+
+**해소(2026-08-19)**: `price`와 동일한 패턴으로 계약을 바꿨다.
+`app/schemas/recommend.py::RecommendMember.market_cap`을 `Optional[int] = None`으로,
+`app/services/recommend.py`의 sentinel `else 0`을 `else None`으로 변경. 이 필드로
+정렬하는 `items.sort(key=lambda m: m.market_cap, ...)`이 `None`과 `int`를 비교해
+`TypeError`가 나므로 정렬 키를 `m.market_cap if m.market_cap is not None else -1`로
+고쳐 결측을 정렬 맨 뒤로 보냈다. 프론트 `lib/api.ts::RecommendMember.market_cap`
+타입을 `number | null`로 변경(렌더 쪽 `recommend/page.tsx`는 이미 `fmtAmt`가
+null을 `"-"`로 처리하므로 손댈 필요 없음). `test_market_cap_none_when_missing_and_
+sort_does_not_crash`(`tests/test_recommend.py`) 신설 — 결측 시 `None`, 정렬이
+예외 없이 결측을 맨 뒤로 보냄을 검증. 백엔드 전체 스위트 930 passed, 프론트
+lint→vitest(131 passed)→build 모두 통과.
+
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.

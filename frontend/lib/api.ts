@@ -851,8 +851,8 @@ export interface RecommendMember {
   price: number | null;
   /** 당일 등락률(소수 비율). */
   change_rate: number | null;
-  /** 시가총액(원). */
-  market_cap: number;
+  /** 시가총액(원). 시총 조회 실패 시 결측(null) — 0 이 아니다. */
+  market_cap: number | null;
   /** 20일 평균 거래대금(원). */
   avg_value_20: number;
   per: number | null;
