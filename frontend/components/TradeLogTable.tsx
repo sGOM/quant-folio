@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { BacktestTrade } from "@/lib/api";
-import { fmtPct, formatKRW, pctColor } from "@/lib/format";
+import { fmtPct, fmtKRW, formatKRW, pctColor } from "@/lib/format";
 
 // lib/format 공용 헬퍼에 이 컴포넌트의 표준 자릿수(2)만 입힌 별칭 — 포맷 로직 중복 금지.
 const pct = (x: number | null | undefined) => fmtPct(x, 2);
@@ -150,7 +150,7 @@ export function TradeLogTable({
                 </td>
                 <td className="py-1 text-right">{formatKRW(tr.amount)}</td>
                 <td className="py-1 text-right">
-                  {tr.price == null ? "-" : formatKRW(tr.price, false)}
+                  {fmtKRW(tr.price, false)}
                 </td>
                 <td className={`py-1 text-right ${pctColor(tr.position_return)}`}>
                   {tr.position_return === null || tr.position_return === undefined

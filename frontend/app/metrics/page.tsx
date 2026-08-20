@@ -31,7 +31,7 @@ import {
   TooltipProvider,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { fmtPct, fmtNum, fmtAmt, formatKRW, formatNumber, pctColor } from "@/lib/format";
+import { fmtPct, fmtNum, fmtAmt, fmtKRW, formatNumber, pctColor } from "@/lib/format";
 
 /** 종합점수(score) 계산 방식 설명 — 헤더 툴팁·안내에 공용으로 사용. */
 const SCORE_HINT =
@@ -529,7 +529,7 @@ function StockRow({ row }: { row: StockMetric }) {
       </td>
       {/* 가격 */}
       <td className="px-3 py-2 text-right tabular-nums">
-        {row.price == null ? "-" : formatKRW(row.price, false)}
+        {fmtKRW(row.price, false)}
       </td>
       <td
         className={cn(
