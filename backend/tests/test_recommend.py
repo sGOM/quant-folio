@@ -124,6 +124,27 @@ def test_price_none_when_close_and_fallback_both_missing(monkeypatch):
     assert by_code["000660"].price == 143_000  # 정상 종가는 그대로 채워진다
 
 
+def test_market_cap_none_when_missing_and_sort_does_not_crash(monkeypatch):
+    """market_cap 이 결측(NaN)이면 0 sentinel 이 아니라 None 이어야 하고,
+    시가총액 내림차순 정렬(None 은 맨 뒤)이 TypeError 없이 동작해야 한다.
+    """
+    codes = _patch_common(monkeypatch, qmetrics_side_effect=lambda members, as_of: {})
+    cap_df = pd.DataFrame(
+        {"시가총액": [np.nan, 100_000_000_000_000],
+         "상장주식수": [5_000_000_000, 700_000_000]},
+        index=codes,
+    )
+    monkeypatch.setattr(recommend_mod, "_fetch_market_cap", lambda *a: cap_df)
+
+    out = recommend_mod.compute_kospi200_scored(AS_OF)
+
+    by_code = {m.code: m for m in out.items}
+    assert by_code["005930"].market_cap is None
+    assert by_code["000660"].market_cap == 100_000_000_000_000
+    # 결측(None)이 정렬 마지막으로 밀려나 있어야 한다.
+    assert out.items[-1].code == "005930"
+
+
 def test_opendart_failure_falls_back_to_neutral_without_raising(monkeypatch):
     """DataSourceError(외부 장애)는 삼키고 중립 처리한다(Task 7 — except DataSourceError)."""
     def _boom(members, as_of):

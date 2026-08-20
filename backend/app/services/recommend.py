@@ -155,7 +155,7 @@ def compute_kospi200_scored(as_of: date) -> RecommendOut:
             name=seed_names.get(code_str) or krx_names.get(code_str) or code_str,
             price=int(round(float(row["price_close"]))) if not _is_nan(row.get("price_close")) else None,
             change_rate=_safe_float(row.get("change_rate")),
-            market_cap=int(row["시가총액"]) if not _is_nan(row.get("시가총액")) else 0,
+            market_cap=int(row["시가총액"]) if not _is_nan(row.get("시가총액")) else None,
             avg_value_20=_safe_float(row.get("avg_value_20")) or 0.0,
             per=_safe_float(row.get("PER")),
             pbr=_safe_float(row.get("PBR")),
@@ -173,8 +173,8 @@ def compute_kospi200_scored(as_of: date) -> RecommendOut:
             score_growth=_safe_float(row.get("score_growth")),
         ))
 
-    # 시가총액 내림차순 기본 정렬(프론트가 가중점수로 재정렬).
-    items.sort(key=lambda m: m.market_cap, reverse=True)
+    # 시가총액 내림차순 기본 정렬(결측은 맨 뒤로, 프론트가 가중점수로 재정렬).
+    items.sort(key=lambda m: m.market_cap if m.market_cap is not None else -1, reverse=True)
     logger.info("KOSPI200 추천 스코어링 완료: %d종목(as_of=%s)", len(items), as_of_ymd)
     return RecommendOut(
         as_of=as_of, index=_INDEX, count=len(items),
