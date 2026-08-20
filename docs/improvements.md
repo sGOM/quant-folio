@@ -1618,4 +1618,19 @@ sort_does_not_crash`(`tests/test_recommend.py`) 신설 — 결측 시 `None`, �
 예외 없이 결측을 맨 뒤로 보냄을 검증. 백엔드 전체 스위트 930 passed, 프론트
 lint→vitest(131 passed)→build 모두 통과.
 
+## 63. null 허용 원화 포맷이 3곳에 인라인 삼항식으로 중복 — 해소 ✅
+
+`recommend/page.tsx`·`metrics/page.tsx`·`TradeLogTable.tsx`가 각자
+`x == null ? "-" : formatKRW(x, false)` 를 인라인으로 반복하고 있었다
+(2026-08-19 전체 재스캔 발견 #3). `lib/format.ts` 에 이미 `fmtPct`/`fmtNum`/
+`fmtAmt`/`pctColor` 로 확립된 "null 허용 표시 헬퍼" 패턴이 있는데 원화만
+빠져 있었다.
+
+**해소(2026-08-19)**: 같은 패턴으로 `lib/format.ts::fmtKRW(v, withUnit=true)`
+신설(`v == null ? "-" : formatKRW(v, withUnit)`). 3곳 모두 인라인 삼항식을
+`fmtKRW(...)` 호출로 교체하고, 대체된 자리에서만 쓰이던 `formatKRW` import를
+정리했다(`TradeLogTable.tsx`는 `tr.amount`처럼 non-null 값에도 `formatKRW`를
+계속 쓰므로 두 함수 모두 import 유지). `format.test.ts` 에 `fmtKRW` 테스트
+신설. 프론트 lint→vitest(133 passed)→build 모두 통과.
+
 새로운 개선 후보가 쌓이면 이 문서에 이어서 추가한다.

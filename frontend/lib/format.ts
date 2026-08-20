@@ -52,6 +52,11 @@ export function fmtNum(v: number | null | undefined, digits = 1): string {
   return v == null ? "-" : v.toFixed(digits);
 }
 
+/** null 가능한 원화 금액. null → "-". */
+export function fmtKRW(v: number | null | undefined, withUnit = true): string {
+  return v == null ? "-" : formatKRW(v, withUnit);
+}
+
 /** 원화 금액을 조/억/만 단위로 축약. null → "-". */
 export function fmtAmt(v: number | null | undefined): string {
   if (v == null) return "-";

@@ -8,6 +8,7 @@ import {
   fmtPct,
   fmtNum,
   fmtAmt,
+  fmtKRW,
   pctColor,
   formatRelativeTime,
 } from "@/lib/format";
@@ -79,6 +80,18 @@ describe("fmtPct / fmtNum", () => {
   it("값이 있으면 formatPercent/toFixed를 사용한다", () => {
     expect(fmtPct(0.0567)).toBe("+5.7%");
     expect(fmtNum(3.14159, 2)).toBe("3.14");
+  });
+});
+
+describe("fmtKRW", () => {
+  it("null/undefined는 '-'", () => {
+    expect(fmtKRW(null)).toBe("-");
+    expect(fmtKRW(undefined)).toBe("-");
+  });
+
+  it("값이 있으면 formatKRW 와 동일하게 표시한다", () => {
+    expect(fmtKRW(1234567)).toBe("1,234,567원");
+    expect(fmtKRW(1234567, false)).toBe("1,234,567");
   });
 });
 

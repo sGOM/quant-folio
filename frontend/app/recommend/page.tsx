@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import { fmtPct, fmtNum, fmtAmt, formatKRW, pctColor } from "@/lib/format";
+import { fmtPct, fmtNum, fmtAmt, fmtKRW, pctColor } from "@/lib/format";
 
 // ─────────────────────────── 팩터 정의 ───────────────────────────
 
@@ -414,7 +414,7 @@ function ResultTable({
                 <div className="font-mono text-[11px] text-muted-foreground">{m.code}</div>
               </td>
               <td className="px-3 py-2 text-right tabular-nums">
-                {m.price != null ? formatKRW(m.price, false) : "-"}
+                {fmtKRW(m.price, false)}
               </td>
               <td className={cn("px-3 py-2 text-right tabular-nums", pctColor(m.change_rate))}>
                 {m.change_rate == null
