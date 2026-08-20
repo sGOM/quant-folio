@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { Watchlist } from "@/app/monitor/page";
+import { Watchlist } from "@/app/monitor/Watchlist";
 import { api } from "@/lib/api";
 
 /** 테스트마다 격리된 QueryClient 로 감싼 래퍼(캐시가 테스트 간 새지 않도록). */
