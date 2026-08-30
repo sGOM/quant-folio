@@ -4,6 +4,21 @@
 제품 정의는 [`docs/PRD.md`](docs/PRD.md), 백엔드 학습 가이드는 [`help/README.md`](help/README.md) 참고.
 **코드 작성·수정 시 [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md)(코드 컨벤션)를 따를 것.**
 
+## 도메인 지식 — `.claude/rules/`
+
+작업 전 아래 표에서 **해당 문서 하나만** 읽는다(전부 읽지 말 것).
+인덱스: [`.claude/rules/README.md`](.claude/rules/README.md)
+
+| 작업 영역 | 문서 |
+|---|---|
+| 서비스 구성·Redis 통신 규약·배치 스케줄·기동 함정 | `.claude/rules/architecture.md` |
+| DB 테이블·관계·삭제 정책 | `.claude/rules/data-model.md` (→ `data-model/trading.md`, `data-model/market-store.md`) |
+| 외부 데이터 조회·캐시 정책·팩터 | `.claude/rules/market-data.md` |
+| 백테스트 엔진·성과지표·전략 판정 기준 | `.claude/rules/backtest.md` |
+| 실시간 매매 엔진·주문 멱등·리스크 | `.claude/rules/trading-engine.md` |
+| REST/WS 엔드포인트·인증·응답 계약 | `.claude/rules/api.md` |
+| Next.js 화면·표시 규약 | `.claude/rules/frontend.md` |
+
 ## 아키텍처 (한 줄 지도)
 
 Docker Compose로 뜨는 별도 프로세스들. 서로 **Redis(pub/sub·큐·분산락)**로 통신.
