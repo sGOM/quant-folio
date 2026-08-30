@@ -21,7 +21,6 @@ import numpy as np
 import pandas as pd
 
 from app.schemas.screener import TurnaroundCandidate, TurnaroundScreenOut
-from app.services._num import is_nan
 from app.services.data import opendart
 from app.services.data.errors import DataSourceError
 from app.services.metrics import (
@@ -126,7 +125,9 @@ def screen_turnaround(
     items: list[TurnaroundCandidate] = []
     for code in candidates:
         surge_v = _safe_float(liquid.loc[code, "turnover_surge"])
-        mcap = int(liquid.loc[code, "시가총액"]) if not is_nan(liquid.loc[code, "시가총액"]) else 0
+        # 결측 가드 불필요 — 위에서 시가총액 컬럼 부재는 조기 반환(빈 결과)이고,
+        # `cap_df["시가총액"] <= threshold` 가 NaN 행을 이미 떨어뜨린다.
+        mcap = int(liquid.loc[code, "시가총액"])
         avgv = _safe_float(liquid.loc[code, "avg_value_20"]) or 0.0
         # 시장 라벨은 시총 프레임이 실어온 `market` 태그를 쓴다(§49 B1 이후
         # `_fetch_market_cap` 이 시장별로 태깅한다). 예전에는 pykrx 가 낸 적 없는

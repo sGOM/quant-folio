@@ -34,6 +34,7 @@ from app.services.data.errors import (
     note_failure,
     representative,
 )
+from app.services.market import now_kst
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +240,10 @@ async def snapshot_stock_master(db, trade_date: date | None = None) -> int:
 
     from app.models import KisStockMasterSnapshot
 
-    snap_date = trade_date or date.today()
+    # `date.today()` 를 쓰지 않는다 — KRX 거래일은 KST 기준인데 컨테이너 TZ 는 UTC 라,
+    # 야간 배치를 KST 00:00~09:00 으로 옮기면 스냅샷 거래일이 조용히 하루 어긋난다
+    # (worker/tasks.py::_snapshot_target_date 가 같은 이유로 now_kst 를 쓴다).
+    snap_date = trade_date or now_kst().date()
     errors: list[DataSourceError] = []
     saved = 0
 
@@ -334,7 +338,7 @@ def management_block_reason(snapshot: dict | None, *, today: date | None = None)
     trade_date = snapshot.get("trade_date")
     if trade_date is None:
         return None
-    if ((today or date.today()) - trade_date).days > _MAX_STALE_DAYS:
+    if ((today or now_kst().date()) - trade_date).days > _MAX_STALE_DAYS:
         return None
 
     market = snapshot.get("market") or ""
