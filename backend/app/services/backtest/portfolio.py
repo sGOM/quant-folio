@@ -75,6 +75,7 @@ from __future__ import annotations
 import calendar
 import logging
 import math
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -692,6 +693,117 @@ def _apply_rebalance(
     return cash, turnover, executed_notional
 
 
+#: 패닉 지표 라벨의 심각도 순위 — Arm 임계(arm_level) 비교에 쓴다.
+_PANIC_LEVEL_RANK = {"normal": 0, "caution": 1, "warning": 2, "panic": 3}
+
+
+@dataclass(frozen=True)
+class PanicOverlayParams:
+    """패닉 오버레이(P2) 파라미터 — config["panic_overlay"] 를 해석한 결과.
+
+    `_parse_panic_overlay` 로만 만든다. 불변이라 백테스트 루프가 값을 흔들 수 없다.
+    """
+
+    arm_rank: int              # Arm 임계 라벨의 심각도 순위(이상이면 Arm)
+    arm_window: int            # Arm 후 Confirm 을 기다리는 거래일 수
+    hold_days: int             # Confirm 후 오버레이를 유지하는 거래일 수
+    profit_reclaim_pct: float  # 익절 — 자본항복일 낙폭의 되돌림 비율
+    knife_stop_pct: float      # 손절 — 자본항복일 저가 대비 추가 하락률
+    base_exposure: float       # 평시(코어) 총투자비중
+    panic_exposure: float      # 오버레이 최대 총투자비중
+    scale_in_confirm: float    # Confirm 시 base→panic 구간 중 즉시 채우는 비율
+    ma_recovery_period: int    # 잔여 스케일인 판정용 지수 이평 기간
+    event_only: bool           # True 면 대조군 B(상시 코어 없이 이벤트에만 진입)
+
+
+def _parse_panic_overlay(po: dict) -> PanicOverlayParams:
+    """패닉 오버레이 설정을 파라미터 객체로 해석한다(기본값·형변환 한곳 모음).
+
+    비율 계열은 `or` 가 아니라 None 여부로만 기본값을 대체한다 — 0.0 이 유효값이라
+    `po.get(k) or default` 로 쓰면 "0 으로 끄기"가 조용히 기본값으로 되살아난다.
+    """
+    def _pof(key: str, default: float) -> float:
+        v = po.get(key)
+        return float(v) if v is not None else default
+
+    return PanicOverlayParams(
+        arm_rank=_PANIC_LEVEL_RANK.get(str(po.get("arm_level") or "warning"), 2),
+        arm_window=int(po.get("arm_window") or 5),
+        hold_days=int(po.get("hold_days") or 20),
+        profit_reclaim_pct=_pof("profit_reclaim_pct", 0.5),
+        knife_stop_pct=_pof("knife_stop_pct", 0.05),
+        base_exposure=_pof("base_exposure", 0.70),
+        panic_exposure=_pof("panic_exposure", 1.00),
+        scale_in_confirm=_pof("scale_in_confirm", 0.5),
+        ma_recovery_period=int(po.get("ma_recovery_period") or 20),
+        event_only=bool(po.get("event_only", False)),
+    )
+
+
+def _adv_frame(
+    adv_cap_frac: float, panel: pd.DataFrame, volume_panel: pd.DataFrame | None,
+) -> pd.DataFrame | None:
+    """ADV 참여율 캡(A-2)용 20일 평균 거래대금 프레임. 캡 미설정·거래량 미확보면 None.
+
+    거래대금 = 거래량 × 종가의 20일 이동평균이다. 미래참조 없음 — d 시점 값은 그날까지의
+    관측만으로 정해진다. 캡이 설정됐는데 거래량 패널이 없으면 경고만 남기고 캡을 포기한다
+    (거래량은 선택 입력이라 부재가 곧 오류는 아니다).
+    """
+    if adv_cap_frac <= 0:
+        return None
+    if volume_panel is None or volume_panel.empty:
+        logger.warning(
+            "adv_participation_cap 설정됨이나 거래량 패널(volume_panel) 미확보 —"
+            " ADV 캡을 적용하지 않는다."
+        )
+        return None
+    vol_norm = _normalize_index(volume_panel)
+    vol_norm = vol_norm.reindex(index=panel.index, columns=panel.columns).fillna(0.0)
+    return (vol_norm * panel).rolling(20, min_periods=10).mean()
+
+
+def _with_sector_map(config: dict, risk_layer: dict) -> dict:
+    """섹터 집중 한도(max_sector_pct)용 종목→업종 매핑을 config 에 실어 돌려준다.
+
+    백테스트 전체에서 1회만 조회해 `_targets_at` → `_apply_risk_caps` 로 흘려보낸다
+    (업종 분류는 사실상 정적). 한도가 꺼져 있거나 이미 실려 있으면 원본을 그대로 반환.
+    소스 미확보(빈 dict)면 `_apply_risk_caps` 가 섹터 캡을 조용히 미적용한다.
+
+    조회 실패(예외)와 매핑 부재(빈 결과)는 다른 사건이라 로그를 나눈다 — 둘 다 섹터 캡
+    미적용으로 수렴하는 것은 max_sector_pct 가 선택적 리스크 정교화라 매핑 부재가 원래도
+    설계된 저하이기 때문이다(§20). 실패는 ERROR 로 남기고 그 경우 WARNING 을 겹쳐 찍지
+    않는다(두 줄이 겹치면 구분이 흐려진다).
+
+    PIT 한계(C-2, 부분 해소): 업종분류 스냅샷을 분기 1회 적재한다(worker
+    "snapshot-sector-map-quarterly" → sector_map_snapshots, 자세한 내용은
+    app.services.data.krx_index.sector_map 문서 참고). as_of=오늘로 조회하면 스냅샷 도입
+    이후 시점부터는 그 시점에 가장 가까운 과거 스냅샷(=PIT)을 쓴다. 다만 백테스트 전체에
+    대해 1회만 로드하는 구조라, 수년치 구간 전체를 '오늘' 시점 하나의 분류로 대표한다는
+    한계는 남는다(구간별로 그 시점 스냅샷을 골라 쓰려면 호출을 리밸런싱일 단위로 옮겨야
+    한다 — 별도 과제). 스냅샷 도입 **이전** 과거 구간은 그 시점 분류를 보존한 소스가 아예
+    없어 소급 적용이 불가능하며 현재 KRX 분류로 폴백한다(약한 look-ahead 잔존). 섹터
+    '한도'(비중 상한) 용도라 왜곡은 제한적이다.
+    """
+    if not risk_layer.get("max_sector_pct") or config.get("_sector_map"):
+        return config
+
+    from datetime import date as _date
+
+    from app.services.data.errors import DataSourceError
+    from app.services.data.krx_index import sector_map as _sector_map_fn
+
+    try:
+        smap = _sector_map_fn(as_of=_date.today())
+    except DataSourceError as e:
+        logger.error("섹터 집중 한도용 업종 매핑 조회 실패 — 섹터 캡 미적용: %s", e)
+        return config
+    if not smap:
+        logger.warning("섹터 한도 설정됨(max_sector_pct)이나 업종 매핑 미확보 — 섹터 캡 미적용.")
+        return config
+    logger.info("섹터 집중 한도용 업종 매핑 로드: %d종목", len(smap))
+    return {**config, "_sector_map": smap}
+
+
 def run_rebalance_backtest(
     close_panel: pd.DataFrame,
     config: dict,
@@ -794,18 +906,7 @@ def run_rebalance_backtest(
     integer_shares = bool(config.get("integer_shares", True))
     adv_cap_frac = float(config.get("adv_participation_cap") or 0.0)
     price_limit_model = bool(config.get("price_limit_model", False))
-    adv_frame: pd.DataFrame | None = None
-    if adv_cap_frac > 0:
-        if volume_panel is not None and not volume_panel.empty:
-            vol_norm = _normalize_index(volume_panel)
-            vol_norm = vol_norm.reindex(index=panel.index, columns=panel.columns).fillna(0.0)
-            # 거래대금 = 거래량×종가, 20일 이동평균(미래참조 없음 — d 시점은 그날까지 값만 씀).
-            adv_frame = (vol_norm * panel).rolling(20, min_periods=10).mean()
-        else:
-            logger.warning(
-                "adv_participation_cap 설정됨이나 거래량 패널(volume_panel) 미확보 —"
-                " ADV 캡을 적용하지 않는다."
-            )
+    adv_frame = _adv_frame(adv_cap_frac, panel, volume_panel)
 
     # 리스크 레이어(P1-2) — MDD 킬스위치 파라미터(집중 한도·변동성 타겟팅은 _targets_at
     # 에서 목표비중에 반영된다). mdd_kill_pct 가 None 이면 킬스위치 비활성.
@@ -830,29 +931,7 @@ def run_rebalance_backtest(
     # 없어 소급 적용이 여전히 불가능하며, 이 경우 현재 KRX 분류로 자동 폴백한다(약한
     # look-ahead 잔존). 섹터 '한도'(비중 상한) 용도라 왜곡은 제한적이다.
 
-    if risk_layer.get("max_sector_pct") and not config.get("_sector_map"):
-        from datetime import date as _date
-
-        from app.services.data.errors import DataSourceError
-        from app.services.data.krx_index import sector_map as _sector_map_fn
-
-        try:
-            smap = _sector_map_fn(as_of=_date.today())
-        except DataSourceError as e:
-            # 업종 매핑 미확보(else 분기, 자료 없음)와 조회 자체의 실패(예외)는 다른
-            # 사건이다 — "매핑이 없었다"가 아니라 "조회가 실패했다"를 드러낸다. 둘 다
-            # 섹터 캡 미적용으로 수렴하는 것은 max_sector_pct 가 선택적 리스크 정교화라
-            # 매핑 부재가 원래도 설계된 저하이기 때문이다(§20).
-            logger.error("섹터 집중 한도용 업종 매핑 조회 실패 — 섹터 캡 미적용: %s", e)
-            smap = {}
-        else:
-            # 조회는 성공했는데 매핑이 빈 경우에만 '미확보'다. 실패는 위에서 이미 ERROR 로
-            # 남겼으므로 여기서 다시 WARNING 을 찍지 않는다(두 줄이 겹치면 구분이 흐려진다).
-            if not smap:
-                logger.warning("섹터 한도 설정됨(max_sector_pct)이나 업종 매핑 미확보 — 섹터 캡 미적용.")
-        if smap:
-            config = {**config, "_sector_map": smap}
-            logger.info("섹터 집중 한도용 업종 매핑 로드: %d종목", len(smap))
+    config = _with_sector_map(config, risk_layer)
 
     # 현금화 오버레이(레짐 필터) 준비
     rf = config.get("regime_filter") or {}
@@ -892,30 +971,13 @@ def run_rebalance_backtest(
             )
 
     panic_on = panic_ps is not None
-    _LEVEL_RANK = {"normal": 0, "caution": 1, "warning": 2, "panic": 3}
-    arm_level = str(po.get("arm_level") or "warning")
-    arm_rank = _LEVEL_RANK.get(arm_level, 2)
-    arm_window = int(po.get("arm_window") or 5)
-    hold_days_ov = int(po.get("hold_days") or 20)
-
-    def _pof(key: str, default: float) -> float:
-        # 0.0 이 유효값이므로 `or` 대신 None 여부로만 기본값 대체(단일 .get()).
-        v = po.get(key)
-        return float(v) if v is not None else default
-
-    profit_reclaim_pct = _pof("profit_reclaim_pct", 0.5)
-    knife_stop_pct = _pof("knife_stop_pct", 0.05)
-    base_exposure_ov = _pof("base_exposure", 0.70)
-    panic_exposure_ov = _pof("panic_exposure", 1.00)
-    scale_in_confirm = _pof("scale_in_confirm", 0.5)
-    ma_recovery_period = int(po.get("ma_recovery_period") or 20)
-    event_only = bool(po.get("event_only", False))
+    pov = _parse_panic_overlay(po)
 
     panic_ma: pd.Series | None = None
     panic_prev_close: pd.Series | None = None
     if panic_on:
-        min_p = max(5, ma_recovery_period // 2)
-        panic_ma = panic_ps["close"].rolling(ma_recovery_period, min_periods=min_p).mean()
+        min_p = max(5, pov.ma_recovery_period // 2)
+        panic_ma = panic_ps["close"].rolling(pov.ma_recovery_period, min_periods=min_p).mean()
         panic_prev_close = panic_ps["close"].shift(1)  # 전일 종가(루프마다 재계산 방지)
 
     # 상태기계: idle → armed → confirmed_half → confirmed_full (A) / confirmed (B, event_only)
@@ -1079,9 +1141,9 @@ def run_rebalance_backtest(
             has_prev = prev_close_i is not None and pd.notna(prev_close_i)
 
             if panic_state == "idle":
-                if has_close and (_LEVEL_RANK.get(level_i, 0) >= arm_rank or hard_i):
+                if has_close and (_PANIC_LEVEL_RANK.get(level_i, 0) >= pov.arm_rank or hard_i):
                     panic_state = "armed"
-                    arm_deadline_idx = i + arm_window
+                    arm_deadline_idx = i + pov.arm_window
                     capit_close = float(close_i)
                     capit_low = float(low_i) if low_i is not None and pd.notna(low_i) else capit_close
                     capit_drop = float(prev_close_i) - capit_close if has_prev else None
@@ -1099,15 +1161,15 @@ def run_rebalance_backtest(
                 ):
                     # Confirm: 지수가 자본항복일 종가를 상회 + 당일 등락률 양(+).
                     # Fill 은 기존 defer(next_close) 규약을 그대로 재사용(아래 pending 이월).
-                    exposure_fill = panic_exposure_ov if event_only else (
-                        base_exposure_ov + scale_in_confirm * (panic_exposure_ov - base_exposure_ov)
+                    exposure_fill = pov.panic_exposure if pov.event_only else (
+                        pov.base_exposure + pov.scale_in_confirm * (pov.panic_exposure - pov.base_exposure)
                     )
                     targets = _targets_at(
                         d, panel, config, fundamentals_provider, pool_provider,
                         score_out=score_snapshots, exposure=exposure_fill,
                     )
                     decision = {"kind": "rebalance", "targets": targets, "reason": "panic_confirm"}
-                    panic_state = "confirmed" if event_only else "confirmed_half"
+                    panic_state = "confirmed" if pov.event_only else "confirmed_half"
                     confirm_idx = i
                     num_panic_events += 1
                     markers.append({"t": d.isoformat(), "type": "panic_confirm"})
@@ -1116,20 +1178,20 @@ def run_rebalance_backtest(
                 exit_reason: str | None = None
                 if (
                     has_close and capit_low is not None
-                    and float(close_i) <= capit_low * (1.0 - knife_stop_pct)
+                    and float(close_i) <= capit_low * (1.0 - pov.knife_stop_pct)
                 ):
                     exit_reason = "panic_exit_knife"  # 손절(필수) — 칼날 방어
                 elif (
                     has_close and capit_close is not None
                     and capit_drop is not None and capit_drop > 0
-                    and float(close_i) >= capit_close + profit_reclaim_pct * capit_drop
+                    and float(close_i) >= capit_close + pov.profit_reclaim_pct * capit_drop
                 ):
                     exit_reason = "panic_exit_profit"  # 익절 — 낙폭의 profit_reclaim_pct 되돌림
-                elif confirm_idx >= 0 and (i - confirm_idx) >= hold_days_ov:
+                elif confirm_idx >= 0 and (i - confirm_idx) >= pov.hold_days:
                     exit_reason = "panic_exit_hold"    # 시간청산
 
                 if exit_reason is not None:
-                    if event_only:
+                    if pov.event_only:
                         # B(순수 이벤트): 전량 현금화.
                         decision = {"kind": "liquidate", "reason": exit_reason}
                     else:
@@ -1139,21 +1201,21 @@ def run_rebalance_backtest(
                         else:
                             targets = _targets_at(
                                 d, panel, config, fundamentals_provider, pool_provider,
-                                score_out=score_snapshots, exposure=base_exposure_ov,
+                                score_out=score_snapshots, exposure=pov.base_exposure,
                             )
                             decision = {"kind": "rebalance", "targets": targets, "reason": exit_reason}
                     panic_state = "idle"
                     capit_close = capit_low = capit_drop = None
                     confirm_idx = -1
                 elif (
-                    not event_only and panic_state == "confirmed_half"
+                    not pov.event_only and panic_state == "confirmed_half"
                     and has_close and ma_i is not None and pd.notna(ma_i)
                     and float(close_i) > float(ma_i)
                 ):
                     # A 잔여 스케일인: 지수 ma_recovery_period 이평 회복 시 리저브 나머지 배치.
                     targets = _targets_at(
                         d, panel, config, fundamentals_provider, pool_provider,
-                        score_out=score_snapshots, exposure=panic_exposure_ov,
+                        score_out=score_snapshots, exposure=pov.panic_exposure,
                     )
                     decision = {"kind": "rebalance", "targets": targets, "reason": "panic_scale_full"}
                     panic_state = "confirmed_full"
@@ -1185,11 +1247,11 @@ def run_rebalance_backtest(
             # event_only(B)는 상시 core 가 없으므로 정기 리밸런싱 자체를 스킵한다.
             regime_reentry = bool(regime_on is not None and prev_risk_off and not val)
             due = d in rebal_dates or regime_reentry or (just_rearmed and not val)
-            if due and not (panic_on and event_only):
+            if due and not (panic_on and pov.event_only):
                 targets = _targets_at(
                     d, panel, config, fundamentals_provider, pool_provider,
                     score_out=score_snapshots,
-                    exposure=(base_exposure_ov if panic_on else 1.0),
+                    exposure=(pov.base_exposure if panic_on else 1.0),
                 )
                 decision = {"kind": "rebalance", "targets": targets, "reason": "rebalance"}
 
