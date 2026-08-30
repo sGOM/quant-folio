@@ -29,8 +29,10 @@
 요청   → 쿠키 SESSION_COOKIE → get_session_user_id(sid) → 인증 성공 시 TTL 갱신(슬라이딩 만료)
 ```
 
-- **X-Forwarded-For 를 신뢰하지 않는다.** 스푸핑으로 로그인 IP 스로틀을 우회할 수 있었다(§58).
-  프록시 홉 수를 고려해 신뢰 가능한 클라이언트 IP 만 쓴다.
+- **클라이언트 IP 는 `auth.py::_client_ip` 하나로만 얻는다.** 단일 출처 프록시(Caddy)가
+  `header_up X-Forwarded-For {remote_host}` 로 이 헤더를 **항상 덮어쓰는** 전제 위에서 신뢰하고,
+  이중화로 콤마 목록이 오면 **마지막 항목**(가장 가까운 프록시 기록)만 취한다 — 앞에 끼워 넣은
+  임의 값에 흔들리지 않게. 예전엔 앞 항목을 써서 스푸핑으로 로그인 IP 스로틀을 우회할 수 있었다(§58).
 - WebSocket 도 같은 쿠키로 인증한다. 실패 시 `close(code=4401)`.
 
 ## WebSocket 규약 (`ws.py`)

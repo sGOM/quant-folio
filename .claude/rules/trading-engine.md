@@ -32,12 +32,31 @@
 **3중 멱등 방어.** 중복이면 `None` 반환.
 
 ```
-1) Redis 분산락  lock:order:{idempotency_key}   (nx=True, TTL)
-2) DB 중복 검사
-3) 포지션 락     lock:position:{user_id}:{symbol}  ← 읽기-판단-주문 직렬화(TOCTOU)
+1) 결정적 idempotency_key 생성   (전략·종목·side·신호봉시각 → make_idempotency_key)
+2) Redis 분산락 SET NX           lock:order:{idempotency_key}
+3) orders.idempotency_key UNIQUE 제약  ← 최종 방어선(IntegrityError 흡수)
+   (그 사이에 DB 기존 주문 조회로 한 번 더 거른다)
 ```
 
-새 주문 경로를 만들면 **반드시** 이 세 가지를 통과시키고 `Order.reason`(한국어)을 채운다.
+새 주문 경로를 만들면 **반드시** 이 셋을 통과시키고 `Order.reason`(한국어)을 채운다.
+
+### 락은 두 종류다 — 혼동 주의
+
+| 락 | 키 | 막는 것 | 위치 |
+|---|---|---|---|
+| **주문 락** | `lock:order:{idempotency_key}` | 같은 신호의 중복 주문 | `executor.py` |
+| **포지션 락** | `lock:position:{user}:{symbol}` | 같은 종목의 읽기-판단-주문 경합(TOCTOU) | `base_runner.py::_position_lock` |
+
+포지션 락은 멱등 3중 방어의 일부가 **아니라** 보완 관계다. 전략 여러 개가 같은 종목을 봐도
+"보유수량 읽고 → 살지 판단 → 주문"을 직렬화해 이중 매수를 막는다.
+
+### 주문 전송 결과는 세 갈래
+
+| 결과 | 상태 전이 |
+|---|---|
+| 성공 | `SUBMITTED`(주문번호 기록) → 체결 조회 |
+| 증권사 명시적 거부(`BrokerError`) | `REJECTED` — 접수 안 됐음이 확인됐으므로 확정해도 안전 |
+| **그 밖의 예외**(타임아웃·연결 끊김 등) | **접수 여부 불명** → `PENDING` 유지 + 즉시 알림. `REJECTED` 로 확정하지 않는다 — 실제로 체결됐을 수 있다. `reconcile` 이 잔고로 교차확인한다 |
 
 ## 리스크 (`risk.py`)
 
@@ -59,9 +78,9 @@
 
 | 모듈 | 역할 |
 |---|---|
-| `reconcile.py` | 브로커 응답과 DB 주문 상태 정합. **접수불명 주문** 처리 포함 |
+| `reconcile.py` | 미체결·**접수불명(PENDING, 주문번호 없음)** 주문을 실제 체결로 수렴. 접수불명은 체결조회가 불가능해 **잔고 교차확인**으로만 회수하고, 못 밝히면 critical 알림으로 사람에게 넘긴다 — **임의 재주문 절대 금지**(이중 매수). 이미 기록된 체결수량을 뺀 증분만 기록해 멱등 |
 | `fills.py::record_fill` | 체결 기록. 오버셀은 클램프하되 **경보를 낸다**(§35) |
-| `halt.py` | 거래정지 실시간 판정(브로커 응답 기준 — 종목마스터 스냅샷은 최대 하루 지연이라 여기 안 씀) |
+| `halt.py` | **시장 CB 상태기계**가 본체 — 동시 정지 비율로 간접 판정하고 `NORMAL→HALTED→COOLDOWN` 을 거친다(CB 해제 직후 붕괴된 호가에 시장가가 꽂히는 것을 막는다). 개별 종목 정지는 브로커 응답(`Quote.halted`)이 판정한다 |
 | `price_feed.py` / `kis_ws.py` | 실시간 시세 WS. 재연결 실패는 알림 발행(§25) |
 | `fill_notice.py` | 체결 통보 |
 | `alerts.py::publish_alert` | 알림 발행 — `code` + `dedup_window_hours` 로 반복 억제 |

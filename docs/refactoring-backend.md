@@ -80,6 +80,30 @@ fetch_one, mkts, *, what, when, empty_columns)`로 축약했다. `fetch_one(stoc
 `_dynamic_universe`/`_regime_on_flags`/`_score_factor_frame`/`_targets_at` 등 시뮬레이션
 루프와 결합도가 높은 함수는 `portfolio.py`에 유지.
 
+### 후속 (2026-08-31, improvements.md §67)
+
+위 분리 이후에도 `run_rebalance_backtest` 자체가 588줄·중첩깊이 8로 남아 있었다(다음으로 긴
+함수가 213줄). 시뮬레이션 루프 앞의 준비 코드 150여 줄이 원인이라, **동작이 없는 준비 로직만**
+추가로 뽑았다.
+
+- `_adv_frame` — ADV 참여율 캡용 20일 평균 거래대금 프레임
+- `_with_sector_map` — 섹터 집중 한도용 업종 매핑 로드(**이 수치 함수 안의 유일한 네트워크 I/O**)
+- `_parse_panic_overlay` → `PanicOverlayParams`(frozen) — 패닉 오버레이 설정 해석
+
+588 → 538줄, 단위 테스트 17건 신설. **일별 루프·패닉 상태기계는 그대로 둔다** — 깊이 8은
+상태기계의 실제 형태이고 분기마다 측정 근거 주석이 붙어 있다. 이 함수의 수치가 전략 승격의
+근거라 평탄화는 리팩토링이 아니라 재작성이다.
+
+전후 동일성은 합성 패널에 전 오버레이를 켠 백테스트의 결과 dict 전체(스칼라 + 배열 해시)를
+대조해 확인했다. 이 대조는 §66(`set` 순회 의존으로 실행마다 수치가 달랐다)을 먼저 고쳐야
+가능했다 — **재현성이 없으면 리팩토링의 안전성을 증명할 수 없다.**
+
+**남은 후보(측정만 함)**: cProfile 상 백테스트 시간의 75%가 `_targets_at` 안의
+`_score_factor_frame`·`_compute_stock_scores`에 있다. 종목별 파이썬 루프라 벡터화 여지가
+크지만, `c.dropna().tail(N)`(마지막 N개 **유효 관측**)과 패널 `tail(N)`(마지막 N **행**)이
+결측 종목에서 달라져 **수치가 바뀐다**. 착수하려면 "전후 완전 동일"이 아니라 "허용 오차"로
+기준을 낮추는 판단이 먼저 필요하다.
+
 ## 🟢 5. 사소한 것들 — **완료 ✅**
 
 - `_safe_float`/`_safe`/`_is_nan`/`_safe_bool`를 `app/services/_num.py` 공용 유틸로 통합.
@@ -97,3 +121,4 @@ fetch_one, mkts, *, what, when, empty_columns)`로 축약했다. `fetch_one(stoc
 - [x] 3. pykrx 페칭 헬퍼 (완료 — `_fetch_per_market`/`_pykrx_stock`, 223 테스트 통과)
 - [x] 4. portfolio.py 모듈 분할 (완료 — slippage/risk_caps/attribution, 재노출 유지)
 - [x] 5. 공용 num 유틸 (완료 — `app/services/_num.py`, backtests provider 검토 완료)
+- [x] 4-2. `run_rebalance_backtest` 준비 로직 분리 (2026-08-31, §67 — 588→538줄, 골든 대조로 수치 동일 확인)
