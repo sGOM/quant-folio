@@ -601,11 +601,6 @@ function StockRow({ row }: { row: StockMetric }) {
   );
 }
 
-/** 서브스코어 한 줄(라벨 + z-score 값). null 은 "-"로 표시. */
-function fmtSubscore(v: number | null): string {
-  return v == null ? "-" : v.toFixed(2);
-}
-
 /**
  * 종합점수 강조 셀. score 는 z-score 합성값(대략 -2~+2)으로, 0 이상이 평균 이상이다.
  * 호버(포커스)하면 가치·모멘텀·저변동성 서브스코어 분해를 툴팁으로 보여준다(§14).
@@ -632,9 +627,9 @@ function ScoreCell({ row }: { row: StockMetric }) {
       <TooltipContent>
         <div className="space-y-0.5 text-xs">
           <p className="font-medium text-foreground">서브스코어 분해(z-score)</p>
-          <p>모멘텀 40%: {fmtSubscore(score_momentum)}</p>
-          <p>밸류 30%: {fmtSubscore(score_value)}</p>
-          <p>저변동성 30%: {fmtSubscore(score_lowvol)}</p>
+          <p>모멘텀 40%: {fmtNum(score_momentum, 2)}</p>
+          <p>밸류 30%: {fmtNum(score_value, 2)}</p>
+          <p>저변동성 30%: {fmtNum(score_lowvol, 2)}</p>
         </div>
       </TooltipContent>
     </Tooltip>
