@@ -67,3 +67,32 @@ def test_해시시드가_달라도_백테스트_수치가_같다():
         f"성과지표가 해시 시드에 따라 달라진다:\n{a['scalars']}\n{b['scalars']}"
     )
     assert a["trades"] == b["trades"], "체결 내역(순서·금액)이 해시 시드에 따라 달라진다"
+
+
+# ───────────── 실거래 경로: 주문 제출 순서도 결정론적이어야 한다 ─────────────
+
+
+def test_실거래_주문_시퀀스가_종목_삽입순서에_좌우되지_않는다():
+    """`compute_rebalance_orders` 의 반환 리스트는 **실제 주문 제출 순서**다.
+
+    백테스트의 1e-15 와 달리 여기서는 결과가 실질적으로 갈린다 — 매수 자금이 빠듯
+    하면 앞선 주문부터 체결되므로, 순서가 흔들리면 같은 계획이 실행마다 다른 바스켓을
+    체결한다. 종목 집합이 같아도 dict 삽입 이력이 다르면 set 순회가 달라진다.
+    """
+    from engine.rebalance import compute_rebalance_orders
+
+    codes = [f"{i:06d}" for i in range(1, 26)]
+    prices = {c: 10000.0 + i * 311 for i, c in enumerate(codes)}
+
+    def _orders(order: list[str]):
+        return compute_rebalance_orders(
+            targets={c: 1 / len(order) for c in order},
+            positions={c: (5 if i % 2 else 0) for i, c in enumerate(order)},
+            prices=prices, capital=50_000_000, drift_band=0.0,
+        )
+
+    fwd = _orders(codes)
+    rev = _orders(list(reversed(codes)))
+
+    assert fwd, "주문이 없으면 순서 의존을 검증할 수 없다"
+    assert fwd == rev, f"주문 제출 순서가 삽입 이력에 좌우된다:\n{fwd[:5]}\n{rev[:5]}"

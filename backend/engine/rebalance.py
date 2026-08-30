@@ -342,7 +342,11 @@ def compute_rebalance_orders(
     sells: list[tuple[str, str, int]] = []
     buys: list[tuple[str, str, int]] = []
 
-    for sym in set(targets) | set(positions):
+    # sorted 필수 — set 순회 순서는 종목 코드 문자열의 해시에 좌우돼 프로세스마다,
+    # 심지어 dict 삽입 이력에 따라서도 달라진다. 이 순서가 그대로 반환 리스트(=주문
+    # 제출 순서)가 되므로, 매수 자금이 빠듯하면 같은 계획이 실행마다 다른 바스켓을
+    # 체결한다. 백테스트 _apply_rebalance 도 같은 이유로 정렬한다(양쪽 parity).
+    for sym in sorted(set(targets) | set(positions)):
         price = prices.get(sym)
         if price is None or price <= 0:
             continue  # 현재가 없으면 매매 불가(다음 주기로 미룸)
