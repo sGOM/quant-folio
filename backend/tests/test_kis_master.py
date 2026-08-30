@@ -412,3 +412,28 @@ def test_management_block_reason_within_stale_window_still_blocks():
     snap = {"trade_date": date(2026, 8, 10), "market": "KOSPI", "관리종목": "Y"}
     # today - trade_date = 9일 <= _MAX_STALE_DAYS(10) → 여전히 유효.
     assert km.management_block_reason(snap, today=date(2026, 8, 19)) is not None
+
+
+def test_snapshot_stock_master_기본_거래일은_UTC_가_아니라_KST_기준이다(monkeypatch):
+    """컨테이너 TZ 는 UTC 인데 KRX 거래일은 KST 다.
+
+    KST 00:00~09:00(=UTC 전날 15:00~24:00)에 배치가 돌면 `date.today()` 는 하루
+    이전을 가리켜 스냅샷 거래일이 조용히 어긋난다. 이 창에서 KST 날짜가 나와야 한다.
+    """
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    from app.services.data import kis_master as km
+
+    # 2026-08-31 01:00 KST == 2026-08-30 16:00 UTC — date.today()(UTC)면 8/30 이 된다.
+    kst = timezone(timedelta(hours=9))
+    monkeypatch.setattr(km, "now_kst", lambda: datetime(2026, 8, 31, 1, 0, tzinfo=kst))
+    monkeypatch.setattr(
+        km, "fetch_market_master",
+        lambda market: [{"symbol": "005930", "name": "삼성전자", "raw": {}}],
+    )
+    db = _FakeMasterDB()
+
+    asyncio.run(km.snapshot_stock_master(db))
+
+    assert all(o.trade_date == date(2026, 8, 31) for o in db.added)
