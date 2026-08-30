@@ -141,3 +141,22 @@ def test_opendart_bug_propagates(monkeypatch):
         screener.screen_turnaround(
             date(2025, 6, 2), "ALL", min_value=50_000_000, surge=1.5, smallcap_pct=0.4,
         )
+
+
+def test_시가총액_결측_종목은_후보에서_제외된다(monkeypatch):
+    """`market_cap` 에 0 sentinel 이 필요 없는 근거를 고정한다.
+
+    시총이 NaN 이면 `cap_df["시가총액"] <= threshold` 비교가 False 라 소형주 선별에서
+    이미 떨어진다 — 즉 아이템 생성 시점에 결측 시총은 도달하지 않는다. 이 불변식이
+    깨지면 `int(NaN)` 이 터지므로, 죽은 가드를 지운 자리를 이 테스트가 지킨다.
+    """
+    cap = _cap_df()
+    cap.loc[S1, "시가총액"] = float("nan")
+    _patch_common(monkeypatch, qmetrics={})
+    monkeypatch.setattr(screener, "_fetch_market_cap", lambda *a, **k: cap)
+
+    out = screener.screen_turnaround(date(2026, 8, 5), "ALL")
+
+    codes = {c.code for c in out.items}
+    assert S1 not in codes
+    assert all(isinstance(c.market_cap, int) for c in out.items)
