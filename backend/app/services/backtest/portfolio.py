@@ -591,7 +591,11 @@ def _apply_rebalance(
                 sells.append((sym, v))     # 전량 매도
                 turnover += v / equity
     else:
-        for sym in set(targets) | set(val):
+        # sorted 필수 — set 순회 순서는 문자열 해시(PYTHONHASHSEED)에 좌우돼 프로세스마다
+        # 다르다. 이 순서가 sells/buys 리스트 순서가 되고, 아래 체결 루프가 cash 를 순차
+        # 누적하므로 같은 입력이 실행마다 ~1e-15 다른 성과지표를 냈다(trades 배열 순서도
+        # 바뀐다). 정렬하면 백테스트가 재현 가능해져 수치 회귀 테스트를 걸 수 있다.
+        for sym in sorted(set(targets) | set(val)):
             cur_val = val.get(sym, 0.0)
             cur_w = cur_val / equity
             tgt_w = targets.get(sym, 0.0)
