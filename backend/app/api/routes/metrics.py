@@ -219,10 +219,11 @@ async def list_stocks(
 
     # 요청 파라미터로 추가 필터 적용 (캐시 기본값보다 엄격한 경우)
     items: list[StockMetric] = data.items
+    # 결측(None)은 기준 충족을 증명할 수 없으므로 더 엄격한 필터에서 탈락시킨다.
     if min_value > 500_000_000:
-        items = [s for s in items if s.avg_value_20 >= min_value]
+        items = [s for s in items if s.avg_value_20 is not None and s.avg_value_20 >= min_value]
     if min_mcap > 100_000_000_000:
-        items = [s for s in items if s.market_cap >= min_mcap]
+        items = [s for s in items if s.market_cap is not None and s.market_cap >= min_mcap]
 
     # 정렬 (null을 뒤로)
     sort_fn = _STOCK_SORT_KEY.get(sort, _STOCK_SORT_KEY["score"])

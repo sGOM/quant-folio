@@ -140,3 +140,34 @@ def test_펀더멘털이_비어도_시장태그와_결측_펀더멘털로_계속
     assert out.count == 2
     assert all(i.per is None for i in out.items)
     assert {i.market for i in out.items} == {"KOSPI"}
+
+
+def test_종가_결측이면_price_는_0_이_아니라_None_이다(monkeypatch, _stub_sources):
+    """§50·§62 와 같은 계약 — 결측 종가를 0 으로 채우면 실제 0원과 구분이 안 된다.
+
+    거래대금은 살려둬 유동성 필터를 통과시키고 종가만 결측으로 만든다(0 sentinel 이
+    실제로 도달하던 경로).
+    """
+    pc = _price_change_frame()
+    pc.loc["000660", "종가"] = float("nan")
+    monkeypatch.setattr(stocks_mod, "_fetch_price_change", lambda *a, **kw: pc)
+
+    out = stocks_mod.compute_stocks("KOSPI", _AS_OF)
+
+    by_code = {i.code: i for i in out.items}
+    assert by_code["000660"].price is None
+    assert by_code["005930"].price == 71000
+
+
+def test_거래대금_컬럼이_없으면_avg_value_20_은_0_이_아니라_None_이다(monkeypatch, _stub_sources):
+    """부분 소스 장애로 거래대금이 통째로 빠지면 유동성 필터도 함께 비활성화된다.
+
+    이때 0.0 을 채우면 "거래대금 0원"과 "모름"이 같은 값이 된다.
+    """
+    pc = _price_change_frame().drop(columns=["거래대금"])
+    monkeypatch.setattr(stocks_mod, "_fetch_price_change", lambda *a, **kw: pc)
+
+    out = stocks_mod.compute_stocks("KOSPI", _AS_OF)
+
+    assert out.count > 0
+    assert all(i.avg_value_20 is None for i in out.items)

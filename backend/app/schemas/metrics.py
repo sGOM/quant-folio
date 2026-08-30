@@ -47,10 +47,10 @@ class StockMetric(BaseModel):
     code: str
     name: str
     market: str   # "KOSPI" | "KOSDAQ"
-    price: int    # 종가(원)
+    price: Optional[int] = None    # 종가(원). 결측이면 None(0 sentinel 아님)
     change_rate: Optional[float] = None  # 당일 등락률(소수)
-    market_cap: int    # 시가총액(원)
-    avg_value_20: float  # 20일 평균 거래대금(원)
+    market_cap: Optional[int] = None    # 시가총액(원). 결측이면 None
+    avg_value_20: Optional[float] = None  # 20일 평균 거래대금(원). 결측이면 None
     # ── 밸류에이션(div은 pykrx 원값 %) ──
     per: Optional[float] = None
     pbr: Optional[float] = None
