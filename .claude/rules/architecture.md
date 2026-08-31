@@ -75,3 +75,24 @@ docker compose exec frontend npm run build
 ```
 
 앱을 실제로 띄워 검증·스크린샷은 `run-quantfolio` 스킬을 쓴다.
+
+## CI (GitHub Actions)
+
+| 워크플로 | 트리거 | job |
+|---|---|---|
+| `.github/workflows/ci.yml` | main 대상 PR + main push | `backend`(pytest+커버리지) · `frontend`(lint→**tsc --noEmit**→vitest→build) |
+| `.github/workflows/e2e-smoke.yml` | 매일 03:00 KST + 수동 | `smoke` — compose 전체 스택 기동 후 Playwright 로 "가입→로그인→전략목록→백테스트→모니터링" |
+
+- **CI 는 `npx tsc --noEmit`(타입체크)를 돈다.** 로컬 게이트(lint→vitest→build)에는 이 단계가
+  없으므로, 프론트를 고쳤으면 타입체크도 같이 돌리는 편이 CI 왕복을 줄인다.
+- backend job 은 timescaledb·redis 서비스 컨테이너를 띄우고 `alembic upgrade head` 후 pytest 를 돈다
+  — **마이그레이션이 깨지면 CI 가 테스트 전에 죽는다.**
+- e2e-smoke 는 스택 기동이 무거워 **PR 필수 게이트가 아니다**(야간 크론).
+- 상태 확인·실패 로그 요약은 `ci-check` 스킬.
+
+## 이 저장소의 Claude Code 훅 (동작이 눈에 안 보임)
+
+| 훅 | 시점 | 동작 |
+|---|---|---|
+| `block-secret-edit.js` | PreToolUse(Edit\|Write) | `secrets/*.txt`·`.env*` **편집을 차단**한다. 실거래 자격증명 노출 방지 — 막히면 훅 때문이지 권한 문제가 아니다 |
+| `backend-restart-reminder.js` | PostToolUse(Edit\|Write) | `backend/**` 수정 시 web/engine/worker 재시작 리마인더(핫리로드 없음) |

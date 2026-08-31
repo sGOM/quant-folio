@@ -120,6 +120,7 @@
 2. **리팩토링과 동작 변경을 한 커밋에 섞지 않는다.** 가독성 패스에서는 수치 결과가 바뀌면 안 된다(테스트가 그대로 통과해야 함).
 3. 검증 게이트 — 아래 전부 통과 후 완료 보고:
    - 백엔드 변경: `docker compose exec web pytest` 전체 통과 + 변경 서비스 `docker compose restart <svc>` (web/engine/worker 는 핫리로드 없음)
-   - 프론트 변경: lint → vitest → build 전체 통과
+   - 프론트 변경: lint → vitest → build 전체 통과. **CI 는 여기에 `npx tsc --noEmit`(타입체크)를 더 돌리므로**, 타입에 손댔으면 로컬에서도 같이 확인해 CI 왕복을 줄인다.
+   - CI(`.github/workflows/ci.yml`)는 PR/main push 마다 `backend`(alembic upgrade → pytest+커버리지)·`frontend`(lint→tsc→vitest→build)를 돌린다. 마이그레이션이 깨지면 테스트 전에 죽는다. 전체 스택 E2E(`e2e-smoke.yml`)는 야간 크론이라 PR 게이트가 아니다.
 4. 커밋 메시지는 한국어, `type: 요약` 형식(`fix:`/`refactor:`/`test:`/`docs:`/`chore:`). 빌드 산출물(`tsconfig.tsbuildinfo` 등) 커밋 금지.
 5. 새 전략 검증은 반드시 PIT(생존편향 제거) KOSPI200 유니버스로. 방어형 전략 성과 판정은 excess/IR 이 아닌 alpha/Sharpe 기준.

@@ -14,9 +14,12 @@
 | 서비스 구성·Redis 통신 규약·배치 스케줄·기동 함정 | `.claude/rules/architecture.md` |
 | DB 테이블·관계·삭제 정책 | `.claude/rules/data-model.md` (→ `data-model/trading.md`, `data-model/market-store.md`) |
 | 외부 데이터 조회·캐시 정책·팩터 | `.claude/rules/market-data.md` |
+| 전략 설정 필드·블록 조립(`RebalanceConfig` 등) | `.claude/rules/strategy-config.md` |
 | 백테스트 엔진·성과지표·전략 판정 기준 | `.claude/rules/backtest.md` |
+| 신규 팩터·전략 검증 프로토콜·검증 스크립트 | `.claude/rules/validation-workflow.md` |
 | 실시간 매매 엔진·주문 멱등·리스크 | `.claude/rules/trading-engine.md` |
 | REST/WS 엔드포인트·인증·응답 계약 | `.claude/rules/api.md` |
+| 알림 체계·`code` 레지스트리 | `.claude/rules/alerts.md` |
 | Next.js 화면·표시 규약 | `.claude/rules/frontend.md` |
 
 ## 아키텍처 (한 줄 지도)
