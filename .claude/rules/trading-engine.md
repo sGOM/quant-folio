@@ -92,6 +92,21 @@
 `runner_failures`·`pit_fallback`·`mdd_kill`·`factor_outage`·`kis_master_outage`·
 `db_backup_stale`·`ohlcv_ingest_failure_rate`.
 
+## 브로커 추상화 (`app/services/broker/`)
+
+특정 증권사에 하드코딩하지 않는다. `SUPPORTED_BROKERS = ("kis", "toss")`, 기본 `kis`.
+
+- **`base.py::BrokerClient`(Protocol)** — `verify_connection` · `get_quote` · `place_order` ·
+  `get_order_execution` · `get_balance`. 증권사별 원시 dict 대신 **정규화 dataclass**
+  (`Quote`·`OrderResult`·`Fill`·`Balance`)로 통일한다. `Quote.halted` 는 `is_halted_status` 가
+  KIS 의 `temp_stop_yn`·`iscd_stat_cls_code` 를 정규화한 것이다.
+- **`factory.py::make_broker`** — 자격증명 우선순위: ① 사용자가 앱에서 등록한 DB 값(암호화 저장,
+  멀티유저 정식 경로) → ② `.env` 기본값 폴백(단일 운영자 편의).
+  컬럼 의미가 브로커마다 다르다: kis = app_key/app_secret/계좌(CANO-PRDT),
+  toss = client_id/client_secret/accountSeq.
+
+새 증권사를 붙이면 Protocol 5개 메서드 + 정규화 dataclass 변환만 구현한다. 엔진은 손대지 않는다.
+
 ## KIS 연동 (`app/services/kis/`)
 
 - 토큰 발급·갱신은 락으로 직렬화.

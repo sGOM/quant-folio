@@ -9,9 +9,12 @@
 | 서비스가 어떻게 뜨고 서로 어떻게 통신하는지 | [architecture.md](architecture.md) |
 | DB 테이블·관계·어느 도메인 소유인지 | [data-model.md](data-model.md) |
 | 외부 데이터(KRX·DART·KIS·pykrx) 조회, 로컬 캐시 정책 | [market-data.md](market-data.md) |
+| 전략 설정 필드·기본값·블록 조립 순서 | [strategy-config.md](strategy-config.md) |
 | 백테스트 엔진, 팩터, 성과지표, 체결 모델 | [backtest.md](backtest.md) |
+| 신규 팩터·전략 검증, `backend/scripts/` 사용법 | [validation-workflow.md](validation-workflow.md) |
 | 실시간 자동매매 데몬, 주문·리스크·정합 | [trading-engine.md](trading-engine.md) |
 | REST/WebSocket 엔드포인트, 인증 | [api.md](api.md) |
+| 알림 발행·중복억제·보존정책, `code` 레지스트리 | [alerts.md](alerts.md) |
 | Next.js 화면·상태관리·표시 규약 | [frontend.md](frontend.md) |
 
 ## 이 폴더 밖의 기준 문서
