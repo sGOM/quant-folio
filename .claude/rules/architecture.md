@@ -1,19 +1,20 @@
+---
+paths:
+  - "docker-compose*.yml"
+  - "Caddyfile"
+  - "backend/Dockerfile"
+  - "frontend/Dockerfile"
+  - "backend/worker/celery_app.py"
+  - "backend/app/core/channels.py"
+  - ".github/workflows/**"
+---
+
 # 아키텍처 — 프로세스와 통신
 
 Docker Compose 로 뜨는 **별도 프로세스**들이 **Redis**(pub/sub·큐·분산락)로 통신한다.
 서로 함수를 직접 호출하지 않는다.
 
-## 서비스
-
-| 서비스 | 정체 | 실행 |
-|---|---|---|
-| `web` | FastAPI REST + WebSocket (인증·CRUD·시세) | `uvicorn app.main:app` |
-| `engine` | 24h 자동매매 데몬 (asyncio 이벤트루프) | `python -m engine.main` |
-| `worker` | Celery (백테스트 등 비동기 작업 + beat 스케줄) | `celery -A worker.celery_app.celery_app worker -B` |
-| `frontend` | Next.js 15 (App Router, React 19) | `npm run dev` |
-| `db` | PostgreSQL + TimescaleDB | — |
-| `redis` | 세션·큐·pub/sub | — |
-| `proxy` | Caddy | — |
+서비스 목록·실행 명령은 `CLAUDE.md` 의 "아키텍처(한 줄 지도)" 표를 본다(상시 로드됨).
 
 ## Redis 통신 규약
 
@@ -59,20 +60,6 @@ Docker Compose 로 뜨는 **별도 프로세스**들이 **Redis**(pub/sub·큐·
 - **시크릿은 `.env` 가 아니라 `secrets/*.txt` 파일 마운트.** 새 시크릿은 compose secret +
   `app/core/config` 배선.
 - **빌드 산출물 커밋 금지** (`frontend/tsconfig.tsbuildinfo` 등).
-
-## 자주 쓰는 명령
-
-```bash
-docker compose up -d --build
-docker compose logs -f web
-docker compose restart web
-
-docker compose exec web pytest                       # 백엔드 테스트
-docker compose exec web alembic upgrade head         # 마이그레이션
-docker compose exec frontend npm run lint            # 프론트 lint
-docker compose exec frontend npm run test            # vitest
-docker compose exec frontend npm run build
-```
 
 앱을 실제로 띄워 검증·스크린샷은 `run-quantfolio` 스킬을 쓴다.
 

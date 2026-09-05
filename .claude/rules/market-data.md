@@ -1,3 +1,12 @@
+---
+paths:
+  - "backend/app/services/data/**"
+  - "backend/app/services/metrics/**"
+  - "backend/app/services/screener.py"
+  - "backend/app/services/recommend.py"
+  - "backend/app/services/symbols.py"
+---
+
 # 시장 데이터 — 외부 소스와 조회 정책
 
 `app/services/data/` + `app/services/metrics/`

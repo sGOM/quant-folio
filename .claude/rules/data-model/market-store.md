@@ -1,3 +1,9 @@
+---
+paths:
+  - "backend/app/models/store.py"
+  - "backend/app/services/data/store/**"
+---
+
 # 시장데이터 저장소 테이블 (`app/models/store.py`)
 
 **확정된 과거 데이터를 Postgres 에 영구 저장**해 로컬 우선으로 읽는다. 외부(pykrx·DART)는
