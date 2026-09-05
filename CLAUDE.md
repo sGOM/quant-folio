@@ -6,7 +6,9 @@
 
 ## 도메인 지식 — `.claude/rules/`
 
-작업 전 아래 표에서 **해당 문서 하나만** 읽는다(전부 읽지 말 것).
+각 문서는 `paths` frontmatter 를 갖고 있어 **해당 영역 파일을 만지면 그 문서만 자동으로 도착한다**
+(상시 로드 아님). 표는 어느 문서가 어느 영역을 담당하는지 보는 용도이고, 아직 파일을 열지 않은
+상태에서 배경이 먼저 필요하면 **해당 문서 하나만** 직접 읽는다(전부 읽지 말 것).
 인덱스: [`.claude/rules/README.md`](.claude/rules/README.md)
 
 | 작업 영역 | 문서 |
@@ -22,6 +24,12 @@
 | 알림 체계·`code` 레지스트리 | `.claude/rules/alerts.md` |
 | Next.js 화면·표시 규약 | `.claude/rules/frontend.md` |
 
+## 절대 금지 (문서가 도착하기 전에도 유효)
+
+- **백테스트 미래참조 금지.** 어떤 날 `d` 의 결정은 `panel.loc[:d]` 만 쓴다.
+- **접수불명 주문에 임의 재주문 금지.** 이중 매수가 된다. 잔고 교차확인으로만 회수하고,
+  못 밝히면 critical 알림으로 사람에게 넘긴다.
+
 ## 아키텍처 (한 줄 지도)
 
 Docker Compose로 뜨는 별도 프로세스들. 서로 **Redis(pub/sub·큐·분산락)**로 통신.
@@ -35,32 +43,6 @@ Docker Compose로 뜨는 별도 프로세스들. 서로 **Redis(pub/sub·큐·�
 | `db` | PostgreSQL + TimescaleDB | — |
 | `redis` | 세션·큐·pub/sub | — |
 | `proxy` | Caddy | — |
-
-## 자주 쓰는 명령
-
-```bash
-# 기동 / 재빌드
-docker compose up -d --build
-docker compose ps                       # 상태 확인
-docker compose logs -f web              # 로그
-
-# ⚠️ web/engine/worker 재시작 필수(핫리로드 없음 — 아래 "필수 함정" 참고)
-docker compose restart web
-# 개발 중엔 docker-compose.override.yml 이 자동 병합되어 web 이 --reload 로 뜬다.
-# (운영 배포는 docker compose -f docker-compose.yml up -d --build 로 override 제외)
-
-# 백엔드 테스트 (컨테이너 안에서)
-docker compose exec web pytest
-docker compose exec web pytest tests/test_broker.py -k <name>
-
-# DB 마이그레이션
-docker compose exec web alembic upgrade head
-docker compose exec web alembic revision --autogenerate -m "<msg>"
-
-# 프론트 (컨테이너 안에서)
-docker compose exec frontend npm run lint
-docker compose exec frontend npm run build
-```
 
 ## 필수 함정 (반복 실수 지점)
 
