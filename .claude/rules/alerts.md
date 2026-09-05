@@ -1,3 +1,11 @@
+---
+paths:
+  - "backend/engine/alerts.py"
+  - "backend/worker/**"
+  - "backend/app/api/routes/alerts.py"
+  - "frontend/components/AlertCenter.tsx"
+---
+
 # 알림(alerts) 체계
 
 무인 자동매매의 **"조용한 실패"를 사용자에게 알리는** 경로. engine·worker·web·frontend 4곳에 걸친다.

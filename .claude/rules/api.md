@@ -1,3 +1,9 @@
+---
+paths:
+  - "backend/app/api/**"
+  - "backend/app/core/session.py"
+---
+
 # API — REST · WebSocket · 인증
 
 `backend/app/api/routes/` · FastAPI

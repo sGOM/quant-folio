@@ -1,3 +1,12 @@
+---
+paths:
+  - "backend/app/schemas/strategy.py"
+  - "backend/engine/rebalance*.py"
+  - "frontend/lib/strategy.ts"
+  - "frontend/lib/api.ts"
+  - "frontend/components/strategy-form/**"
+---
+
 # 전략 설정 계약 (`app/schemas/strategy.py`)
 
 **993줄, 스키마 중 최대.** 백엔드·엔진·프론트 3자가 필드명을 정확히 맞춰야 하는 계약이다

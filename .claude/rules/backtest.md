@@ -1,3 +1,8 @@
+---
+paths:
+  - "backend/app/services/backtest/**"
+---
+
 # 백테스트 엔진
 
 `app/services/backtest/`

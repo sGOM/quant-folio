@@ -1,3 +1,11 @@
+---
+paths:
+  - "backend/engine/**"
+  - "backend/app/services/broker/**"
+  - "backend/app/services/kis/**"
+  - "backend/app/services/live_gate.py"
+---
+
 # 실시간 자동매매 엔진
 
 `backend/engine/` — 24h asyncio 데몬. `python -m engine.main`

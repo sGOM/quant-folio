@@ -1,3 +1,8 @@
+---
+paths:
+  - "frontend/**"
+---
+
 # 프론트엔드
 
 `frontend/` — Next.js 15 (App Router) · React 19 · TanStack Query · Tailwind/shadcn

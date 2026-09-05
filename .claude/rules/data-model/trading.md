@@ -1,3 +1,9 @@
+---
+paths:
+  - "backend/app/models/models.py"
+  - "backend/alembic/**"
+---
+
 # 운영 테이블 (`app/models/models.py`)
 
 사용자가 만들고 엔진이 채우는 데이터. 삭제 정책(`ondelete`)이 도메인 규칙을 담고 있다.
