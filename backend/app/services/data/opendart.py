@@ -229,8 +229,8 @@ def single_company_accounts(
     """단일회사 전체 재무제표 원계정(fnlttSinglAcntAll)을 반환한다.
 
     반환은 OpenDART 원자료(list of dict)이며, 계정과목(account_nm)·금액(thstrm_amount)
-    ·재무제표구분(sj_div) 등을 포함한다. ROE/부채비율/FCF 파생은 배선 단계에서
-    `derive_metrics` 로 계산한다(계정과목 표준화가 관건 — TODO 참고).
+    ·재무제표구분(sj_div) 등을 포함한다. ROE/부채비율/FCF 파생은 `derive_metrics` 가
+    account_id(IFRS 표준 태그) 우선·계정명 폴백으로 계산한다(`_pick` 참고).
 
     :param corp_code: OpenDART 고유번호(8자리). corp_code_map 으로 획득.
     :param bsns_year: 사업연도(예: 2024)
