@@ -53,5 +53,5 @@ paths:
 ## 주의
 
 - **저장소는 빈 상태에서 시작할 수 있어야 한다.** 시드 데이터를 전제하면 안 된다.
-- 종목명 신뢰 소스(`CLAUDE.md`)는 날짜 비의존 KRX MDC finder 다. 외부 조회 실패 시
-  seed-only 캐시로 굳히지 말 것(자가복구 불가).
+- **종목명의 신뢰 소스는 `krx_index.all_listed_stocks`**(KRX MDC finder, 날짜 비의존).
+  FDR/pykrx 는 이 환경에서 불안정하다. 외부 조회 실패 시 seed-only 캐시로 굳히지 말 것(자가복구 불가).

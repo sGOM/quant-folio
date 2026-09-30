@@ -51,44 +51,14 @@ Spring Boot 식으로 비유하면:
 
 ---
 
-## 2. 처음 30분: 직접 돌려보며 감 잡기
+## 2. 처음 30분 · 코드 진입점
 
-```bash
-# (최초 1회) 시크릿 파일 + .env 준비는 루트 README.md "실행 방법" 참고
-docker compose up -d --build
-docker compose exec web alembic upgrade head   # DB 테이블 생성
-```
-
-그 다음 브라우저에서:
-
-- <http://localhost:8080/docs> — **Swagger UI**. Spring 의 springdoc-openapi 와 동일.
-  여기서 API 목록을 먼저 눈으로 훑는 것이 코드 읽기보다 빠르다.
-- <http://localhost:8080/health> — 헬스체크 JSON.
-
-로그를 흐르게 켜 두고 읽으면 이해가 빠르다:
-
-```bash
-docker compose logs -f web      # API 서버
-docker compose logs -f engine   # 매매 엔진(전략 ON 시 여기서 신호/주문 로그)
-```
+직접 띄워 보는 실습(STEP 0)과 "어디부터 코드를 열까" 치트시트는
+[`00-하루만에-이해하기.md`](00-하루만에-이해하기.md) 에 있다.
 
 ---
 
-## 3. "어디부터 코드를 열까" 빠른 진입점
-
-| 궁금한 것 | 먼저 열 파일 |
-|-----------|--------------|
-| 서버가 어떻게 뜨나 (`@SpringBootApplication` 격) | `backend/app/main.py` |
-| 설정/환경변수 (`application.yml` 격) | `backend/app/core/config.py` |
-| DB 테이블 정의 (`@Entity` 격) | `backend/app/models/models.py` |
-| 로그인/인증이 어떻게 도나 | `backend/app/api/routes/auth.py`, `backend/app/api/deps.py` |
-| 매매 엔진의 심장 | `backend/engine/runner.py`, `backend/engine/executor.py` |
-| 증권사 API 호출 | `backend/app/services/kis/client.py` |
-| 백테스트 계산 | `backend/app/services/backtest/engine.py` |
-
----
-
-## 4. 함께 보면 좋은 기존 문서
+## 3. 함께 보면 좋은 기존 문서
 
 - 루트 [`README.md`](../README.md) — 실행/배포(노트북을 24시간 서버로) 절차
 - [`docs/PRD.md`](../docs/PRD.md) — 제품 요구사항·데이터 모델 정의
