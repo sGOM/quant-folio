@@ -12,7 +12,7 @@ paths:
 # 아키텍처 — 프로세스와 통신
 
 Docker Compose 로 뜨는 **별도 프로세스**들이 **Redis**(pub/sub·큐·분산락)로 통신한다.
-서로 함수를 직접 호출하지 않는다. 서비스 목록·실행 명령은 `CLAUDE.md`.
+서로 함수를 직접 호출하지 않는다. 서비스 목록·실행 명령은 `docker-compose.yml`.
 
 ## Redis 통신 규약
 

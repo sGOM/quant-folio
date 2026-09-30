@@ -34,16 +34,6 @@
 
 Docker Compose로 뜨는 별도 프로세스들. 서로 **Redis(pub/sub·큐·분산락)**로 통신.
 
-| 서비스 | 정체 | 실행 명령 |
-|--------|------|-----------|
-| `web` | FastAPI REST + WebSocket (인증·CRUD·시세) | `uvicorn app.main:app` |
-| `engine` | 24h 자동매매 데몬 (asyncio 이벤트루프) | `python -m engine.main` |
-| `worker` | Celery (백테스트 등 비동기 작업 + beat 스케줄) | `celery -A worker.celery_app.celery_app worker -B` |
-| `frontend` | Next.js 15 (App Router, React 19) | `npm run dev` |
-| `db` | PostgreSQL + TimescaleDB | — |
-| `redis` | 세션·큐·pub/sub | — |
-| `proxy` | Caddy | — |
-
 ## 필수 함정 (반복 실수 지점)
 
 - **프론트 패키지 추가는 컨테이너 내부에 설치**해야 반영됨 (호스트 `npm install` X — 익명 볼륨 격리).
