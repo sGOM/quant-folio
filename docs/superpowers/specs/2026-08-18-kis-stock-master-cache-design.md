@@ -209,3 +209,13 @@ return 저장된 총 종목 수
   관찰한 다운로드 URL이다. KIS가 이 경로나 파일 포맷을 바꾸면 `SourceSchemaError`로
   드러나긴 하지만(조용히 실패하지 않음), 복구는 코드 수정이 필요하다 — 계약이
   아니라 관찰에 기반한 통합이라는 점을 명시적 리스크로 남긴다.
+
+## 13. 실 네트워크 검증 (2026-08-19)
+
+테스트는 전부 대역이라 실 KIS CDN 응답 형식은 수동으로만 확인 가능하다.
+
+- `alembic upgrade head`(0016→0017) → 워커 재기동 → `celery call worker.snapshot_kis_stock_master`.
+- 로그 "KIS 종목마스터 스냅샷 적재: trade_date=2026-08-19 4385종목(성공 시장 2/2)".
+- DB: KOSPI 2563 / KOSDAQ 1822 행, 005930 raw 필드 정상 파싱(거래정지="N", 관리종목="N")
+  → 실 응답 형식이 파서 스펙과 일치.
+- 관련 테스트 45건(`test_kis_master.py`·`test_kis_master_snapshot_task.py`·`test_risk_evaluate.py`) 통과.

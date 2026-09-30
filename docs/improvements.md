@@ -1191,8 +1191,7 @@ VKOSPI 96.94(2009년 집계 이후 최고)·이틀 연속 서킷브레이커(사
 
 **해소 경로(2026-08-06)**: 원인이던 `metrics/fetch.py` 의 조용한 실패를 걷어내고
 확정 과거 데이터를 로컬에 영구 저장하는 작업으로 닫는다. 설계는
-`docs/superpowers/specs/2026-08-06-local-persistent-store-design.md`, 계획은
-`docs/superpowers/plans/2026-08-06-local-persistent-store.md`. §47 재검증은 이
+`docs/superpowers/specs/2026-08-06-local-persistent-store-design.md`. §47 재검증은 이
 작업이 끝나고 pykrx 차단이 풀린 뒤에 다시 돌린다.
 
 > **3차 시도(2026-08-16) — 실행됐으나 결론 보류.** pykrx 차단이 풀려 스크립트가
