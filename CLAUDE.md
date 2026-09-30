@@ -55,6 +55,7 @@ Docker Compose로 뜨는 별도 프로세스들. 서로 **Redis(pub/sub·큐·�
   `.claude/rules/market-data.md`·`data-model/market-store.md`.
 
 앱을 실제로 띄워 검증·스크린샷은 `run-quantfolio` 스킬 사용.
+작업별 에이전트 선택은 `.claude/agents/*.md` 의 description 을 따른다(매 세션 자동 주입됨).
 
 ## 전략 id 관리
 
