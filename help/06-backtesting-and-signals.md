@@ -41,12 +41,13 @@ POST /api/strategies/{id}/backtest  { period_start, period_end }
 ```python
 entries, exits = generate_signals(signal_input, config)   # 매수/매도 시점 bool 시계열
 pf = vbt.Portfolio.from_signals(
-    close, entries, exits, init_cash=cash, fees=effective_fees, freq="1D",
+    close, exec_entries, exec_exits, init_cash=cash, fees=effective_fees,
+    slippage=slippage, freq="1D",  # 체결은 익일 종가로 민 신호
     sl_stop=..., sl_trail=..., tp_stop=...)                # 손절/익절/트레일링 반영
 return {
     "total_return": pf.total_return(),   # 총수익률
     "mdd": pf.max_drawdown(),            # 최대낙폭
-    "sharpe": pf.sharpe_ratio(),         # 위험대비수익
+    "sharpe": ..., "sortino": ...,       # risk_free_rate 초과 기준
     "win_rate": ..., "num_trades": ...,
     "equity_curve": [...],               # 자산곡선(차트용)
     "markers": [...],                    # 매매 시점 마커(차트용)
@@ -121,7 +122,8 @@ entries = (close > upper) & (close.shift(1) <= upper)
 ```
 
 `signals.py` 주석을 보면 거의 모든 전략에 **"미래참조 처리:"** 설명이 달려 있다.
-규약은 일관된다: **"t 시점 신호는 t 종가가 확정된 뒤 계산되고, t 종가로 체결"**.
+규약은 일관된다: **"t 시점 신호는 t 종가가 확정된 뒤 계산되고, 체결은 기본 t+1 종가"**
+(`fill_mode="next_close"`. 당일 종가 체결 `same_close` 는 민감도 분석용 opt-in).
 채널/돌파처럼 과거 레벨을 봐야 하는 건 `shift(1)` 로 당일 봉을 제외한다.
 
 이건 단순 코딩 디테일이 아니라 **백테스트의 신뢰성 그 자체**다. 신호를 수정할 땐
@@ -131,7 +133,7 @@ entries = (close > upper) & (close.shift(1) <= upper)
 
 ## 6. 실거래에서 같은 신호를 쓰는 법 (다시 runner)
 
-[05 문서](05-trading-engine.md)에서 본 `_tick()` 을 떠올리면:
+[05 문서](05-trading-engine.md)에서 본 `_tick_once()` 를 떠올리면:
 
 ```python
 series.loc[today] = 현재가          # 오늘 봉을 실시간 현재가로 채우고
@@ -166,7 +168,7 @@ sig = latest_signal(series, cfg)    # 백테스트와 같은 함수로 마지막
 ### 직접 열어볼 파일
 - `backend/app/services/backtest/signals.py` — 길지만 한 함수씩 읽으면 쉽다.
   `_cross_up`/`_cross_down` 과 `_sma_signals` 부터.
-- `backend/app/services/backtest/engine.py` — 약 150줄. vectorbt 호출부.
+- `backend/app/services/backtest/engine.py` — vectorbt 호출부.
 - `backend/app/services/backtest/portfolio.py` — 멀티팩터 리밸런싱(포트폴리오)
   백테스트. 익일 체결·슬리피지·리스크 캡·팩터 성과귀속까지 이쪽에서 처리.
 - `backend/app/api/routes/backtests.py` — 요청 흐름.

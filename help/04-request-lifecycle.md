@@ -168,7 +168,7 @@ KIS키등록 → Fernet 암호화 → users.kis_app_key(암호문)
 → [05-trading-engine.md](05-trading-engine.md)
 
 ### 직접 열어볼 파일
-- `backend/app/core/session.py` — 60줄. 세션의 전부.
+- `backend/app/core/session.py` — 짧다. 세션의 전부.
 - `backend/app/api/deps.py` — 인증 의존성.
 - `backend/app/core/security.py` — 해싱 + 암호화.
 - `backend/app/core/config.py` — 부팅 게이트(`_ensure_secrets`).
