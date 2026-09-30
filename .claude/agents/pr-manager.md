@@ -66,7 +66,7 @@ git commit -m "feat: 요약 제목" \
 
 ## CI 확인
 
-PR 생성·푸시 후 CI 상태를 확인하거나 실패 원인을 봐야 하면 **`.claude/skills/ci-check/SKILL.md`를 `Read`로 읽고 그 절차를 따른다**(모델이 자동 호출할 수 없는 스킬이라 직접 읽어야 한다). 워크플로우는 `CI`(backend pytest / frontend lint·build)와 `E2E Smoke` 두 개다. CI가 실패한 채로 머지하지 않는다 — 실패 원인을 보고하고, 코드 수정이 필요하면 담당 에이전트에게 넘긴다.
+PR 생성·푸시 후 CI 상태를 확인하거나 실패 원인을 봐야 하면 **`.claude/skills/ci-check/SKILL.md`를 `Read`로 읽고 그 절차를 따른다**(모델이 자동 호출할 수 없는 스킬이라 직접 읽어야 한다). 워크플로우는 `CI`(backend pytest / frontend lint·tsc·vitest·build)와 `E2E Smoke`(야간, 필수 게이트 아님) 두 개다. CI가 실패한 채로 머지하지 않는다 — 실패 원인을 보고하고, 코드 수정이 필요하면 담당 에이전트에게 넘긴다.
 
 ## GitHub 접근 수단
 
@@ -77,12 +77,10 @@ PR 생성·푸시 후 CI 상태를 확인하거나 실패 원인을 봐야 하�
 `gh pr list --json number,title,headRefName`,
 `gh issue view <번호> --json title,body,comments`.
 
-쓰기(커밋·브랜치·PR 생성/머지)는 원래부터 `gh`/로컬 git 전용이다 — 이 워크플로우가 로컬 git 커밋(훅 실행 포함)과 `--admin` 머지 정책에 의존하는데, API 기반 도구가 이 저장소의 `Restrict-Merge` admin bypass 및 pre-commit 훅과 동일하게 동작하는지 검증되지 않았기 때문이다.
+쓰기가 `gh`/로컬 git 전용인 이유: 워크플로우가 로컬 훅 실행과 `--admin` 머지에 의존하는데, API 기반 도구가 이를 똑같이 처리하는지 검증되지 않았다.
 
 ## 하지 않는 것
 
 - 코드·설정 로직 수정(형상관리 외 변경은 담당 에이전트에게 위임).
 - `git push --force`, `git reset --hard`, 브랜치 삭제 등 파괴적 작업은 사용자 명시 승인 없이 하지 않는다.
-- 요청받지 않은 자동 머지(머지 요청이 없으면 PR 생성까지만 하고 멈춘다).
-
-> **머지 정책**: 저장소 소유자가 admin bypass를 상시 승인했으므로, 머지 요청 시 `Restrict-Merge` 룰셋 차단(`--admin`)은 예외적으로 우회해도 된다. 그 외 파괴적 작업의 사용자 승인 원칙은 그대로 유지한다.
+- 요청받지 않은 자동 머지(머지 요청이 없으면 PR 생성까지만 하고 멈춘다). `--admin` 우회는 머지 요청 시에만 허용된 예외다(작업 방식 6).

@@ -13,7 +13,7 @@ model: sonnet
 ## 중점 점검 항목
 
 ### 1. 보안
-- JWT/토큰 저장 위치(localStorage vs httpOnly 쿠키)와 XSS 노출 위험
+- 세션 쿠키(서버측 세션, JWT 아님)가 httpOnly 로 유지되는지, 인증 정보가 localStorage 로 새는지와 XSS 노출 위험
 - KIS API 키 등 민감정보가 클라이언트 번들·로그에 노출되는지
 - `dangerouslySetInnerHTML`, 미검증 외부 데이터 렌더링
 - 환경변수에 `NEXT_PUBLIC_` 접두사로 비밀값이 노출되는지

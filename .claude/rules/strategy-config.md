@@ -9,11 +9,9 @@ paths:
 
 # 전략 설정 계약 (`app/schemas/strategy.py`)
 
-**993줄, 스키마 중 최대.** 백엔드·엔진·프론트 3자가 필드명을 정확히 맞춰야 하는 계약이다
+스키마 중 최대. 백엔드·엔진·프론트가 필드명을 정확히 맞춰야 하는 계약이다
 (직렬화 경계에서 이름 변환 금지 — `docs/CONVENTIONS.md` §3).
-
-`Strategy.config` 는 **JSONB** 라 유형·파라미터 추가에 **DB 마이그레이션이 필요 없다.**
-대신 그만큼 스키마가 유일한 방어선이다.
+`Strategy.config` 는 **JSONB** 라 필드 추가에 마이그레이션이 없다 — 그만큼 스키마가 유일한 방어선.
 
 ```
 백엔드  app/schemas/strategy.py   (Pydantic v2, discriminated union)
@@ -37,9 +35,7 @@ paths:
 
 전략별 수식·금융학적 근거는 [`docs/strategies.md`](../../docs/strategies.md) 참고. 여기서는 **계약**만 다룬다.
 
-### 단일종목 공통 (`_BaseConfig`)
-
-모든 단일종목 유형이 상속한다.
+### 단일종목 공통 (`_BaseConfig`, 전 유형이 상속)
 
 | 필드 | 기본 | 의미 |
 |---|---|---|

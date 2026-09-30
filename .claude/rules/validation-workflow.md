@@ -5,8 +5,7 @@ paths:
 
 # 전략·팩터 검증 워크플로 (`backend/scripts/`)
 
-이 프로젝트의 **핵심 반복 작업**. 26개 스크립트가 계열별로 나뉜다.
-채택·기각 결론은 [`docs/improvements.md`](../../docs/improvements.md)·[`docs/strategies.md`](../../docs/strategies.md)에 누적돼 있으니,
+이 프로젝트의 **핵심 반복 작업**. 채택·기각 결론은 [`docs/improvements.md`](../../docs/improvements.md)·[`docs/strategies.md`](../../docs/strategies.md)에 누적돼 있으니,
 **새 아이디어를 검증하기 전에 이미 기각된 것인지 먼저 확인한다.**
 
 ## 실행
@@ -35,7 +34,7 @@ docker compose run --rm web python scripts/<name>.py [옵션]
 판정:     alpha / Sharpe                                    ← 저베타 전략은 excess/IR 로 보면 안 된다
 ```
 
-- **손질된 종목 풀에서는 결론이 뒤집힌다.** 동적 섹터로테이션이 +131% → PIT 에서 +12.9% 로 붕괴한 전례가 있다.
+- **손질된 종목 풀에서는 결론이 뒤집힌다**(동적 섹터로테이션 +131% → PIT +12.9%).
 - **파라미터를 여러 개 흔들어 최적점을 고르는 것은 과최적화다.** 표본 외·워크포워드 결과를 함께 제시한다.
 - 다중검정 보정이 필요하면 `app/services/backtest/deflated_sharpe.py`(DSR).
 

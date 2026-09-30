@@ -10,8 +10,9 @@ model: sonnet
 ## 책임 범위
 - 스키마 설계 및 Alembic 마이그레이션
 - 실제 스키마의 출처는 **`backend/app/models/` 아래 두 파일**이다. 테이블이 계속 늘고 있으므로 목록을 기억에 의존하지 말고 착수 시 두 파일을 모두 읽어 확인한다.
-  - `models.py` — 애플리케이션 도메인. 사용자·전략(users, strategies, backtests, strategy_likes), 매매(orders, executions, positions, risk_limits), 시계열(price_ticks), 참조데이터(sector_map_snapshots), 뉴스(news_articles, news_article_symbols), 알림(alerts).
-  - `store.py` — **확정 과거 데이터의 로컬 영구 저장소**(§49). 정규화 5테이블(stock_daily_snapshots, stock_period_stats, index_ohlcv, index_constituents, dart_financials) + 페치 원장(external_fetches). 이 테이블들은 애플리케이션이 쓰는 게 아니라 **외부 소스(pykrx·KRX MDC·OpenDART) 조회 결과의 캐시**이며, 원장이 "적재 안 됨"과 "데이터 없음"을 가른다. 아래 원칙 절 참고.
+  - `models.py` — 애플리케이션 도메인(사용자·전략·매매·시계열·참조 스냅샷·뉴스·알림).
+  - `store.py` — **확정 과거 데이터의 로컬 영구 저장소**(§49). 외부 소스(pykrx·KRX MDC·OpenDART) 조회 결과의 캐시이며, 페치 원장(`external_fetches`)이 "적재 안 됨"과 "데이터 없음"을 가른다.
+  - 테이블별 관계·삭제 정책은 `.claude/rules/data-model.md`.
 - price_ticks를 TimescaleDB hypertable로 구성, 압축·보존 정책 설정
 - 인덱스 설계 및 시계열/집계 쿼리 최적화
 - 백업·보존 정책(`docs/db-backup.md`, `worker/tasks.py`의 백업 태스크)과의 정합성

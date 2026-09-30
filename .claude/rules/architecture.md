@@ -12,9 +12,7 @@ paths:
 # 아키텍처 — 프로세스와 통신
 
 Docker Compose 로 뜨는 **별도 프로세스**들이 **Redis**(pub/sub·큐·분산락)로 통신한다.
-서로 함수를 직접 호출하지 않는다.
-
-서비스 목록·실행 명령은 `CLAUDE.md` 의 "아키텍처(한 줄 지도)" 표를 본다(상시 로드됨).
+서로 함수를 직접 호출하지 않는다. 서비스 목록·실행 명령은 `CLAUDE.md`.
 
 ## Redis 통신 규약
 
@@ -50,18 +48,12 @@ Docker Compose 로 뜨는 **별도 프로세스**들이 **Redis**(pub/sub·큐·
 
 ## ⚠️ 반복 실수 지점
 
-- **컨테이너 TZ 는 UTC 인데 KRX 거래일은 KST.** `celery_app.timezone` 은 beat 스케줄 표시에만
-  적용되고 **태스크 본문의 `date.today()` 에는 영향이 없다.** 거래일을 다룰 땐
-  `app.services.market.now_kst().date()` 를 쓴다(§65 에서 이 함정으로 실제 결함이 났다).
-- **web/engine/worker 는 핫리로드가 없다.** 코드 수정 후 `docker compose restart <svc>`.
-  (개발 중엔 `docker-compose.override.yml` 이 병합돼 web 만 `--reload` 로 뜬다.)
-- **프론트 패키지는 컨테이너 내부에 설치.** 호스트 `npm install` 은 익명 볼륨에 가려 반영 안 됨.
-  → `docker compose exec frontend npm install <pkg>`
-- **시크릿은 `.env` 가 아니라 `secrets/*.txt` 파일 마운트.** 새 시크릿은 compose secret +
-  `app/core/config` 배선.
-- **빌드 산출물 커밋 금지** (`frontend/tsconfig.tsbuildinfo` 등).
+(핫리로드·npm·시크릿·빌드 산출물 함정은 `CLAUDE.md` "필수 함정".)
 
-앱을 실제로 띄워 검증·스크린샷은 `run-quantfolio` 스킬을 쓴다.
+- **컨테이너 TZ 는 UTC 인데 KRX 거래일은 KST.** `celery_app.timezone` 은 beat 스케줄에만
+  적용되고 **태스크 본문의 `date.today()` 에는 영향이 없다.** 거래일은
+  `app.services.market.now_kst().date()`(§65 에서 이 함정으로 실제 결함).
+- 핫리로드 없음의 예외: 개발 중엔 `docker-compose.override.yml` 이 병합돼 web 만 `--reload`.
 
 ## CI (GitHub Actions)
 
@@ -70,8 +62,7 @@ Docker Compose 로 뜨는 **별도 프로세스**들이 **Redis**(pub/sub·큐·
 | `.github/workflows/ci.yml` | main 대상 PR + main push | `backend`(pytest+커버리지) · `frontend`(lint→**tsc --noEmit**→vitest→build) |
 | `.github/workflows/e2e-smoke.yml` | 매일 03:00 KST + 수동 | `smoke` — compose 전체 스택 기동 후 Playwright 로 "가입→로그인→전략목록→백테스트→모니터링" |
 
-- **CI 는 `npx tsc --noEmit`(타입체크)를 돈다.** 로컬 게이트(lint→vitest→build)에는 이 단계가
-  없으므로, 프론트를 고쳤으면 타입체크도 같이 돌리는 편이 CI 왕복을 줄인다.
+- **CI 는 `npx tsc --noEmit` 을 돈다.** 로컬 게이트(lint→vitest→build)엔 없으니 프론트 수정 시 같이 돌린다.
 - backend job 은 timescaledb·redis 서비스 컨테이너를 띄우고 `alembic upgrade head` 후 pytest 를 돈다
   — **마이그레이션이 깨지면 CI 가 테스트 전에 죽는다.**
 - e2e-smoke 는 스택 기동이 무거워 **PR 필수 게이트가 아니다**(야간 크론).

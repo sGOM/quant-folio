@@ -22,8 +22,9 @@ paths:
 | `index_constituents` | (index_code, base_date, symbol) | 시점별 지수 구성종목(PIT, 생존편향 제거용) |
 | `dart_financials` | (corp_code, bsns_year, reprt_code, fs_div) | OpenDART 재무제표 |
 | `external_fetches` | (source, cache_key) | **적재 원장** — 위 전부의 "확정 여부(final)·행수" 기록 |
-| `sector_map_snapshots` | — | 업종분류 분기 스냅샷(PIT 부분 해소) |
-| `kis_stock_master_snapshots` | (symbol, trade_date) unique | KIS 종목마스터 — 관리종목·정리매매·액면가·업종 |
+
+참조 스냅샷 `sector_map_snapshots`(업종 분기, PIT 부분 해소)·`kis_stock_master_snapshots`
+(관리종목·정리매매·액면가·업종)는 `models.py` 소속이고 원장 밖이다.
 
 ## `external_fetches` 가 핵심이다
 
@@ -52,5 +53,5 @@ paths:
 ## 주의
 
 - **저장소는 빈 상태에서 시작할 수 있어야 한다.** 시드 데이터를 전제하면 안 된다.
-- **종목명의 신뢰 소스는 `krx_index.all_listed_stocks`**(KRX MDC finder, 날짜 비의존).
-  FDR/pykrx 는 이 환경에서 불안정하다. 외부 조회 실패 시 seed-only 캐시로 굳히지 말 것(자가복구 불가).
+- 종목명 신뢰 소스(`CLAUDE.md`)는 날짜 비의존 KRX MDC finder 다. 외부 조회 실패 시
+  seed-only 캐시로 굳히지 말 것(자가복구 불가).

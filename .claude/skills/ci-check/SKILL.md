@@ -8,8 +8,8 @@ disable-model-invocation: true
 
 이 저장소의 CI는 두 워크플로우로 구성된다.
 
-- `CI` (`.github/workflows/ci.yml`) — PR/main push마다 실행. job: `backend`(pytest), `frontend`(lint/build)
-- `E2E Smoke` (`.github/workflows/e2e-smoke.yml`) — 스케줄 실행. job: `smoke`
+- `CI` (`.github/workflows/ci.yml`) — PR/main push마다 실행. job: `backend`(alembic upgrade → pytest), `frontend`(lint → tsc → vitest → build)
+- `E2E Smoke` (`.github/workflows/e2e-smoke.yml`) — 야간·수동 실행, 필수 게이트 아님. job: `smoke`
 
 ## 절차
 
@@ -37,11 +37,11 @@ disable-model-invocation: true
 
 3. **요약해서 보고**
 
-   - 어떤 job이 실패했는지 (`backend` pytest? `frontend` lint/build? `smoke`?)
+   - 어떤 job·단계가 실패했는지 (`backend` 마이그레이션/pytest? `frontend` lint/tsc/vitest/build? `smoke`?)
    - 실패 원인 한 줄(예: 특정 테스트 assertion, 타입 에러, lint 룰)
    - 로컬 재현 명령 제시:
      - backend: `docker compose exec web pytest tests/<파일> -k <테스트명>`
-     - frontend: `docker compose exec frontend npm run lint` / `npm run build`
+     - frontend: `docker compose exec frontend npm run lint` / `npx tsc --noEmit` / `npx vitest run` / `npm run build`
 
 4. **아직 실행 중이면** `gh run watch <run-id>`로 완료를 기다릴지, 그냥 상태만 보고할지 사용자에게 물어본다(장시간 대기는 기본으로 하지 않는다).
 

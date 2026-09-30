@@ -49,7 +49,6 @@ paths:
 
 ## 주의
 
-- **패키지 설치는 컨테이너 내부에서.** `docker compose exec frontend npm install <pkg>`
 - `app/*/page.tsx` 에 **named export 를 두면 Next.js 15 페이지 타입 계약이 깨져 빌드가 실패한다**.
 - `localStorage` 접근은 try/catch — 예외가 페이지 전체를 죽인 적 있다(워치리스트).
-- 검증: `npm run lint` → `npm run test`(vitest) → `npm run build` 를 모두 통과시킨다.
+- 검증: `npm run lint` → `npx tsc --noEmit` → `npm run test`(vitest) → `npm run build`. tsc 는 CI 만 돌리므로 로컬에서 빠뜨리기 쉽다.
