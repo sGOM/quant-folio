@@ -140,13 +140,10 @@ docker compose run --rm web python scripts/paper_rebalance.py --strategy 23 --ex
 - [ ] **모의투자(vts)로 먼저 검증** — `KIS_ENV=vts`, `KIS_HTS_ID` 설정 후 실시탭으로
   전략을 켜고, `docker compose logs -f engine | grep 체결통보` 로 구독·수신·반영
   로그가 정상적으로 찍히는지 확인한다.
-- [ ] **CNTG_QTY(체결수량) 필드가 누적값인지 증분값인지 실제 로그로 확인** —
-  `engine/fill_notice.py` 는 이 필드를 "해당 주문의 누적 체결수량"으로 가정해
-  `reconcile.py._order_recorded_qty` 와 동일한 델타 방식을 적용한다. 부분체결이
-  여러 번 나는 주문으로 실제 프레임을 로깅해, 회차별 CNTG_QTY 값이 매번 늘어나는
-  누적값인지 매번 이번 회차분만 담긴 증분값인지 반드시 확인할 것. 증분값으로
-  밝혀지면 `parse_fill_notice`/`apply_fill_notice` 의 델타 계산 로직을 증분 합산
-  방식으로 변경해야 한다(현재 구현은 누적 가정으로 델타=notice.qty−already 계산).
+- [ ] **CNTG_QTY(체결수량)가 누적값인지 증분값인지 실제 로그로 확인** — 현재 구현은
+  누적 가정(델타 = notice.qty − 기록분, `reconcile._order_recorded_qty` 와 같은 방식).
+  부분체결이 여러 번 나는 주문의 회차별 값을 로깅해 확인하고, 증분으로 밝혀지면
+  `parse_fill_notice`/`apply_fill_notice` 를 증분 합산으로 바꾼다.
 - [ ] **tr_id 실전 전환 확인** — `settings.is_paper_trading` 에 따라 자동으로
   모의(`H0STCNI9`) ↔ 실전(`H0STCNI0`) 이 분기되므로 별도 설정은 필요 없지만,
   `KIS_ENV=prod` 전환 직후 엔진 로그에서 `tr_id=H0STCNI0` 로 구독됐는지 확인한다.
@@ -252,12 +249,9 @@ curl http://localhost:8000/api/engine/status    # {"engine_alive": true}
 따라 즉시 매수하거나 다음 정기 리밸런싱을 기다린다(§1-B 참고).
 
 ### 개선 방향(TODO, 미구현)
-구 개선안(improvement-plan-2026-07-16, git 히스토리) B-3 은 "재개는 반드시 수동 조작으로 제한"을
-권장한다 — 즉 쿨다운 경과만으로 자동 재가동하지 말고, 사람이 명시적으로 승인해야만
-`killed` 상태를 해제하도록 `_evaluate_mdd_kill` 을 바꾸는 것. 이는 실거래 안전성을 바꾸는
-변경이라 별도 논의·구현 작업으로 남겨둔다(현재는 위 "실시탭 stop→점검→start" 수동
-절차로 동일한 효과를 낼 수 있으니, 쿨다운을 기다리지 않고 점검하고 싶다면 이 절차를
-쓸 것).
+구 개선안 B-3(improvement-plan-2026-07-16, git 히스토리): 쿨다운 경과만으로 자동 재가동하지 말고
+사람의 명시적 승인으로만 `killed` 를 해제하도록 `_evaluate_mdd_kill` 을 바꾼다. 실거래 안전성을
+바꾸는 변경이라 별도 논의로 남김 — 그 전까지는 위 "stop→점검→start" 절차로 같은 효과를 낸다.
 
 ---
 
@@ -272,14 +266,15 @@ curl http://localhost:8000/api/engine/status    # {"engine_alive": true}
 
 ```bash
 # 1) NULL로 남은 포지션 확인 (미청산만 — qty=0인 과거 청산분은 무관)
-docker compose exec db psql -U quantfolio -d quantfolio -c "
+#    DB·유저명은 quant(compose 기본값) — quantfolio 가 아니다
+docker compose exec db psql -U quant -d quant -c "
   SELECT user_id, symbol, qty, avg_price
   FROM positions
   WHERE strategy_id IS NULL AND qty > 0
   ORDER BY user_id, symbol;"
 
 # 2) 해당 (user, symbol)의 주문 이력에서 실제로 몇 개 전략이 관여했는지 확인
-docker compose exec db psql -U quantfolio -d quantfolio -c "
+docker compose exec db psql -U quant -d quant -c "
   SELECT user_id, symbol, strategy_id, side, count(*), min(created_at), max(created_at)
   FROM orders
   WHERE (user_id, symbol) IN (
