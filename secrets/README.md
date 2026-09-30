@@ -11,7 +11,7 @@ docker compose 가 이 파일들을 `/run/secrets/*`(tmpfs)로 마운트하고, 
 
 | 파일 | 내용 | 비고 |
 |------|------|------|
-| `secret_key.txt` | JWT 서명 키 | `openssl rand -hex 32` |
+| `secret_key.txt` | 앱 마스터 키(`SECRET_KEY`) — prod 부팅 필수. 인증은 JWT 가 아닌 서버측 세션이라 현재 서명에 쓰이지 않는다 | `openssl rand -hex 32` |
 | `credential_enc_key.txt` | DB 자격증명 Fernet 암호화 키 | 아래 생성 명령 |
 | `kis_app_key.txt` | (선택) KIS app_key 폴백 | 미사용 시 빈 파일 |
 | `kis_app_secret.txt` | (선택) KIS app_secret 폴백 | 미사용 시 빈 파일 |
@@ -19,7 +19,7 @@ docker compose 가 이 파일들을 `/run/secrets/*`(tmpfs)로 마운트하고, 
 | `toss_app_secret.txt` | (선택) 토스 client_secret 폴백 | 미사용 시 빈 파일 |
 | `krx_id.txt` | (선택) KRX 데이터 포털 로그인 ID | 지표 화면용. 미사용 시 빈 파일 |
 | `krx_pw.txt` | (선택) KRX 데이터 포털 비밀번호 | 지표 화면용. 미사용 시 빈 파일 |
-| `opendart_api_key.txt` | (선택) OpenDART 인증키 | 재무데이터용(준비/미배선). 미사용 시 빈 파일 |
+| `opendart_api_key.txt` | (선택) OpenDART 인증키 | 퀄리티·성장 팩터·턴어라운드 스크리너. 없으면 해당 팩터가 중립 처리돼 점수가 편향된다. 미사용 시 빈 파일 |
 | `telegram_bot_token.txt` | (선택) 텔레그램 봇 토큰 | critical 알림 외부 발송용. 미사용 시 빈 파일 |
 | `telegram_chat_id.txt` | (선택) 텔레그램 채팅 ID | 봇 토큰과 함께 둘 다 설정해야 활성화. 미사용 시 빈 파일 |
 | `s3_backup_access_key_id.txt` | (선택) S3 백업 오프사이트 복제 액세스 키 | 야간 DB 백업 추가 반출용(§10). 미사용 시 빈 파일 |
@@ -39,7 +39,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 : > secrets/toss_app_key.txt; : > secrets/toss_app_secret.txt
 # KRX 데이터 포털(지표 화면용). 무료 가입 https://data.krx.co.kr — 미사용 시 빈 파일
 : > secrets/krx_id.txt; : > secrets/krx_pw.txt
-# OpenDART 재무데이터(준비/미배선). 무료 발급 https://opendart.fss.or.kr — 미사용 시 빈 파일
+# OpenDART 재무데이터(퀄리티·성장 팩터). 무료 발급 https://opendart.fss.or.kr — 미사용 시 빈 파일
 : > secrets/opendart_api_key.txt
 # 텔레그램 critical 알림(선택). @BotFather 로 봇 생성 후 토큰 발급, 채팅 ID는
 # 봇과 대화 시작 후 https://api.telegram.org/bot<TOKEN>/getUpdates 로 확인 — 미사용 시 빈 파일
