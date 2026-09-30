@@ -24,6 +24,8 @@ main()
 
 전략 시작 전에는 **실전 전환 게이트**(`app/services/live_gate.py`)를 통과해야 한다 —
 실전(prod) 환경이면 정합 등급·금액 상한·승인 플래그를 검사해 미달 시 시작을 거부한다.
+주문 직전엔 **거래정지·시장 서킷브레이커 게이트**(`engine/halt.py`, `base_runner._halt_gate_passed`)도
+통과해야 한다 — 정지·재개 직후 유예(COOLDOWN) 중이면 주문만 막고 러너는 계속 관측한다.
 
 핵심 자료구조:
 
@@ -57,7 +59,7 @@ _feed_mgr = PriceFeedManager(...) # 사용자별 시세 WS 피드 관리자
 async def run(self, stop_event):
     if not await self._load(): return        # 전략·사용자·브로커·시드 로딩
     while not stop_event.is_set():
-        await self._tick()                    # 한 번 평가
+        await self._tick_once()                    # 한 번 평가
         await asyncio.wait_for(stop_event.wait(), timeout=30)  # 30초 대기(중단 가능)
 ```
 
@@ -67,10 +69,10 @@ async def run(self, stop_event):
 - `_seed_series()`: 지표 계산용 **과거 일봉**을 시드. DB(`price_ticks`)에 없으면
   FinanceDataReader 로 적재 후 사용.
 
-### `_tick()` — 한 번의 판단 (핵심 중의 핵심)
+### `_tick_once()` — 한 번의 판단 (핵심 중의 핵심)
 
 ```python
-async def _tick(self):
+async def _tick_once(self):
     if not is_market_open(): return            # ① 장 운영시간 아니면 스킵
     price = await self._current_price()        # ② 현재가 (Redis 캐시 우선, REST 폴백)
 
@@ -226,7 +228,7 @@ config 기반 청산(`runner._config_exit`)도 별도로 있다 — `stop_loss_p
 ## 7. 장 운영시간 가드 (`app/services/market.py`)
 
 `is_market_open()` 이 **정규장(09:00~15:30 KST) + 영업일**일 때만 True.
-휴장일은 pykrx 로 best-effort 확인. `_tick()` 첫 줄에서 이걸 검사해 **장 외 시간엔
+휴장일은 pykrx 로 best-effort 확인. `_tick_once()` 첫 줄에서 이걸 검사해 **장 외 시간엔
 신호 평가·주문을 아예 건너뛴다**. (휴장/시간외 오발주 방지)
 
 ---
@@ -239,6 +241,7 @@ base.py`)에만 의존한다. `make_broker_for_user(user)` 팩토리가 사용�
 
 ```python
 class BrokerClient(Protocol):     # = Java interface
+    async def verify_connection(...)
     async def get_quote(...) -> Quote
     async def place_order(...) -> OrderResult
     async def get_order_execution(...) -> Fill
@@ -262,7 +265,7 @@ class BrokerClient(Protocol):     # = Java interface
 ### 직접 열어볼 파일 (이 순서로)
 - `backend/engine/main.py` — 엔진 생애주기.
 - `backend/engine/base_runner.py` — 러너 공통 골격(적재·루프·락).
-- `backend/engine/runner.py` — `_tick()` 을 정독. 매매 판단의 전부.
+- `backend/engine/runner.py` — `_tick_once()` 을 정독. 매매 판단의 전부.
 - `backend/engine/executor.py` — 멱등성 3중 방어.
 - `backend/engine/fills.py` — 체결 기록 단일 진입점(3중 경로가 공유).
 - `backend/engine/reconcile.py`, `fill_notice.py` — 체결 보정·실시간 체결통보.

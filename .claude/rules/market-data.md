@@ -11,6 +11,10 @@ paths:
 
 `app/services/data/` + `app/services/metrics/`
 
+- **확정 과거 데이터(펀더멘털·시총·OHLCV·PIT 구성·DART 재무)는 Postgres 에 영구 저장돼 로컬 우선으로
+  읽힌다.** 테이블·원장·강제 재적재는 [data-model/market-store.md](data-model/market-store.md).
+- **종목명의 신뢰 소스는 `krx_index.all_listed_stocks`**(KRX MDC). FDR/pykrx 는 이 환경에서 불안정.
+
 ## 소스별 성격
 
 | 소스 | 모듈 | 인증 | 안정성 | 용도 |

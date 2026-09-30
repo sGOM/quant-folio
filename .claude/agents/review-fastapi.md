@@ -14,7 +14,7 @@ model: sonnet
 
 ### 1. 보안 (최우선 — 금융 플랫폼)
 - 증권사(KIS/Toss) app_key/secret 평문 저장·로깅 여부, Fernet 암호화 적용 여부, 브로커 팩토리(`services/broker/factory.py`)의 자격증명 복호화·폴백 처리
-- 비밀번호 해싱 방식, JWT/세션 토큰 생성·검증·만료 처리
+- 비밀번호 해싱 방식, 서버측 세션(`session:{sid}`, JWT 아님) 생성·검증·슬라이딩 만료 처리
 - 인증/인가 누락 엔드포인트, 사용자 간 자원 접근 격리(IDOR)
 - SQL 인젝션, 입력 검증(Pydantic) 누락
 - CORS/시크릿 환경변수 하드코딩, 민감정보 노출

@@ -44,7 +44,7 @@
 | **redis** | `redis:7-alpine` | 세션·캐시·pub/sub·락·큐 | ❌ (127.0.0.1:6379) |
 
 > **핵심**: 외부에 뚫린 포트는 `proxy(:8080)` **딱 하나**. 나머지는 `127.0.0.1` 에만
-> 바인딩돼 호스트 로컬에서만 접근 가능하다(테일넷·외부 노출 차단). 컨테이너끼리는
+> 바인딩돼 호스트 로컬에서만 접근 가능하다(외부 노출 차단). 컨테이너끼리는
 > 도커 내부 네트워크에서 서비스 이름(`web`, `db`, `redis`...)으로 통신한다.
 
 ---
@@ -56,7 +56,7 @@
 - **하는 일**: 들어온 요청을 경로로 분기. `/api/*`, `/ws`, `/docs`, `/health` 는
   `web:8000` 으로, 나머지는 전부 `frontend:3000` 으로 보낸다 (`Caddyfile` 참고).
 - **왜 필요**: 프론트와 백엔드를 **한 출처(:8080)** 로 합친다. 그러면
-  - 폰이 어떤 주소(Tailscale IP/머신명)로 들어와도 프론트가 **상대경로**로 API 를
+  - 폰이 어떤 주소(WireGuard IP 등)로 들어와도 프론트가 **상대경로**로 API 를
     호출 → 주소가 바뀌어도 재빌드 불필요.
   - 같은 출처라 **CORS·교차출처 쿠키 문제가 사라진다**(모바일 Safari 의 엄격한
     SameSite/Secure 정책에서도 인증 안정적).
@@ -88,20 +88,24 @@
 
 ### worker — Celery 배치
 
-- **하는 일**: 무거운/주기적 배치 작업. 헬스체크(`ping`) 외에 **beat 스케줄 6개**가
+- **하는 일**: 무거운/주기적 배치 작업. 헬스체크(`ping`) 외에 **beat 스케줄 9개**가
   등록돼 있다 (`worker/celery_app.py` 의 `beat_schedule`, 구현은 `worker/tasks.py`):
 
   | 태스크 | 주기 | 하는 일 |
   |--------|------|---------|
   | `ingest_daily_ohlcv` | 매일 18:30 | 장 마감·시세 확정 후 당일 일봉을 `price_ticks` 에 적재 |
+  | `snapshot_kis_stock_master` | 매일 18:40 | KIS 종목마스터(관리종목·정리매매·거래정지) 스냅샷 |
+  | `ingest_daily_snapshots` | 매일 18:50 | 확정 과거 데이터 로컬 저장소 선적재 |
+  | `ingest_news` | 매시 :10 | 언론사 RSS 수집·요약·종목 매핑 |
   | `check_fill_quality_drift` | 매주 월 09:00 | 체결 품질(슬리피지 실측) 드리프트 정기 점검 |
   | `snapshot_sector_map` | 분기 1회(1/4/7/10월 1일 19:00) | 업종분류를 `sector_map_snapshots` 에 적재(섹터 캡 PIT화) |
   | `backup_database` | 매일 03:00 | `pg_dump` 압축 백업 + 보존기간 관리(`docs/db-backup.md`) |
   | `check_backup_freshness` | 매일 09:00 | 백업 성공 기록 신선도 점검 — worker/beat 침묵 사망 감지 |
   | `cleanup_old_alerts` | 매일 04:00 | `alerts` 보존정책 정리(읽음 90일·미확인 180일 초과 삭제) |
 
-- **커맨드**: `celery -A worker.celery_app.celery_app worker --loglevel=info -B`
-  — `-B` 가 beat 스케줄러를 워커 프로세스에 **내장**한다(별도 beat 컨테이너 없음).
+- **커맨드**: `python -m celery -A worker.celery_app.celery_app worker --loglevel=info -B`
+  — `python -m` 이어야 `/app` 이 `sys.path` 에 들어가 `engine.*` 임포트가 된다(콘솔 스크립트
+  `celery` 로 띄우면 조용히 실패했다, `docs/improvements.md` §9). `-B` 가 beat 스케줄러를 워커 프로세스에 **내장**한다(별도 beat 컨테이너 없음).
   단일 워커 replica 전제이며, 워커를 여러 개로 늘리면 스케줄이 중복 발화한다.
 - **engine 과 차이**: engine 은 "항상 도는 실시간 데몬", worker 는 "요청받으면 처리하는
   작업 큐 컨슈머"(Spring 의 `@Async`/메시지 컨슈머). 브로커·백엔드 모두 Redis 사용.
@@ -109,9 +113,9 @@
 
 ### db — PostgreSQL + TimescaleDB
 
-- **하는 일**: 모든 영속 데이터(users, strategies, backtests, orders, executions,
-  positions, sector_map_snapshots, risk_limits). `price_ticks` 는
-  **TimescaleDB hypertable**(시계열 최적화).
+- **하는 일**: 모든 영속 데이터 — 운영 테이블(사용자·전략·주문·체결·포지션·알림 등)과
+  확정 과거 시장데이터 저장소. `price_ticks` 는 **TimescaleDB hypertable**(시계열 최적화).
+  테이블 지도는 `.claude/rules/data-model.md`.
 - **이미지**: `timescale/timescaledb:latest-pg16` (PostgreSQL + 시계열 확장).
 - **영속성**: `pgdata` named volume 에 저장 → 컨테이너 지워도 데이터 유지.
 - **마이그레이션**: `docker compose exec web alembic upgrade head`
@@ -150,7 +154,7 @@ compose 에서 `command:` 로 **덮어쓴다**:
 ```yaml
 web:    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
 engine: command: python -m engine.main
-worker: command: celery -A worker.celery_app.celery_app worker --loglevel=info -B
+worker: command: python -m celery -A worker.celery_app.celery_app worker --loglevel=info -B
 ```
 
 → 코드 한 벌, 의존성 한 벌. **역할만 커맨드로 분기**한다. 셋이 같은 코드베이스
@@ -222,8 +226,7 @@ docker compose exec web bash                   # 셸 진입(디버깅)
 docker compose exec db psql -U quant quant     # DB 직접 접속
 docker compose exec redis redis-cli            # Redis 직접 접속
 
-# 백업
-docker compose exec db pg_dump -U quant quant > backup.sql
+# 백업 — worker 가 매일 03:00 자동 수행. 수동·복구는 docs/db-backup.md
 ```
 
 ---

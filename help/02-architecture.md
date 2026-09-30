@@ -139,7 +139,7 @@ engine 은 5초마다 `engine:heartbeat` 키를 TTL 15초로 갱신한다
 ## 5. 보안 토폴로지 (왜 포트가 127.0.0.1 인가)
 
 `docker-compose.yml` 을 보면 `web`/`db`/`redis`/`frontend` 의 호스트 포트가
-`127.0.0.1:...` 로 바인딩돼 있다. 외부(테일넷)에 노출되는 건 **proxy(:8080) 하나뿐**.
+`127.0.0.1:...` 로 바인딩돼 있다. 외부(WireGuard 터널)에 노출되는 건 **proxy(:8080) 하나뿐**.
 
 - 외부 → `proxy(:8080)` → 내부에서 `web`/`frontend` 로 라우팅
 - DB·Redis 는 호스트 로컬에서만 접근 가능 (외부 침투면 차단)
@@ -155,6 +155,6 @@ Spring 으로 치면 API Gateway 한 대만 공개하고 나머지는 사설망�
 → [03-fastapi-for-spring-developers.md](03-fastapi-for-spring-developers.md)
 
 ### 직접 열어볼 파일
-- `backend/app/core/channels.py` — **60줄, 필독.** web↔engine 규약의 단일 출처.
+- `backend/app/core/channels.py` — **필독.** web↔engine 규약의 단일 출처.
 - `backend/engine/main.py` — 엔진이 제어 명령을 받고 전략을 켜고 끄는 루프.
 - `backend/app/api/routes/engine.py` — web 이 명령을 발행하는 쪽.

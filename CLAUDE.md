@@ -34,16 +34,6 @@
 
 Docker Compose로 뜨는 별도 프로세스들. 서로 **Redis(pub/sub·큐·분산락)**로 통신.
 
-| 서비스 | 정체 | 실행 명령 |
-|--------|------|-----------|
-| `web` | FastAPI REST + WebSocket (인증·CRUD·시세) | `uvicorn app.main:app` |
-| `engine` | 24h 자동매매 데몬 (asyncio 이벤트루프) | `python -m engine.main` |
-| `worker` | Celery (백테스트 등 비동기 작업 + beat 스케줄) | `celery -A worker.celery_app.celery_app worker -B` |
-| `frontend` | Next.js 15 (App Router, React 19) | `npm run dev` |
-| `db` | PostgreSQL + TimescaleDB | — |
-| `redis` | 세션·큐·pub/sub | — |
-| `proxy` | Caddy | — |
-
 ## 필수 함정 (반복 실수 지점)
 
 - **프론트 패키지 추가는 컨테이너 내부에 설치**해야 반영됨 (호스트 `npm install` X — 익명 볼륨 격리).
@@ -51,11 +41,8 @@ Docker Compose로 뜨는 별도 프로세스들. 서로 **Redis(pub/sub·큐·�
 - **web/engine/worker는 핫리로드 없음.** 코드 고쳤으면 `docker compose restart <svc>`.
 - 시크릿은 `.env`가 아니라 `secrets/*.txt` 파일 마운트. 새 시크릿은 compose secret + `app/core/config` 배선.
 - `frontend/tsconfig.tsbuildinfo` 등 빌드 산출물은 커밋하지 말 것.
-- 종목명 해석의 신뢰 소스는 `krx_index.all_listed_stocks`(KRX MDC). FDR/pykrx는 이 환경에서 불안정.
-- KRX PIT 지수구성 조회는 KRX 로그인 필요(`KRX_ID/PW`가 `app.core.config`로 주입됨).
-- 확정 과거 데이터(펀더멘털·시총·OHLCV·PIT구성·DART재무)는 Postgres 에 영구 저장돼
-  로컬 우선으로 읽힌다. 조회 계약은 `app/services/data/store/frame.py`, 강제 재적재는
-  각 리포지토리의 `delete_*` 후 `external_fetches` 행 삭제.
+- 시장데이터(종목명 신뢰 소스·KRX 로그인·로컬 영구 저장소·강제 재적재) 함정은
+  `.claude/rules/market-data.md`·`data-model/market-store.md`.
 
 앱을 실제로 띄워 검증·스크린샷은 `run-quantfolio` 스킬 사용.
 작업별 에이전트 선택은 `.claude/agents/*.md` 의 description 을 따른다(매 세션 자동 주입됨).

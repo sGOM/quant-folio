@@ -95,10 +95,8 @@ paths:
 
 ## 조용한 실패를 만들지 말 것
 
-무인 자동매매라 **실패가 조용하면 사용자가 모른다.** 새 배치·루프를 추가하면 실패 경로에
-`publish_alert(code=...)` 를 반드시 붙인다. 기존 code 예:
-`runner_failures`·`pit_fallback`·`mdd_kill`·`factor_outage`·`kis_master_outage`·
-`db_backup_stale`·`ohlcv_ingest_failure_rate`.
+무인 자동매매라 **실패가 조용하면 사용자가 모른다.** 새 배치·루프의 실패 경로엔
+`publish_alert(code=...)` 를 반드시 붙인다. code 레지스트리·dedup 규칙은 [alerts.md](alerts.md).
 
 ## 브로커 추상화 (`app/services/broker/`)
 

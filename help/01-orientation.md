@@ -124,5 +124,5 @@ user = await db.scalar(select(User).where(User.email == form.username))
 → [02-architecture.md](02-architecture.md)
 
 ### 직접 열어볼 파일
-- `backend/app/main.py` — 약 120줄. 앱이 어떻게 조립되는지 한눈에 들어온다.
+- `backend/app/main.py` — 앱이 어떻게 조립되는지 한눈에 들어온다.
 - `docker-compose.yml` — 어떤 프로세스들이 같이 도는지(서비스 목록)를 본다.

@@ -33,9 +33,11 @@ paths:
 │  index_ohlcv ── index_ohlcv_coverage                   │
 │  index_constituents      dart_financials               │
 │  external_fetches  ← 적재 원장(모든 위 테이블의 상태 기록) │
-│  sector_map_snapshots    kis_stock_master_snapshots    │
 └────────────────────────────────────────────────────────┘
 ```
+
+`sector_map_snapshots`·`kis_stock_master_snapshots` 는 성격상 시장 참조 스냅샷이지만
+**정의는 `models.py`** 에 있고 `external_fetches` 원장을 쓰지 않는다(자체 배치가 적재).
 
 **두 덩어리 사이에 FK 는 없다.** 운영 테이블의 `symbol` 과 저장소의 `symbol` 은 같은
 6자리 KRX 종목코드지만 참조 제약을 걸지 않는다 — 저장소는 언제든 통째로 지우고 다시

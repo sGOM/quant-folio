@@ -14,7 +14,7 @@
 | [`docs/CONVENTIONS.md`](../../docs/CONVENTIONS.md) | 코드 컨벤션 — **코드 작성·수정 시 필독** |
 | [`docs/PRD.md`](../../docs/PRD.md) | 제품 정의 |
 | [`docs/improvements.md`](../../docs/improvements.md) | 개선 이력·로드맵(§번호로 참조됨). 결정의 *이유*가 여기 있다 |
-| [`docs/strategies.md`](../../docs/strategies.md) | 등록 전략 목록 |
+| [`docs/strategies.md`](../../docs/strategies.md) | 단일종목 기술적 전략 카탈로그·타당성 검증 |
 | [`help/README.md`](../../help/README.md) | 백엔드 학습 가이드 |
 
 ## 전역 원칙 (도메인 무관)

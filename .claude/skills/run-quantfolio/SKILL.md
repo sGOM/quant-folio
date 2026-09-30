@@ -89,13 +89,8 @@ delete strays before committing).
 
 ## Run: human path
 
-```bash
-docker compose up -d --build
-```
-
-Open <http://localhost:8080> (app), <http://localhost:8080/docs> (Swagger),
-<http://localhost:8080/health>. Register at `/login`. For phone/external access
-over WireGuard, see README §5 — not needed for local verification.
+After "Build & launch", open <http://localhost:8080> (app) or `/docs` (Swagger) and
+register at `/login`. Phone/external access over WireGuard: README §5.
 
 ## Run: scripted Playwright E2E smoke (codified version of "UI flow" above)
 
@@ -113,28 +108,15 @@ npm run test:e2e                  # runs against http://localhost:8080 by defaul
 ```
 
 Override the target with `E2E_BASE_URL=http://localhost:8080 npm run test:e2e`.
-There's also a nightly/manual-only GitHub Actions workflow
-(`.github/workflows/e2e-smoke.yml`) that boots the whole stack from a clean
-checkout and runs this — it's not part of the required `ci.yml` gate because
-spinning up the full stack is too heavy for every push. Trigger it manually via
-`gh workflow run e2e-smoke.yml` or the Actions UI.
-
-Use the manual MCP path above when you're actively debugging a UI issue
-in-session; use this scripted spec for regression coverage (it's what you'd
-extend if you add a new critical-path screen).
+CI runs it nightly via `.github/workflows/e2e-smoke.yml` (not a required gate — too
+heavy per push); trigger manually with `gh workflow run e2e-smoke.yml`.
+Use the MCP path for in-session UI debugging, this spec for regression coverage
+(extend it when adding a critical-path screen).
 
 ## Backend code change → restart, don't wait
 
-The `web` container runs `uvicorn` **without `--reload`** (24/7 operation). After
-editing `backend/`, changes do NOT hot-reload:
-
-```bash
-docker compose restart web       # (and engine/worker if you touched their code)
-```
-
-The frontend (`npm run dev`) *does* hot-reload; new frontend npm packages must be
-installed **inside** the container (anonymous `node_modules` volume), not on the
-host.
+No hot-reload for `web`/`engine`/`worker`: `docker compose restart <svc>` after editing
+`backend/`. The frontend (`npm run dev`) does hot-reload.
 
 ## Gotchas
 

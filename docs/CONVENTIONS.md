@@ -36,17 +36,12 @@
   이 두 함수에 모여 있다. 새 소스를 붙일 때 `try/except` 로 자체 캐싱을 만들지 말고
   둘 중 하나를 쓴다.
 - **범위 키 소스의 커버 구간은 "요청한 범위"이지 "받아온 행의 범위"가 아니다.**
-  `[A, B]` 에 대해 소스가 정상 응답했으면 그 창 안은 전부 받은 것이므로, 저장된 행을
-  뒤져 갭을 판정할 필요가 없다 — 그 판정에는 거래일 달력이 필요한데 이 저장소엔
-  신뢰할 소스가 없다. 겹치거나 하루 맞닿은 구간만 병합하고 주말만큼 벌어진 구간은
-  병합하지 않는다(사이에 거래일이 있었는지 단정할 수 없다). **부분 응답은 소스 쪽에서
-  방어한다** — `cached_range`(frame.py) 자체는 소스 불가지라 응답 수신 여부만 보고
-  판단하지 않지만, `merge_coverage` 콜백에 수신 행 수(`row_count`)를 전달받은
-  소스(예: `metrics/fetch.py::_store_merge_coverage`)가 `app/services/market.py`의
-  순수 함수 `estimated_trading_days(start, end)`(거래일 캘린더 없이 달력일×5/7 −
-  연 15일 공휴일 근사)로 기대 거래일을 구해, 수신 행 수가 그 절반 미만이면 커버리지
-  기록만 건너뛰고 데이터는 그대로 저장한다(임계 `_COVERAGE_ROW_RATIO_THRESHOLD=0.5`,
-  짧은 구간은 근사 오차가 커 검사 제외).
+  정상 응답했으면 그 창은 전부 받은 것 — 행으로 갭을 판정하려면 거래일 달력이 필요한데
+  신뢰할 소스가 없다. 겹치거나 하루 맞닿은 구간만 병합한다(주말만큼 벌어지면 사이 거래일을
+  단정할 수 없다). **부분 응답은 소스 쪽에서 방어한다**: `cached_range` 는 소스 불가지라
+  `merge_coverage` 콜백에 `row_count` 만 넘기고, 소스(`metrics/fetch.py::_store_merge_coverage`)가
+  `market.estimated_trading_days` 근사 대비 절반 미만이면 커버리지 기록만 건너뛴다(데이터는 저장,
+  `improvements.md` §49).
 - **빈 결과는 소스가 명시적으로 "없다"고 선언한 경우에만 확정으로 굳힌다.** OpenDART status 013 만 여기 해당한다. 나머지는 `row_count == 0` 이면 `final=False` 로 남겨 다음 호출이 재조회한다 — 스키마 변동으로 값이 빈 것을 굳히면 수동 DB 삭제 전까지 영구히 0행이 된다.
 - **호출자 저하는 세 갈래로 갈린다.** 백테스트·리밸런싱 경로와 조회 라우트는 예외를 **그대로 전파**한다(`app/main.py` 가 502/503 으로 변환). 보조 지표(패닉 S9 브레드스·개별 업종)만 **항목 단위** 실패를 흡수하되 기준선(지수·기준업종) 실패는 전파한다 — 기준선이 없으면 신호 자체가 성립하지 않는다.
 - **반환 프레임의 컬럼 구성은 공개 계약이다.** 컬럼을 더하거나 빼면 docstring 을 같은 커밋에서 고치고 소비자를 전부 훑는다. 원격 경로와 로컬 경로의 컬럼 집합이 달라지면 1회차와 2회차가 조용히 다르게 동작한다.
@@ -105,7 +100,7 @@
 
 - vitest, 위치는 해당 모듈 옆 `__tests__/`. 테스트 이름은 한국어 평서문("이름이 비면 거부한다").
 - 픽스처는 `defaultConfig()` 에서 파생한 오버라이드 헬퍼(`single(over)`, `rebal(over)`)로 만들어 기본값 변경에 강건하게 유지.
-- 검증: `docker compose exec frontend npm run lint` → `npx vitest run` → `npm run build` 순서로 모두 통과해야 완료.
+- 검증: `docker compose exec frontend npm run lint` → `npx tsc --noEmit` → `npx vitest run` → `npm run build` 순서로 모두 통과해야 완료(CI 와 같은 순서).
 
 ## 3. 네이밍
 
@@ -120,7 +115,7 @@
 2. **리팩토링과 동작 변경을 한 커밋에 섞지 않는다.** 가독성 패스에서는 수치 결과가 바뀌면 안 된다(테스트가 그대로 통과해야 함).
 3. 검증 게이트 — 아래 전부 통과 후 완료 보고:
    - 백엔드 변경: `docker compose exec web pytest` 전체 통과 + 변경 서비스 `docker compose restart <svc>` (web/engine/worker 는 핫리로드 없음)
-   - 프론트 변경: lint → vitest → build 전체 통과. **CI 는 여기에 `npx tsc --noEmit`(타입체크)를 더 돌리므로**, 타입에 손댔으면 로컬에서도 같이 확인해 CI 왕복을 줄인다.
+   - 프론트 변경: lint → tsc → vitest → build 전체 통과(§2 테스트).
    - CI(`.github/workflows/ci.yml`)는 PR/main push 마다 `backend`(alembic upgrade → pytest+커버리지)·`frontend`(lint→tsc→vitest→build)를 돌린다. 마이그레이션이 깨지면 테스트 전에 죽는다. 전체 스택 E2E(`e2e-smoke.yml`)는 야간 크론이라 PR 게이트가 아니다.
 4. 커밋 메시지는 한국어, `type: 요약` 형식(`fix:`/`refactor:`/`test:`/`docs:`/`chore:`). 빌드 산출물(`tsconfig.tsbuildinfo` 등) 커밋 금지.
 5. 새 전략 검증은 반드시 PIT(생존편향 제거) KOSPI200 유니버스로. 방어형 전략 성과 판정은 excess/IR 이 아닌 alpha/Sharpe 기준.

@@ -5,9 +5,7 @@ paths:
 
 # 백테스트 엔진
 
-`app/services/backtest/`
-
-| 모듈 | 역할 |
+| 모듈 (`app/services/backtest/`) | 역할 |
 |---|---|
 | `portfolio.py` | **리밸런싱(다종목) 백테스트 코어** — `run_rebalance_backtest` |
 | `signals.py` | 단일종목 기술적 신호(SMA/EMA/RSI/MACD/볼린저/돌파/모멘텀/z-score) |
@@ -64,11 +62,11 @@ num_panic_events, factor_ic, avg_turnover, avg_turnover_actual`
 
 ## 전략 판정 기준
 
-- **신규 전략 검증은 반드시 PIT(생존편향 제거) KOSPI200 유니버스로.** 손질된 풀은 성과가
-  붕괴한다(동적 섹터로테이션 +131% → PIT 에서 +12.9%).
-- **저베타·방어형 전략은 `excess_return`/IR 이 아니라 `alpha`/Sharpe 로 판정한다.**
-  강세장 구간에서는 저베타가 구조적으로 초과수익이 음수로 나온다 — 알파 소멸이 아니다.
-- 현재 대표 전략 **id=23**(균형 멀티팩터, 저베타 β≈0.6·순수 알파형), 보완재 **id=24**.
+PIT KOSPI200 필수·대표 id=23 은 `CLAUDE.md`, 검증 프로토콜은 `validation-workflow.md`.
+
+- **저베타·방어형은 `excess_return`/IR 이 아니라 `alpha`/Sharpe 로 판정.** 강세장 구간에선
+  저베타의 초과수익이 구조적으로 음수다 — 알파 소멸이 아니다(id=23 β≈0.6).
+- 보완재 **id=24**.
 
 ## 재현성
 

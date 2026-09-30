@@ -192,5 +192,5 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 ### 직접 열어볼 파일
 - `backend/app/api/routes/auth.py` — 가장 읽기 쉬운 컨트롤러. 여기서 시작.
-- `backend/app/core/database.py` — 20줄. 세션 의존성의 전부.
+- `backend/app/core/database.py` — 짧다. 세션 의존성의 전부.
 - `backend/app/schemas/` — DTO 들이 어떻게 생겼는지.
