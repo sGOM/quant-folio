@@ -14,8 +14,6 @@
 2. **실시간 자동매매 엔진** — 검증된 전략을 KIS WebSocket 시세에 연결해 신호를 생성하고, 리스크 관리 규칙(손절·최대 포지션·일일 손실 한도)을 거쳐 자동 주문을 실행합니다.
 3. **실시간 모니터링 대시보드** — 보유 잔고, 미체결/체결 주문, 실현·평가 손익, 전략별 성과를 WebSocket으로 실시간 갱신해 보여줍니다.
 
-> MVP 목표: **"전략 1개를 모의투자로 자동매매하고 모니터링한다"**
-
 ---
 
 ## 기술 스택
@@ -90,7 +88,7 @@
 
 ### 데이터 모델 (요약)
 
-`users` · `strategies` · `backtests` · `strategy_likes` · `orders` · `executions` · `positions` · `sector_map_snapshots` · `risk_limits` · `price_ticks`(TimescaleDB hypertable). 자세한 정의는 [`docs/PRD.md` §4](docs/PRD.md)와 `backend/app/models/models.py` 참고.
+운영 테이블(`backend/app/models/models.py` — 사용자·전략·주문·체결·포지션·알림·뉴스 등)과 확정 과거 시장데이터 저장소(`store.py`)로 나뉜다. 관계·삭제 정책은 [`.claude/rules/data-model.md`](.claude/rules/data-model.md).
 
 ---
 
@@ -342,8 +340,9 @@ docker compose ps                 # 상태 확인
 docker compose logs -f web        # 로그 실시간(web/engine/worker 등)
 docker compose restart web        # 특정 서비스 재시작
 git pull && docker compose -f docker-compose.yml up -d --build   # 코드 업데이트 후 반영(운영)
-docker compose exec db pg_dump -U quant quant > backup.sql   # DB 백업
 ```
+
+DB 백업은 worker 가 매일 03:00 KST 자동 수행한다 — 복구·오프사이트 복제는 [`docs/db-backup.md`](docs/db-backup.md).
 
 ---
 
@@ -360,10 +359,13 @@ docker compose exec db pg_dump -U quant quant > backup.sql   # DB 백업
 ## 테스트
 
 ```bash
-docker compose exec web pytest             # 백엔드 — 신호·보안·장운영시간·멱등성·엔진 E2E
-docker compose exec frontend npm test      # 프론트 — Vitest 유닛 테스트(lib·훅·컴포넌트·전략 폼 검증)
-docker compose exec frontend npm run lint  # 프론트 — ESLint
+docker compose exec web pytest               # 백엔드
+docker compose exec frontend npm run lint    # 프론트 — ESLint
+docker compose exec frontend npx tsc --noEmit
+docker compose exec frontend npx vitest run  # 프론트 — Vitest
 ```
+
+CI(`.github/workflows/ci.yml`)도 같은 단계를 돈다.
 
 **E2E 스모크(Playwright)** — 실제로 스택을 띄운 뒤 브라우저로 핵심 경로
 (회원가입/로그인 → 전략 목록 → 전략 생성 → 백테스트 1회 → 모니터 표시)를 훑는다.
@@ -374,16 +376,6 @@ docker compose exec frontend npm run lint  # 프론트 — ESLint
 docker compose up -d --build               # 스택이 떠 있어야 한다(:8080)
 cd frontend && npm run test:e2e            # Playwright 스모크
 ```
-
----
-
-## 구현 진행 (PRD §7)
-
-- [x] 1. 기반 구축 — 뼈대 분리, Docker Compose, 인증, KIS 연동 검증
-- [x] 2. 백테스팅 코어 — 데이터 적재, vectorbt 엔진, 백테스트 API·결과 화면
-- [x] 3. 매매 엔진 — KIS WS 시세→신호→리스크→주문, Redis 분산 락 멱등성, 주문/체결 기록
-- [x] 4. 실시간 대시보드 — FastAPI WS 푸시, 실시간 잔고·포지션·체결, 전략 ON/OFF
-- [x] 5. 안정화 & 검증 — 장 운영시간/휴장일 처리, WS 재연결·상태복구, 감사 로그, 테스트
 
 ---
 
@@ -402,7 +394,8 @@ quant/
 │   ├── worker/         # Celery 워커
 │   └── alembic/        # DB 마이그레이션
 ├── frontend/           # Next.js 대시보드
-├── docs/PRD.md         # 제품 요구사항 정의서
+├── docs/               # 제품 정의(PRD)·로드맵·개선 이력·운영 가이드
+├── help/               # 백엔드 학습 가이드
 ├── Caddyfile           # 리버스 프록시(단일 출처) 설정
 └── docker-compose.yml
 ```
@@ -430,17 +423,7 @@ quant/
 **우선** 읽습니다. 덕분에 비밀이 `docker inspect`·이미지 레이어·프로세스 환경에
 남지 않습니다.
 
-```bash
-# 최초 1회 — 시크릿 파일 생성(secrets/ 는 .gitignore 로 제외됨)
-openssl rand -hex 32 > secrets/secret_key.txt
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" > secrets/credential_enc_key.txt
-# 미사용 브로커 키는 빈 파일로(파일은 존재해야 compose 기동)
-: > secrets/kis_app_key.txt;  : > secrets/kis_app_secret.txt
-: > secrets/toss_app_key.txt; : > secrets/toss_app_secret.txt
-chmod 600 secrets/*.txt   # 선택, 권장
-```
-
-자세한 내용은 [`secrets/README.md`](secrets/README.md) 참고. `CREDENTIAL_ENC_KEY` 를
+생성 명령은 1단계, 전체 파일 목록은 [`secrets/README.md`](secrets/README.md). `CREDENTIAL_ENC_KEY` 를
 교체하면 기존에 암호화 저장된 DB 자격증명을 복호화할 수 없으니 주의하세요.
 
 | 브로커 | 자격증명(공통 컬럼 재사용) | 실시간 시세 | 모의투자 |
