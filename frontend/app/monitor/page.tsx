@@ -40,7 +40,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { formatKRW, formatNumber, formatRelativeTime } from "@/lib/format";
+import { fmtKRW, formatNumber, formatRelativeTime } from "@/lib/format";
 
 // 매매·체결 관련 이벤트 타입 — 어느 것이든 잔고/주문을 다시 가져온다.
 const TRADE_EVENTS = new Set(["execution", "order", "position", "fill", "signal"]);
@@ -398,7 +398,7 @@ function MonitorContent() {
                 positions.data?.map((p) => [
                   nameOf(p.symbol),
                   formatNumber(p.qty),
-                  formatKRW(p.avg_price, false),
+                  fmtKRW(p.avg_price, false),
                 ]) ?? []
               }
               empty="보유 포지션이 없습니다."
