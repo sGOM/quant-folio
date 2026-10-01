@@ -694,3 +694,19 @@ nullable 이었다. `min_value`·`min_mcap` 필터는 **결측을 탈락**시킨
 `dropna().tail(N)`(유효 관측 N개)과 패널 `tail(N)`(N행)이 결측 종목에서 달라져 **수치가 바뀐다** —
 착수하려면 골든 기준을 "동일"에서 "허용 오차"로 낮추는 별도 결정이 먼저다. `_vol_slippage_map` 의
 `tail(21)` 한정은 측정 이득이 없고 합산 순서로 1e-15 흔들려 원복(미측정 최적화에 재현성을 내주지 않는다).
+
+## 68. 워커가 DB 준비 전에 태스크를 소비해 거짓 `alert_cleanup_failed` — 해소 ✅
+
+호스트 절전 복귀·재부팅 때 Docker 데몬은 컨테이너를 동시에 올린다(compose `depends_on` 은
+`compose up` 에만 적용). DB 는 비정상 종료 복구 중인데 beat 는 밀린 태스크를 즉시 발송해, 가장 먼저
+DB 를 잡는 태스크가 `CannotConnectNowError` 로 죽었다. 실측(2026-09-29·30 로그): DB 기동→접속 수락
+9.1초, 그 직전 `cleanup_old_alerts` 가 실패해 알림 2건.
+
+**해소**: `worker/celery_app.py::wait_for_db` 를 `worker_init` 시그널에 연결 — 컨슈머가 뜨기 전에
+DB 접속을 최대 60초 기다린다(초과 시 포기하고 기동). 태스크별 재시도 대신 모든 태스크가 지나는 한
+곳에서 막았다. `test_worker_wait_for_db.py` 2건 + 실 DB 대조(거부 포트 → False, 정상 → True).
+
+**같은 로그에서 드러난 별개 사건(코드 결함 아님)**: 야간 스냅샷 7/7 실패와 10-01 분기 업종 스냅샷
+(`snapshot_sector_map`, `SourceAuthError`) 실패는 **KRX 가 비밀번호 변경을 요구**해 로그인이 거부된
+것. 운영자가 krx.co.kr 에서 변경 후 `secrets/krx_pw.txt` 갱신 필요. 분기 스냅샷은 다음 실행이
+2027-01-01 이라 **수동 재실행**해야 2026-10 업종 PIT 가 빈다. §47 대기 사유도 이것.

@@ -5,10 +5,18 @@
 Celery 가 워커 기동 시 지연 임포트하게 한다(이 모듈이 정의하는 celery_app 을 tasks.py 가
 역참조하는 순환 임포트를 피하기 위함 — 즉시 최상위 임포트하면 순환이 생긴다).
 """
+import asyncio
+import logging
+import time
+
+import asyncpg
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import worker_init
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 celery_app = Celery(
     "quantfolio",
@@ -82,6 +90,43 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=4, minute=0),
     },
 }
+
+
+def wait_for_db(timeout: float = 60.0, interval: float = 1.0) -> bool:
+    """DB 가 접속을 받을 때까지 기다린다. 받으면 True, `timeout` 초를 넘기면 False.
+
+    호스트 재부팅·절전 복귀 때 Docker 데몬은 컨테이너를 동시에 올린다(compose
+    `depends_on` 은 `compose up` 에만 적용되고 데몬 재시작에는 적용되지 않는다). 그때
+    DB 는 비정상 종료 복구 중인데 beat 는 밀린 태스크를 기동 즉시 발송해, 가장 먼저
+    DB 를 잡는 태스크가 `CannotConnectNowError` 로 죽는다. 실측(2026-09-30 로그):
+    DB 기동 → 접속 수락 9.1초, 그 0.3초 전에 `cleanup_old_alerts` 가 접속을 시도해
+    실패하고 거짓 `alert_cleanup_failed` 알림을 남겼다.
+    """
+    dsn = settings.DATABASE_URL.replace("+asyncpg", "")
+
+    async def _ping() -> None:
+        conn = await asyncpg.connect(dsn, timeout=5)
+        await conn.close()
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            asyncio.run(_ping())
+            return True
+        except (OSError, asyncio.TimeoutError, asyncpg.PostgresError) as exc:
+            if time.monotonic() >= deadline:
+                # DB 를 안 쓰는 태스크까지 막지 않도록 포기하고 기동은 계속한다.
+                logger.error("DB 대기 %s초 초과 — 워커는 그대로 기동한다: %s", timeout, exc)
+                return False
+            logger.warning("DB 준비 대기 중: %s", exc)
+            time.sleep(interval)
+
+
+@worker_init.connect
+def _wait_for_db_on_worker_init(**_kwargs) -> None:
+    # worker_init 은 컨슈머가 뜨기 전 메인 프로세스에서 발화한다 — 여기서 막혀 있는
+    # 동안 beat 가 보낸 태스크는 Redis 큐에 쌓여 있다가 DB 준비 후 소비된다.
+    wait_for_db()
 
 
 @celery_app.task(name="worker.ping")
