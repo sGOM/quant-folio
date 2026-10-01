@@ -893,7 +893,7 @@ export interface RecommendOut {
 export interface Position {
   symbol: string;
   qty: number;
-  avg_price: number;
+  avg_price: number | null;
 }
 
 /** 엔진 실시간 알림(WS "alert" 이벤트)의 사유 코드. */

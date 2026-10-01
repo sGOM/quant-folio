@@ -20,7 +20,7 @@ router = APIRouter(prefix="/api/trading", tags=["trading"])
 class PositionOut(BaseModel):
     symbol: str
     qty: float
-    avg_price: float
+    avg_price: float | None  # 브로커가 평단가를 안 주면 None(0 은 실제 값과 구분 불가)
 
 
 class OrderOut(BaseModel):
@@ -73,7 +73,7 @@ async def list_positions(
         PositionOut(
             symbol=p["symbol"],
             qty=float(p["qty"]),
-            avg_price=float(p["avg_price"]) if p["avg_price"] is not None else 0.0,
+            avg_price=float(p["avg_price"]) if p["avg_price"] is not None else None,
         )
         for p in balance.positions_normalized()
     ]
